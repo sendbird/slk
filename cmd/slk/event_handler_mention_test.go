@@ -82,3 +82,39 @@ func TestOnMessage_NoSelfMention_DoesNotBump(t *testing.T) {
 		t.Errorf("non-mention bumped mention_count = %d, want 0", got)
 	}
 }
+
+func TestOnMessage_GroupDMMention_DoesNotBumpMention(t *testing.T) {
+	// Group DMs (mpim) are excluded from the realtime bump path
+	// because the sidebar's mention sort/render only handles public
+	// + private channels. Writing here would accumulate values that
+	// nothing displays — a foot-gun for whoever extends the read
+	// path next.
+	h, db := mentionHandler(t, "group_dm", "USELF")
+	h.OnMessage("C1", "U1", "1.001", "<@USELF> ping", "", "", false, nil, slack.Blocks{}, nil)
+
+	if got := db.GetChannelMentionCount("C1"); got != 0 {
+		t.Errorf("group_dm mention bumped mention_count = %d, want 0", got)
+	}
+}
+
+func TestOnMessage_AppMention_DoesNotBumpMention(t *testing.T) {
+	// Mirrors group_dm: apps don't render mention badges, so they
+	// must not write to mention_count either.
+	h, db := mentionHandler(t, "app", "USELF")
+	h.OnMessage("C1", "U1", "1.001", "<@USELF> ping", "", "", false, nil, slack.Blocks{}, nil)
+
+	if got := db.GetChannelMentionCount("C1"); got != 0 {
+		t.Errorf("app mention bumped mention_count = %d, want 0", got)
+	}
+}
+
+func TestOnMessage_PrivateChannelMention_BumpsCount(t *testing.T) {
+	// Private channels are part of the channel-kind read path; they
+	// must bump just like public channels.
+	h, db := mentionHandler(t, "private", "USELF")
+	h.OnMessage("C1", "U1", "1.001", "<@USELF> ping", "", "", false, nil, slack.Blocks{}, nil)
+
+	if got := db.GetChannelMentionCount("C1"); got != 1 {
+		t.Errorf("private channel mention bumped mention_count = %d, want 1", got)
+	}
+}

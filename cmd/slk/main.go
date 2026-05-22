@@ -2950,14 +2950,22 @@ func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subty
 		//   - Messages authored by the current user (e.g., from another
 		//     Slack client) — Slack never counts your own messages as
 		//     mentions of yourself.
-		//   - 1:1 DMs: client.counts.Ims carries no mention_count on
-		//     the wire, so incrementing here would silently diverge
-		//     from Slack's authoritative value on the next bootstrap.
+		//   - Non-channel types: only public/private channels surface
+		//     the mention badge in the sidebar (sidebar.isChannelType
+		//     and the bootstrap path keep "channel" + "private" as
+		//     the read side). Anything else (1:1 DMs, group DMs, apps)
+		//     must not write to mention_count, otherwise the column
+		//     accumulates values that nothing renders — silent storage
+		//     drift and a foot-gun for the next person to touch the
+		//     read path. 1:1 DMs additionally lack mention_count on
+		//     the wire (client.counts.Ims), so any value we'd write
+		//     would also diverge from Slack's authoritative state.
 		chType := h.channelTypes[channelID]
+		isChannelKind := chType == "channel" || chType == "private"
 		if h.currentUserID != "" &&
 			userID != h.currentUserID &&
 			!edited &&
-			chType != "dm" &&
+			isChannelKind &&
 			containsSelfMention(text, h.currentUserID) {
 			if _, err := h.db.IncrementChannelMentionCountIfUnread(channelID); err != nil {
 				log.Printf("Warning: failed to bump mention_count for %s: %v", channelID, err)
