@@ -3,6 +3,7 @@ package sidebar
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -253,6 +254,15 @@ type Model struct {
 	// Synthetic "Activity" row state.
 	activityUnread int
 
+	// bootstrapLoading is true between construction (or workspace
+	// switch) and the first SetItems call that delivers the
+	// workspace's channel list. While true, the empty-items branch
+	// renders a "Loading channels…" placeholder instead of the
+	// "No channels" placeholder, so a freshly-launched slk does not
+	// flash a wrongly-empty sidebar while users.conversations is
+	// still in flight.
+	bootstrapLoading bool
+
 	// focused tracks whether this panel currently has user focus. When
 	// false, the cursor "▌" glyph dims from Accent to TextMuted (via
 	// styles.SelectionBorderColor) so the unfocused selection doesn't
@@ -276,16 +286,25 @@ func (m *Model) SetSectionsProvider(p SectionsProvider) {
 // SetReadStateReader installs a callback that returns the per-channel
 // read state map for the workspace currently presented by this sidebar.
 // Called by View() at render time. Setting it invalidates the row cache
-// so the next render reflects the new source.
+// and re-runs rebuildFilter so the DM-recency and channel-mention
+// sort keys (sourced from the reader) take effect on the next View().
 func (m *Model) SetReadStateReader(f func() map[string]cache.ReadState) {
 	m.readStateReader = f
+	m.rebuildFilter()
+	m.rebuildNavPreserveCursor()
 	m.cacheValid = false
 	m.dirty()
 }
 
 // Invalidate forces the next View() call to re-read read state from
 // the installed reader. Called by App.Update on ReadStateChangedMsg.
+// Also re-runs the section sort because DM recency and channel mention
+// counts (the new intra-section sort keys) live in the same read-state
+// map; without re-sorting, a newly-arrived DM would still render in
+// its old position until the next workspace switch.
 func (m *Model) Invalidate() {
+	m.rebuildFilter()
+	m.rebuildNavPreserveCursor()
 	m.cacheValid = false
 	m.dirty()
 }
@@ -473,6 +492,12 @@ func New(items []ChannelItem) Model {
 		defaultChannelsSection: true,
 		defaultAppsSection:     true,
 	}
+	// bootstrapLoading defaults to false; callers that want the
+	// loading spinner placeholder for a not-yet-populated sidebar
+	// invoke SetBootstrapLoading(true) explicitly (the App layer does
+	// this via SetLoadingWorkspaces). Tests that construct a fresh
+	// Model with no items expect the "No channels" placeholder, not
+	// the spinner.
 	m.rebuildFilter()
 	m.rebuildNav()
 	// Default selection is the synthetic Threads row at the top.
@@ -579,8 +604,10 @@ func (m *Model) ToggleCollapse(section string) {
 	m.dirty()
 }
 
-// ToggleCollapseSelected toggles the section currently under the cursor.
-// No-op if the cursor isn't on a section header.
+// ToggleCollapseSelected toggles the section currently under the
+// cursor. No-op when the cursor is not on a section header — Threads
+// / Activity rows have no section, and channel rows route through
+// Enter's "open this channel" path instead.
 func (m *Model) ToggleCollapseSelected() bool {
 	name, ok := m.IsSectionHeaderSelected()
 	if !ok {
@@ -630,8 +657,28 @@ func (m *Model) ActivityUnreadCount() int { return m.activityUnread }
 // SelectThreadsRow() after SetItems.
 func (m *Model) SetItems(items []ChannelItem) {
 	m.items = items
+	// Any SetItems call clears the bootstrap loading flag. An empty
+	// slice now legitimately means "this workspace has no joined
+	// conversations" and we want to show the "No channels"
+	// placeholder rather than spin forever.
+	m.bootstrapLoading = false
 	m.rebuildFilter()
 	m.rebuildNavPreserveCursor()
+	m.cacheValid = false
+	m.dirty()
+}
+
+// SetBootstrapLoading toggles the "still loading the workspace's
+// initial channel list" placeholder. Setting true forces the empty-
+// state branch in buildCache to render "Loading channels…" instead of
+// "No channels." Mostly useful for workspace switches that need to
+// suppress the previous workspace's "No channels" placeholder until
+// the new workspace's SetItems lands.
+func (m *Model) SetBootstrapLoading(loading bool) {
+	if m.bootstrapLoading == loading {
+		return
+	}
+	m.bootstrapLoading = loading
 	m.cacheValid = false
 	m.dirty()
 }
@@ -863,7 +910,18 @@ func (m *Model) rebuildFilter() {
 
 	// Sort filtered indices to match the visual section display order so that
 	// j/k navigation traverses items in the same order they're rendered.
-	// Within a section, preserve the original (Slack-provided) item order.
+	// Within a section, the intra-section ordering depends on item type:
+	//   - DM-typed sections (Direct Messages, group_dm) sort by the
+	//     channel's latest known message timestamp descending, so the
+	//     most recently active conversation is always on top. Items
+	//     without a known latest_ts fall to the bottom in their
+	//     original order.
+	//   - Channel-typed sections lift mention-bearing items to the top
+	//     (sorted by mention_count desc) so @-mentions are immediately
+	//     visible. Remaining items keep their Slack-provided order.
+	// Both signals are read from the readState map populated above; a
+	// nil reader or missing entry yields zero values that degrade
+	// gracefully to "preserve original order."
 	sectionOrder := m.modelOrderedSections(m.filtered)
 	rank := make(map[string]int, len(sectionOrder))
 	for i, name := range sectionOrder {
@@ -875,8 +933,78 @@ func (m *Model) rebuildFilter() {
 		if ra != rb {
 			return ra < rb
 		}
+		ia := m.items[m.filtered[a]]
+		ib := m.items[m.filtered[b]]
+		sa := readState[ia.ID]
+		sb := readState[ib.ID]
+		switch {
+		case isDMType(ia.Type) && isDMType(ib.Type):
+			// Empty LatestTS sinks; non-empty sorts lexicographically
+			// (Slack ts strings are width-stable and sort numerically).
+			ea := sa.LatestTS == ""
+			eb := sb.LatestTS == ""
+			if ea != eb {
+				return !ea
+			}
+			if sa.LatestTS != sb.LatestTS {
+				return sa.LatestTS > sb.LatestTS
+			}
+		case isChannelType(ia.Type) && isChannelType(ib.Type):
+			ma := effectiveMentionCount(sa, ia)
+			mb := effectiveMentionCount(sb, ib)
+			if ma != mb {
+				return ma > mb
+			}
+		}
 		return m.filtered[a] < m.filtered[b]
 	})
+}
+
+// isDMType reports whether an item belongs to the DM family (1:1 or
+// group_dm). Apps live in their own section and intentionally do not
+// participate in DM recency sort: their order is dominated by user
+// pinning and Slack's "recent apps" provider data.
+func isDMType(t string) bool {
+	return t == "dm" || t == "group_dm"
+}
+
+// isChannelType reports whether an item is a regular Slack channel
+// (public or private). DMs, group DMs, and apps are excluded; their
+// sort rules live in their own branches above.
+func isChannelType(t string) bool {
+	return t == "channel" || t == "private"
+}
+
+// effectiveMentionCount returns the mention_count value that the
+// sidebar should actually act on. It mirrors the render-time gate
+// (HasUnread && !IsMuted) so a stale row in the cache cannot lift a
+// read-or-muted channel to the top of its section. The render path
+// suppresses the badge in those cases; the sort path must agree, or
+// the channel floats up with no visible reason. Two situations are
+// covered:
+//
+//   - Muted channels never participate in the notification surface
+//     (no dot, no badge); they must also not get reordered.
+//   - has_unread=false with a leftover mention_count > 0 is the race
+//     IncrementChannelMentionCountIfUnread closes at the SQL layer,
+//     but this is a belt-and-suspenders guard for any other path
+//     that might leave the two columns inconsistent (e.g. a future
+//     migration that lands without resetting mention_count).
+func effectiveMentionCount(s cache.ReadState, item ChannelItem) int {
+	if !s.HasUnread || item.IsMuted {
+		return 0
+	}
+	return s.MentionCount
+}
+
+// formatMentionBadge renders a mention count as "•N" for 1..99 and
+// caps at "•99+" so the badge always fits in 3-4 columns. Callers
+// must guard with n > 0 — the helper does not draw an empty badge.
+func formatMentionBadge(n int) string {
+	if n > 99 {
+		return "•99+"
+	}
+	return "•" + strconv.Itoa(n)
 }
 
 // cursorKey captures what the cursor is logically pointing at, in a
@@ -1224,11 +1352,27 @@ func (m *Model) buildCache(width int) {
 		// "muted = no notification surface". The dimmer ChannelMuted
 		// style below distinguishes muted-with-unreads from a fully
 		// read row visually.
-		hasUnread := readState[item.ID].HasUnread && !item.IsMuted
+		state := readState[item.ID]
+		hasUnread := state.HasUnread && !item.IsMuted
 
-		// Unread dot indicator (same regardless of selection state).
+		// Unread indicator. Channels (public/private) with an effective
+		// mention count > 0 render a numeric badge ("•3") in place of
+		// the plain dot so @-mentions read at a glance. Muted channels
+		// suppress both the dot and the badge to honor the no-
+		// notification-surface contract. Badge values are capped at
+		// "99+" to keep row width predictable. The
+		// effectiveMentionCount helper enforces the same gate the sort
+		// comparator uses, so the visible badge and the channel's
+		// position in the section stay in sync.
 		unreadDot := " "
-		if hasUnread {
+		mentionBadge := ""
+		switch {
+		case !hasUnread:
+			// no indicator
+		case isChannelType(item.Type) && effectiveMentionCount(state, item) > 0:
+			mentionBadge = formatMentionBadge(effectiveMentionCount(state, item))
+			unreadDot = dotStyle.Render(mentionBadge)
+		default:
 			unreadDot = unreadDotStr
 		}
 
@@ -1267,8 +1411,17 @@ func (m *Model) buildCache(width int) {
 		// measurements for these chars, so use a conservative fixed budget:
 		//   cursor(2) + prefix(3) + name + space(1) + dot(2) = name + 8
 		// This assumes worst-case 2-col rendering for every ambiguous char.
+		//
+		// When a mention badge is present (e.g. "•3" or "•99+") we
+		// widen the reservation by the badge length minus the single
+		// dot we'd otherwise show, so the trailing badge never bleeds
+		// past the sidebar's right edge into the message pane.
 		name := item.Name
-		maxNameLen := (width - 2) - 8
+		indicatorReserve := 2
+		if mentionBadge != "" {
+			indicatorReserve = lipgloss.Width(mentionBadge) + 1
+		}
+		maxNameLen := (width - 2) - (6 + indicatorReserve)
 		if maxNameLen < 5 {
 			maxNameLen = 5
 		}
@@ -1355,10 +1508,17 @@ func (m *Model) buildCache(width int) {
 	}
 
 	// When there are no channel items at all, render a single muted
-	// "No channels" placeholder below the Threads row + separator so the
-	// Threads row remains globally visible even on an empty workspace.
+	// placeholder below the Threads row + separator so the Threads row
+	// remains globally visible even on an empty workspace. While we're
+	// still in the bootstrap loading window (no SetItems yet), label
+	// the row "Loading channels…" so the user has feedback that the
+	// workspace is still hydrating instead of seeing "No channels".
 	if len(m.items) == 0 {
-		placeholder := styles.SectionHeader.Render("No channels")
+		text := "No channels"
+		if m.bootstrapLoading {
+			text = "⏳  Loading channels…"
+		}
+		placeholder := styles.SectionHeader.Render(text)
 		m.cacheRows = append(m.cacheRows, renderRow{
 			normal:   placeholder,
 			selected: placeholder,

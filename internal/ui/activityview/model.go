@@ -51,16 +51,23 @@ func borderFillStyle() lipgloss.Style {
 }
 
 type Model struct {
-	items         []cache.ActivityItem
-	userNames     map[string]string
-	channelNames  map[string]string
-	selfUserID    string
-	selected      int
-	focused       bool
-	yOffset       int
+	items            []cache.ActivityItem
+	userNames        map[string]string
+	channelNames     map[string]string
+	selfUserID       string
+	selected         int
+	focused          bool
+	yOffset          int
 	snappedSelection int
-	hasSnapped    bool
-	version       int64
+	hasSnapped       bool
+	// loading is true between construction (or workspace switch) and
+	// the first SetItems call. While true the empty-state placeholder
+	// is replaced with a "Loading…" indicator so the panel never
+	// flashes "no activity" before the activity-list fetcher has had
+	// a chance to populate it. Default true so a freshly-constructed
+	// Model defaults to the loading state.
+	loading bool
+	version int64
 }
 
 func New(userNames map[string]string, selfUserID string) Model {
@@ -93,6 +100,24 @@ func (m *Model) SetItems(items []cache.ActivityItem) {
 	m.selected = newSel
 	m.clampSelection()
 	m.hasSnapped = false
+	// Any SetItems call ends the bootstrap loading state: empty result
+	// now legitimately means "no activity" and we want the user-facing
+	// empty placeholder, not a forever-spinner.
+	m.loading = false
+	m.dirty()
+}
+
+// SetLoading marks the activity panel as still waiting for its
+// first data load. Setting true is only meaningful before the first
+// SetItems call (or after a workspace switch that needs to suppress
+// the previous workspace's empty/non-empty state until fresh data
+// arrives). Setting false is identical to SetItems(nil) except it
+// doesn't reset the selection.
+func (m *Model) SetLoading(loading bool) {
+	if m.loading == loading {
+		return
+	}
+	m.loading = loading
 	m.dirty()
 }
 
@@ -251,7 +276,11 @@ func (m *Model) View(height, width int) string {
 		height = 1
 	}
 	if len(m.items) == 0 {
-		empty := mutedStyle().Render("no activity")
+		text := "no activity"
+		if m.loading {
+			text = "⏳  Loading activity…"
+		}
+		empty := mutedStyle().Render(text)
 		return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, empty)
 	}
 	lines := m.renderRows(width)
