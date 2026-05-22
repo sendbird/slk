@@ -4981,3 +4981,64 @@ func TestGlobalSearch_DebouncePathIsAsync(t *testing.T) {
 	}
 	close(release)
 }
+
+func TestGlobalSearch_MessageHitSchedulesPendingJump(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+
+	_, _ = app.Update(SearchResultsMsg{
+		Gen:   app.searchGen,
+		Query: app.globalSearch.Query(),
+		Messages: []globalsearch.Item{
+			{ID: "9.99", Name: "jinku — deploy", ChannelID: "C42", ChannelName: "eng-deploy", MessageTS: "9.99"},
+		},
+	})
+	if got := app.globalSearch.SectionLen(globalsearch.CategoryMessage); got != 1 {
+		t.Fatalf("setup precondition: expected 1 message hit, got %d", got)
+	}
+
+	// Synthetic Threads/Activity rank above the Messages section
+	// under a "d" query; the message hit is in the second flat slot.
+	// Navigate down once before confirming so we pick the remote row.
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: tea.KeyDown})
+
+	cmd := app.handleGlobalSearchMode(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("enter on message hit must return a ChannelSelected cmd")
+	}
+	if app.pendingJumpChannelID != "C42" || app.pendingJumpTS != "9.99" {
+		t.Fatalf("pending jump must be set: channel=%q ts=%q", app.pendingJumpChannelID, app.pendingJumpTS)
+	}
+	picked := cmd()
+	sel, ok := picked.(ChannelSelectedMsg)
+	if !ok {
+		t.Fatalf("cmd produced %T, want ChannelSelectedMsg", picked)
+	}
+	if sel.ID != "C42" {
+		t.Fatalf("ChannelSelectedMsg.ID: got %q", sel.ID)
+	}
+}
+
+func TestGlobalSearch_MessagesLoadedConsumesPendingJump(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C42"
+	app.pendingJumpChannelID = "C42"
+	app.pendingJumpTS = "2.0"
+
+	_, _ = app.Update(MessagesLoadedMsg{
+		ChannelID: "C42",
+		Messages: []messages.MessageItem{
+			{TS: "1.0", UserID: "U1", Text: "first"},
+			{TS: "2.0", UserID: "U2", Text: "target"},
+			{TS: "3.0", UserID: "U3", Text: "third"},
+		},
+	})
+	if got := app.messagepane.SelectedIndex(); got != 1 {
+		t.Fatalf("messagepane must focus the target ts: got selected=%d", got)
+	}
+	if app.pendingJumpChannelID != "" || app.pendingJumpTS != "" {
+		t.Fatalf("pending jump must be cleared after consume: %q/%q", app.pendingJumpChannelID, app.pendingJumpTS)
+	}
+}

@@ -845,6 +845,12 @@ type App struct {
 	// HandleKey call so the App can detect changes and bump
 	// searchGen.
 	searchLastQuery string
+	// pendingJumpChannelID + pendingJumpTS encode a "scroll the
+	// messagepane to this ts after the channel finishes loading"
+	// request. Set when the user picks a remote message hit from
+	// the global search overlay; cleared by MessagesLoadedMsg.
+	pendingJumpChannelID string
+	pendingJumpTS        string
 	// channelReadMarker fires Slack's MarkChannel + cache.UpdateChannelReadState
 	// for the given channel up to ts. Returns a tea.Msg (typically
 	// ChannelMarkedReadMsg). Wired in cmd/slk/main.go's wireCallbacks.
@@ -1851,6 +1857,17 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// fetcher logs the error before returning nil.
 			if msg.Messages != nil {
 				a.messagepane.SetMessages(msg.Messages)
+			}
+			// If the user picked a remote message hit out of the global
+			// search overlay, consume the pending jump now that the
+			// channel's messages are loaded. SelectByTS returns false
+			// when the ts isn't in this page — that's fine, we still
+			// clear the pending state so a later unrelated channel
+			// switch doesn't accidentally jump.
+			if a.pendingJumpChannelID == msg.ChannelID && a.pendingJumpTS != "" {
+				a.messagepane.SelectByTS(a.pendingJumpTS)
+				a.pendingJumpChannelID = ""
+				a.pendingJumpTS = ""
 			}
 		}
 
@@ -3873,6 +3890,13 @@ func (a *App) handleGlobalSearchMode(msg tea.KeyMsg) tea.Cmd {
 			if channelName == "" {
 				channelName = result.Name
 			}
+			// Stash the target ts so MessagesLoadedMsg can scroll the
+			// messagepane to that row once the channel finishes
+			// loading. Cleared by the handler regardless of hit/miss
+			// so a stale jump doesn't fire on the next unrelated
+			// channel switch.
+			a.pendingJumpChannelID = channelID
+			a.pendingJumpTS = result.MessageTS
 			a.sidebar.SelectByID(channelID)
 			return func() tea.Msg {
 				return ChannelSelectedMsg{ID: channelID, Name: channelName, Type: "channel"}
