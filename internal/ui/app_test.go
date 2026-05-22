@@ -18,6 +18,7 @@ import (
 	"github.com/gammons/slk/internal/cache"
 	imgpkg "github.com/gammons/slk/internal/image"
 	"github.com/gammons/slk/internal/ui/compose"
+	"github.com/gammons/slk/internal/ui/globalsearch"
 	"github.com/gammons/slk/internal/ui/messages"
 	"github.com/gammons/slk/internal/ui/sidebar"
 	"github.com/gammons/slk/internal/ui/slashpicker"
@@ -4810,4 +4811,173 @@ func TestChannelSelectedReturnsPromptlyEvenIfFetcherBlocks(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("Update did not return within 100ms; fetcher is being called synchronously on the Update goroutine — risks bubbletea Send-from-Update deadlock")
 	}
+}
+
+func TestGlobalSearch_SlashOpensOverlayInNormalMode(t *testing.T) {
+	app := NewApp()
+	if app.mode != ModeNormal {
+		app.SetMode(ModeNormal)
+	}
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	if !app.globalSearch.IsVisible() {
+		t.Fatalf("'/' must open the global search overlay")
+	}
+	if app.mode != ModeSearch {
+		t.Fatalf("'/' must put the app in ModeSearch, got %v", app.mode)
+	}
+}
+
+func TestGlobalSearch_EmptyQueryDoesNotKickRemote(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	called := false
+	app.SetRemoteSearcher(func(ctx context.Context, q string, gen uint64) tea.Msg {
+		called = true
+		return SearchResultsMsg{Gen: gen, Query: q}
+	})
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	cmd := app.handleGlobalSearchMode(tea.KeyPressMsg{Code: tea.KeyBackspace})
+	if cmd != nil {
+		t.Fatalf("backspace with empty query must not schedule a debounce tick")
+	}
+	if called {
+		t.Fatalf("remote searcher must not run for an empty query")
+	}
+}
+
+func TestGlobalSearch_TypingSchedulesDebounceTick(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	app.SetRemoteSearcher(func(ctx context.Context, q string, gen uint64) tea.Msg {
+		return SearchResultsMsg{Gen: gen, Query: q}
+	})
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+
+	cmd := app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	if cmd == nil {
+		t.Fatalf("typing a printable rune must schedule a debounce tick")
+	}
+	if app.searchGen == 0 {
+		t.Fatalf("searchGen must increment on first keystroke")
+	}
+	if got := app.globalSearch.Query(); got != "d" {
+		t.Fatalf("query: got %q", got)
+	}
+}
+
+func TestGlobalSearch_StaleDebounceDropped(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	called := 0
+	app.SetRemoteSearcher(func(ctx context.Context, q string, gen uint64) tea.Msg {
+		called++
+		return SearchResultsMsg{Gen: gen, Query: q}
+	})
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	staleGen := app.searchGen
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'e', Text: "e"})
+
+	// Replay the older tick. It must be dropped without invoking the
+	// searcher.
+	_, _ = app.Update(SearchDebounceMsg{Gen: staleGen})
+	if called != 0 {
+		t.Fatalf("stale debounce tick must not invoke the searcher (called=%d)", called)
+	}
+}
+
+func TestGlobalSearch_StaleResultsDropped(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	staleQuery := app.globalSearch.Query()
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'e', Text: "e"})
+
+	_, _ = app.Update(SearchResultsMsg{
+		Gen:   app.searchGen,
+		Query: staleQuery,
+		Messages: []globalsearch.Item{
+			{ID: "T1", Name: "stale-hit", ChannelID: "C1"},
+		},
+	})
+	if got := app.globalSearch.SectionLen(globalsearch.CategoryMessage); got != 0 {
+		t.Fatalf("stale results must be dropped (got %d)", got)
+	}
+}
+
+func TestGlobalSearch_ResultsArrivePopulateMessageSection(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+
+	_, _ = app.Update(SearchResultsMsg{
+		Gen:   app.searchGen,
+		Query: app.globalSearch.Query(),
+		Messages: []globalsearch.Item{
+			{ID: "T1", Name: "jinku — deploy", ChannelID: "C1", MessageTS: "1.0"},
+		},
+	})
+	if got := app.globalSearch.SectionLen(globalsearch.CategoryMessage); got != 1 {
+		t.Fatalf("expected 1 message hit, got %d", got)
+	}
+}
+
+func TestGlobalSearch_RemoteFailureSurfacesToast(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+
+	_, cmd := app.Update(SearchResultsMsg{
+		Gen:   app.searchGen,
+		Query: app.globalSearch.Query(),
+		Err:   errors.New("rate limited"),
+	})
+	if cmd == nil {
+		t.Fatalf("err result must surface a toast cmd")
+	}
+	produced := cmd()
+	toast, ok := produced.(ToastMsg)
+	if !ok {
+		t.Fatalf("expected ToastMsg, got %T", produced)
+	}
+	if !strings.Contains(toast.Text, "rate limited") {
+		t.Fatalf("toast must include error: got %q", toast.Text)
+	}
+}
+
+func TestGlobalSearch_DebouncePathIsAsync(t *testing.T) {
+	// Searcher blocks until released; the Update goroutine must not
+	// wait on it (193082a deadlock-fix lesson).
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	release := make(chan struct{})
+	app.SetRemoteSearcher(func(ctx context.Context, q string, gen uint64) tea.Msg {
+		<-release
+		return SearchResultsMsg{Gen: gen, Query: q}
+	})
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+
+	done := make(chan struct{})
+	go func() {
+		_, cmd := app.Update(SearchDebounceMsg{Gen: app.searchGen})
+		if cmd != nil {
+			// Resolve the cmd off the Update goroutine.
+			go func() {
+				_ = cmd()
+			}()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+		// Update returned promptly even though the searcher is blocked.
+	case <-time.After(100 * time.Millisecond):
+		close(release)
+		t.Fatalf("Update did not return within 100ms; remote searcher is being called synchronously on the Update goroutine — risks bubbletea Send-from-Update deadlock")
+	}
+	close(release)
 }

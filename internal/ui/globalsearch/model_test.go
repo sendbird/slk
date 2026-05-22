@@ -7,10 +7,11 @@ import (
 
 func newWithItems(t *testing.T, items []Item) *Model {
 	t.Helper()
-	m := New()
+	mv := New()
+	m := &mv
 	m.SetItems(items)
 	m.Open()
-	return &m
+	return m
 }
 
 func filteredNames(m *Model) []string {
@@ -178,26 +179,28 @@ func TestBackspaceTrimsQuery(t *testing.T) {
 }
 
 func TestSyntheticPinnedEvenAcrossSetItems(t *testing.T) {
-	m := New()
+	mv := New()
+	m := &mv
 	m.SetSyntheticItems([]Item{{ID: ThreadsViewID, Name: "Threads", Type: "threads"}})
 	m.SetItems([]Item{{ID: "C1", Name: "general", Type: "channel", Joined: true}})
 	m.Open()
 
-	if got := sectionNames(&m, CategorySynthetic); len(got) != 1 || got[0] != "Threads" {
+	if got := sectionNames(m, CategorySynthetic); len(got) != 1 || got[0] != "Threads" {
 		t.Fatalf("synthetic survived SetItems: got %v", got)
 	}
-	if got := sectionNames(&m, CategoryChannel); len(got) != 1 || got[0] != "general" {
+	if got := sectionNames(m, CategoryChannel); len(got) != 1 || got[0] != "general" {
 		t.Fatalf("channel section after SetItems: got %v", got)
 	}
 }
 
 func TestSetBrowseablePreservesJoined(t *testing.T) {
-	m := New()
+	mv := New()
+	m := &mv
 	m.SetItems([]Item{{ID: "C1", Name: "joined-channel", Type: "channel", Joined: true}})
 	m.SetBrowseable([]Item{{ID: "C2", Name: "public-channel", Type: "channel"}})
 	m.Open()
 
-	got := sectionNames(&m, CategoryChannel)
+	got := sectionNames(m, CategoryChannel)
 	if len(got) != 2 {
 		t.Fatalf("both joined and browseable visible: got %v", got)
 	}
@@ -211,7 +214,8 @@ func TestSetBrowseablePreservesJoined(t *testing.T) {
 }
 
 func TestMarkJoinedFlipsBit(t *testing.T) {
-	m := New()
+	mv := New()
+	m := &mv
 	m.SetBrowseable([]Item{{ID: "C1", Name: "browseable", Type: "channel"}})
 	m.MarkJoined("C1")
 	m.Open()
@@ -223,7 +227,8 @@ func TestMarkJoinedFlipsBit(t *testing.T) {
 }
 
 func TestUpdateLastVisitedReordersUnderEmptyQuery(t *testing.T) {
-	m := New()
+	mv := New()
+	m := &mv
 	m.SetItems([]Item{
 		{ID: "C1", Name: "alpha", Type: "channel", Joined: true},
 		{ID: "C2", Name: "beta", Type: "channel", Joined: true},
@@ -231,7 +236,7 @@ func TestUpdateLastVisitedReordersUnderEmptyQuery(t *testing.T) {
 	m.Open()
 
 	m.UpdateLastVisited("C2", 100)
-	got := sectionNames(&m, CategoryChannel)
+	got := sectionNames(m, CategoryChannel)
 	if len(got) < 2 || got[0] != "beta" {
 		t.Fatalf("most recent visit must rank first: got %v", got)
 	}
@@ -258,7 +263,8 @@ func TestRenderBoxShowsSectionHeaders(t *testing.T) {
 }
 
 func TestRenderEmptyQueryShowsHint(t *testing.T) {
-	m := New()
+	mv := New()
+	m := &mv
 	m.Open()
 	rendered := m.View(80)
 	if !strings.Contains(rendered, "Type to search") {
@@ -369,5 +375,102 @@ func TestControlKeyStringsDoNotPolluteQuery(t *testing.T) {
 	m.HandleKey("alt+x")
 	if got := m.Query(); got != "" {
 		t.Fatalf("control key strings leaked into query: got %q", got)
+	}
+}
+
+func TestSetMessageResultsAddsSection(t *testing.T) {
+	m := newWithItems(t, []Item{{ID: "C1", Name: "deploy", Type: "channel", Joined: true}})
+	m.HandleKey("d")
+	m.HandleKey("e")
+	m.HandleKey("p")
+
+	m.SetMessageResults(m.Query(), []Item{
+		{ID: "T1", Name: "jinku — deploy is failing", ChannelID: "C1", MessageTS: "1.0"},
+		{ID: "T2", Name: "hyojin — deploying tonight", ChannelID: "C1", MessageTS: "2.0"},
+	})
+
+	got := sectionNames(m, CategoryMessage)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 message hits, got %v", got)
+	}
+	// Order from the server must be preserved — no client-side
+	// fuzzy re-ranking on remote rows.
+	if got[0] != "jinku — deploy is failing" {
+		t.Fatalf("server order must be preserved: got %v", got)
+	}
+}
+
+func TestSetMessageResultsDroppedWhenQueryChanged(t *testing.T) {
+	m := newWithItems(t, []Item{{ID: "C1", Name: "deploy", Type: "channel", Joined: true}})
+	m.HandleKey("d")
+	staleQuery := m.Query()
+	m.HandleKey("e")
+	m.HandleKey("p")
+
+	m.SetMessageResults(staleQuery, []Item{
+		{ID: "T1", Name: "stale-result", ChannelID: "C1"},
+	})
+	if got := sectionNames(m, CategoryMessage); len(got) != 0 {
+		t.Fatalf("stale remote results must be dropped: got %v", got)
+	}
+}
+
+func TestQueryChangeClearsRemoteResults(t *testing.T) {
+	m := newWithItems(t, []Item{{ID: "C1", Name: "deploy", Type: "channel", Joined: true}})
+	m.HandleKey("d")
+	m.SetMessageResults(m.Query(), []Item{
+		{ID: "T1", Name: "first-query-hit", ChannelID: "C1"},
+	})
+	if got := sectionNames(m, CategoryMessage); len(got) != 1 {
+		t.Fatalf("setup precondition: got %v", got)
+	}
+	// Next keystroke must flush stale remote rows immediately so
+	// they don't briefly render alongside the new query while
+	// awaiting the next round-trip.
+	m.HandleKey("e")
+	if got := sectionNames(m, CategoryMessage); len(got) != 0 {
+		t.Fatalf("remote results must clear on query change: got %v", got)
+	}
+}
+
+func TestOpenClearsRemoteResults(t *testing.T) {
+	m := newWithItems(t, []Item{{ID: "C1", Name: "deploy", Type: "channel", Joined: true}})
+	m.HandleKey("d")
+	m.SetMessageResults(m.Query(), []Item{{ID: "T1", Name: "hit", ChannelID: "C1"}})
+	m.Close()
+	m.Open()
+	if got := sectionNames(m, CategoryMessage); len(got) != 0 {
+		t.Fatalf("Open must clear remote results: got %v", got)
+	}
+}
+
+func TestSetFileResultsAddsSection(t *testing.T) {
+	m := newWithItems(t, []Item{{ID: "C1", Name: "deploy", Type: "channel", Joined: true}})
+	m.HandleKey("d")
+	m.SetFileResults(m.Query(), []Item{
+		{ID: "F1", Name: "deploy.png", Subtitle: "image/png", Permalink: "https://x"},
+	})
+	got := sectionNames(m, CategoryFile)
+	if len(got) != 1 || got[0] != "deploy.png" {
+		t.Fatalf("file section: got %v", got)
+	}
+}
+
+func TestEnterOnMessageResultCarriesChannelMetadata(t *testing.T) {
+	m := newWithItems(t, []Item{})
+	m.HandleKey("d")
+	m.SetMessageResults(m.Query(), []Item{
+		{ID: "T1", Name: "jinku — deploy", ChannelID: "C42", ChannelName: "eng-deploy", MessageTS: "9.99", Permalink: "https://"},
+	})
+	// First selectable row should be the message hit.
+	res := m.HandleKey("enter")
+	if res == nil {
+		t.Fatalf("enter on message hit returned nil")
+	}
+	if res.ChannelID != "C42" || res.MessageTS != "9.99" {
+		t.Fatalf("Result carries channel/ts: got %+v", res)
+	}
+	if res.Type != "message" {
+		t.Fatalf("Result.Type: got %q want \"message\"", res.Type)
 	}
 }

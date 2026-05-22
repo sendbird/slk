@@ -243,6 +243,8 @@ type mockSlackAPI struct {
 	uploadToURLFn                   func(ctx context.Context, params slack.UploadToURLParameters) error
 	completeUploadExternalContextFn func(ctx context.Context, params slack.CompleteUploadExternalParameters) (*slack.CompleteUploadExternalResponse, error)
 	getUsersInConversationContextFn func(ctx context.Context, params *slack.GetUsersInConversationParameters) ([]string, string, error)
+	searchMessagesContextFn         func(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchMessages, error)
+	searchFilesContextFn            func(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchFiles, error)
 }
 
 func (m *mockSlackAPI) GetConversations(params *slack.GetConversationsParameters) ([]slack.Channel, string, error) {
@@ -398,6 +400,20 @@ func (m *mockSlackAPI) GetUsersInConversationContext(ctx context.Context, params
 		return m.getUsersInConversationContextFn(ctx, params)
 	}
 	return nil, "", nil
+}
+
+func (m *mockSlackAPI) SearchMessagesContext(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchMessages, error) {
+	if m.searchMessagesContextFn != nil {
+		return m.searchMessagesContextFn(ctx, query, params)
+	}
+	return &slack.SearchMessages{}, nil
+}
+
+func (m *mockSlackAPI) SearchFilesContext(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchFiles, error) {
+	if m.searchFilesContextFn != nil {
+		return m.searchFilesContextFn(ctx, query, params)
+	}
+	return &slack.SearchFiles{}, nil
 }
 
 func TestUploadFile_Success(t *testing.T) {

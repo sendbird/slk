@@ -80,6 +80,14 @@ type Item struct {
 	// Synthetic pins this row into the synthetic section regardless of
 	// Type.
 	Synthetic bool
+
+	// Remote-result metadata. Populated for Type=="message" and
+	// Type=="file" items so the App can route Enter back to the
+	// correct channel / file. Empty for local items.
+	ChannelID   string
+	ChannelName string
+	MessageTS   string
+	Permalink   string
 }
 
 // Category returns the section this item belongs to.
@@ -108,6 +116,14 @@ type Result struct {
 	Name   string
 	Type   string
 	Joined bool
+
+	// Remote-result metadata. Set when the picked row was a remote
+	// message or file hit so the App can navigate to channel + ts
+	// (PR3) or open a file URL.
+	ChannelID   string
+	ChannelName string
+	MessageTS   string
+	Permalink   string
 }
 
 // Model is the overlay state.
@@ -206,6 +222,69 @@ func (m *Model) UpdateLastVisited(id string, ts int64) {
 	}
 }
 
+// SetMessageResults replaces the Message section with `items`, in the
+// order provided (server-side ranking is preserved). The call is
+// dropped if `forQuery` no longer matches the current query — that
+// guard, plus the App-level request-generation guard, protects the
+// overlay from stale remote results landing after the user typed
+// further.
+func (m *Model) SetMessageResults(forQuery string, items []Item) {
+	if forQuery != m.query {
+		return
+	}
+	m.replaceCategory(CategoryMessage, items, "message")
+	if m.visible {
+		m.filter()
+	}
+}
+
+// SetFileResults mirrors SetMessageResults for the Files section.
+func (m *Model) SetFileResults(forQuery string, items []Item) {
+	if forQuery != m.query {
+		return
+	}
+	m.replaceCategory(CategoryFile, items, "file")
+	if m.visible {
+		m.filter()
+	}
+}
+
+// clearRemote drops Message + File rows. Used on Open/Close and on
+// every query mutation to avoid stale rows leaking between queries.
+func (m *Model) clearRemote() {
+	if len(m.items) == 0 {
+		return
+	}
+	keep := m.items[:0]
+	for _, it := range m.items {
+		if c := it.Category(); c == CategoryMessage || c == CategoryFile {
+			continue
+		}
+		keep = append(keep, it)
+	}
+	m.items = keep
+}
+
+// replaceCategory swaps out all items currently in `cat` for the
+// given new items, forcing each new item's Type so Category() returns
+// the right value.
+func (m *Model) replaceCategory(cat string, items []Item, forceType string) {
+	keep := m.items[:0]
+	for _, it := range m.items {
+		if it.Category() == cat {
+			continue
+		}
+		keep = append(keep, it)
+	}
+	m.items = keep
+	for _, it := range items {
+		if forceType != "" {
+			it.Type = forceType
+		}
+		m.items = append(m.items, it)
+	}
+}
+
 func (m *Model) extractSynthetic() []Item {
 	var synth []Item
 	for _, it := range m.items {
@@ -221,12 +300,16 @@ func (m *Model) Open() {
 	m.visible = true
 	m.query = ""
 	m.selected = 0
+	m.clearRemote()
 	m.filter()
 }
 
 // Close hides the overlay.
 func (m *Model) Close() {
 	m.visible = false
+	// Drop remote results so a debounced Cmd that lands after the
+	// overlay closed can't seed stale rows into the next Open().
+	m.clearRemote()
 }
 
 // IsVisible returns whether the overlay is showing.
@@ -234,6 +317,11 @@ func (m Model) IsVisible() bool { return m.visible }
 
 // Query returns the current query text.
 func (m Model) Query() string { return m.query }
+
+// SectionLen returns the number of rows currently rendered in the
+// given category. Useful for app-level tests that assert remote
+// results landed in the right bucket without poking at internals.
+func (m Model) SectionLen(cat string) int { return len(m.sectionItems[cat]) }
 
 // HandleKey is the input entrypoint. Returns a Result when the user
 // confirms a selection, otherwise nil.
@@ -243,7 +331,16 @@ func (m *Model) HandleKey(keyStr string) *Result {
 		if len(m.flat) > 0 && m.selected >= 0 && m.selected < len(m.flat) {
 			idx := m.flat[m.selected]
 			it := m.items[idx]
-			return &Result{ID: it.ID, Name: it.Name, Type: it.Type, Joined: it.Joined}
+			return &Result{
+				ID:          it.ID,
+				Name:        it.Name,
+				Type:        it.Type,
+				Joined:      it.Joined,
+				ChannelID:   it.ChannelID,
+				ChannelName: it.ChannelName,
+				MessageTS:   it.MessageTS,
+				Permalink:   it.Permalink,
+			}
 		}
 		return nil
 	case "esc":
@@ -266,6 +363,7 @@ func (m *Model) HandleKey(keyStr string) *Result {
 			_, sz := utf8.DecodeLastRuneInString(m.query)
 			m.query = m.query[:n-sz]
 			m.selected = 0
+			m.clearRemote()
 			m.filter()
 		}
 		return nil
@@ -277,6 +375,7 @@ func (m *Model) HandleKey(keyStr string) *Result {
 	if r, sz := utf8.DecodeRuneInString(keyStr); sz == len(keyStr) && r != utf8.RuneError && !unicode.IsControl(r) {
 		m.query += keyStr
 		m.selected = 0
+		m.clearRemote()
 		m.filter()
 	}
 	return nil
@@ -310,11 +409,20 @@ func (m *Model) filter() {
 	q := text.Fold(m.query)
 	cands := map[string][]candidate{}
 	for i, it := range m.items {
+		cat := it.Category()
+		// Remote rows (Message/File) are pre-ranked by the server and
+		// reflect the query they were fetched for. We do not re-run
+		// the local fuzzy ranker on them: it would discard hits whose
+		// names don't share runes with the query and reorder them in
+		// ways the user didn't ask for.
+		if cat == CategoryMessage || cat == CategoryFile {
+			cands[cat] = append(cands[cat], candidate{idx: i})
+			continue
+		}
 		c, ok := rank(it, q)
 		if !ok {
 			continue
 		}
-		cat := it.Category()
 		cands[cat] = append(cands[cat], candidate{match: c, idx: i})
 	}
 
@@ -372,6 +480,13 @@ func rank(item Item, q string) (match, bool) {
 }
 
 func (m *Model) sortCandidates(cat string, slice []candidate) {
+	// Remote sections trust the server-side ranking and the order of
+	// items passed to SetMessageResults / SetFileResults. The model's
+	// own ranker doesn't have signal the server has (recency,
+	// relevance, channel context), so we preserve order as-is.
+	if cat == CategoryMessage || cat == CategoryFile {
+		return
+	}
 	// Synthetic destinations rank within match tier (so a prefix
 	// match — e.g. "thr" → Threads — outranks a subsequence match)
 	// and within a tier we preserve registration order via idx so

@@ -401,6 +401,25 @@ type (
 	// 3 seconds via a CopiedClearMsg tick scheduled by the App.
 	ToastMsg                struct{ Text string }
 	SlashCommandExecutedMsg struct{ Text string }
+
+	// SearchDebounceMsg fires after the debounce delay following the most
+	// recent query keystroke in the global search overlay. The handler
+	// drops the message if Gen != app.searchGen at fire time (newer
+	// keystrokes already invalidated this tick).
+	SearchDebounceMsg struct {
+		Gen uint64
+	}
+	// SearchResultsMsg carries remote search results back from a
+	// SearchFunc dispatched by SearchDebounceMsg. The handler drops the
+	// message if Gen / Query no longer match (a newer query already
+	// superseded this fetch).
+	SearchResultsMsg struct {
+		Gen      uint64
+		Query    string
+		Messages []globalsearch.Item
+		Files    []globalsearch.Item
+		Err      error
+	}
 )
 
 type loadingEntry struct {
@@ -499,6 +518,13 @@ type SwitchWorkspaceFunc func(teamID string) tea.Msg
 
 // ChannelFetchFunc is called when the user selects a channel.
 type ChannelFetchFunc func(channelID, channelName string) tea.Msg
+
+// SearchFunc runs remote message/file search and returns the result
+// as a tea.Msg. Implementations should perform the network call on
+// the caller's goroutine (the tea.Cmd produced by the App). `gen` is
+// the request generation the result must report back so the App can
+// drop stale results.
+type SearchFunc func(ctx context.Context, query string, gen uint64) tea.Msg
 
 // ChannelCacheReadFunc is called synchronously when the user selects a
 // channel; it returns cached messages from local storage. Returning a
@@ -808,6 +834,17 @@ type App struct {
 
 	// Callbacks
 	channelFetcher ChannelFetchFunc
+	// remoteSearcher fires search.messages + search.files when the
+	// global search overlay's query changes. Wired by main.go.
+	remoteSearcher SearchFunc
+	// searchGen monotonically increments on every query change in the
+	// global search overlay; debounce and result handlers use it to
+	// drop stale fetches.
+	searchGen uint64
+	// searchLastQuery is the query value captured at the previous
+	// HandleKey call so the App can detect changes and bump
+	// searchGen.
+	searchLastQuery string
 	// channelReadMarker fires Slack's MarkChannel + cache.UpdateChannelReadState
 	// for the given channel up to ts. Returns a tea.Msg (typically
 	// ChannelMarkedReadMsg). Wired in cmd/slk/main.go's wireCallbacks.
@@ -2887,6 +2924,58 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return statusbar.CopiedClearMsg{}
 		}))
 
+	case SearchDebounceMsg:
+		// Drop stale ticks: only the most recent generation should
+		// trigger a network call. Also drop if the overlay closed or
+		// the query reset to empty in the interim.
+		if msg.Gen != a.searchGen {
+			break
+		}
+		if !a.globalSearch.IsVisible() {
+			break
+		}
+		q := a.globalSearch.Query()
+		if strings.TrimSpace(q) == "" {
+			break
+		}
+		if a.remoteSearcher == nil {
+			break
+		}
+		gen := a.searchGen
+		searcher := a.remoteSearcher
+		cmds = append(cmds, func() tea.Msg {
+			// Use a background context bounded by SearchFunc; the
+			// 193082a deadlock-fix lesson is: do not call p.Send
+			// from this goroutine. SearchFunc returns the SearchResultsMsg
+			// directly via tea.Cmd.
+			return searcher(context.Background(), q, gen)
+		})
+
+	case SearchResultsMsg:
+		// Stale-result guards mirror the debounce path: drop if the
+		// user has typed further (gen mismatch), if the query no
+		// longer matches, or if the overlay closed in the meantime.
+		if msg.Gen != a.searchGen {
+			break
+		}
+		if !a.globalSearch.IsVisible() {
+			break
+		}
+		if msg.Query != a.globalSearch.Query() {
+			break
+		}
+		if msg.Err != nil {
+			// Remote search failed (rate limited, network, scope, …).
+			// Surface a toast and keep the local results visible so
+			// channels/people search still works.
+			cmds = append(cmds, func() tea.Msg {
+				return ToastMsg{Text: "Search failed: " + msg.Err.Error()}
+			})
+			break
+		}
+		a.globalSearch.SetMessageResults(msg.Query, msg.Messages)
+		a.globalSearch.SetFileResults(msg.Query, msg.Files)
+
 	case TypingExpiredMsg:
 		a.expireTypingUsers()
 		// Continue ticking if there are still active typers
@@ -3775,6 +3864,32 @@ func (a *App) handleGlobalSearchMode(msg tea.KeyMsg) tea.Cmd {
 		if result.Type == "activity" {
 			return func() tea.Msg { return ActivityViewActivatedMsg{} }
 		}
+		// Remote-message and remote-file routing land in PR3. For now
+		// dropping into the corresponding channel is a useful
+		// approximation: opening the message's channel surfaces the
+		// thread without a precise scroll.
+		if result.Type == "message" && result.ChannelID != "" {
+			channelID, channelName := result.ChannelID, result.ChannelName
+			if channelName == "" {
+				channelName = result.Name
+			}
+			a.sidebar.SelectByID(channelID)
+			return func() tea.Msg {
+				return ChannelSelectedMsg{ID: channelID, Name: channelName, Type: "channel"}
+			}
+		}
+		if result.Type == "file" {
+			// No in-app file viewer yet. The status bar toast surfaces
+			// the permalink so the user can open it manually; PR3 may
+			// wire a richer file action.
+			perm := result.Permalink
+			if perm == "" {
+				perm = result.Name
+			}
+			return func() tea.Msg {
+				return ToastMsg{Text: "File: " + perm}
+			}
+		}
 		if result.Joined {
 			a.sidebar.SelectByID(result.ID)
 			return func() tea.Msg {
@@ -3792,6 +3907,25 @@ func (a *App) handleGlobalSearchMode(msg tea.KeyMsg) tea.Cmd {
 
 	if !a.globalSearch.IsVisible() {
 		a.SetMode(ModeNormal)
+		return nil
+	}
+
+	// Detect a query change so we can debounce a remote search. The
+	// model authoritatively owns the query string; we compare against
+	// the value we last observed and bump the generation when it
+	// shifts. Each keystroke bumps the gen and schedules a fresh
+	// debounce tick — the gen guard ensures only the most recent
+	// tick triggers the network call.
+	if q := a.globalSearch.Query(); q != a.searchLastQuery {
+		a.searchLastQuery = q
+		a.searchGen++
+		if a.remoteSearcher == nil || strings.TrimSpace(q) == "" {
+			return nil
+		}
+		gen := a.searchGen
+		return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
+			return SearchDebounceMsg{Gen: gen}
+		})
 	}
 	return nil
 }
@@ -5225,6 +5359,15 @@ func (a *App) SetActivityListFetcher(f ActivityListFetchFunc) {
 func (a *App) SetChannelFinderItems(items []channelfinder.Item) {
 	a.channelFinder.SetItems(items)
 	a.globalSearch.SetItems(globalSearchItemsFromFinder(items))
+}
+
+// SetRemoteSearcher wires the closure that performs remote message
+// and file search for the global search overlay. Called from
+// cmd/slk/main.go alongside SetChannelFetcher; left unset for tests
+// (the overlay still works with channels + people in that case, just
+// without remote categories).
+func (a *App) SetRemoteSearcher(fn SearchFunc) {
+	a.remoteSearcher = fn
 }
 
 // globalSearchItemsFromFinder converts the channelfinder Item list into
