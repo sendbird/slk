@@ -284,7 +284,8 @@ type (
 		// SectionsProvider supplies Slack-native sidebar sections for this
 		// workspace. Nil means "use config-glob behavior" (the App's
 		// sidebar reverts to its existing name-keyed buckets).
-		SectionsProvider sidebar.SectionsProvider
+		SectionsProvider    sidebar.SectionsProvider
+		LastViewedChannelID string
 	}
 	// ReadStateChangedMsg is sent whenever the persistent read state changes,
 	// so panels that read from cache.GetWorkspaceReadState re-render.
@@ -351,7 +352,8 @@ type (
 		// workspace to successfully connect. main.go enforces the uniqueness
 		// via sync.Once + atomic router (Task 14). App's handler treats
 		// InitialActive=false as "workspace is up; threads-list kick only".
-		InitialActive bool
+		InitialActive       bool
+		LastViewedChannelID string
 	}
 	// CustomEmojisLoadedMsg is sent when a workspace's custom emoji list
 	// finishes loading in the background, after WorkspaceReadyMsg has
@@ -803,6 +805,14 @@ type App struct {
 	// messages (defensive — main.go's sync.Once should prevent them) are
 	// ignored.
 	bootstrapActiveClaimed bool
+	// pendingInitialReadyTeamName/pendingInitialRestoreChannelID are set when
+	// the initial active workspace arrives with a persisted restore target but
+	// an empty channel list. That transient state can happen while Slack is
+	// still hydrating DMs; keeping the loading overlay up avoids flashing
+	// "No channels" / "#" before the real list lands, and the pending ID is
+	// selected once the list arrives.
+	pendingInitialReadyTeamName    string
+	pendingInitialRestoreChannelID string
 
 	// Callbacks
 	channelFetcher ChannelFetchFunc
@@ -887,6 +897,7 @@ type App struct {
 	// Reaction picker
 	reactionPicker   *reactionpicker.Model
 	confirmPrompt    *confirmprompt.Model
+	keyDebugEnabled  bool
 	reactionAddFn    ReactionAddFunc
 	reactionRemoveFn ReactionRemoveFunc
 	frecentLoadFn    FrecentLoadFunc
@@ -1093,6 +1104,7 @@ func NewApp() *App {
 		lastChannelByTeam:     map[string]string{},
 		navHistory:            make(map[string]*navStack),
 		clipboardRead:         defaultClipboardReader,
+		keyDebugEnabled:       os.Getenv("SLK_KEY_DEBUG") != "",
 	}
 	// Seed the picker with built-in emojis so the autocomplete works even
 	// before the first workspace finishes loading customs.
@@ -1133,6 +1145,58 @@ func (a *App) Init() tea.Cmd {
 		)
 	}
 	return nil
+}
+
+func exactChannelByID(channels []sidebar.ChannelItem, id string) (sidebar.ChannelItem, bool) {
+	if id == "" {
+		return sidebar.ChannelItem{}, false
+	}
+	for _, ch := range channels {
+		if ch.ID == id {
+			return ch, true
+		}
+	}
+	return sidebar.ChannelItem{}, false
+}
+
+func (a *App) finishPendingInitialReadyWithChannels(channels []sidebar.ChannelItem, allowFallback bool) tea.Cmd {
+	if a.pendingInitialRestoreChannelID == "" || len(channels) == 0 || a.activeChannelID != "" {
+		return nil
+	}
+	target, ok := exactChannelByID(channels, a.pendingInitialRestoreChannelID)
+	if !ok {
+		if !allowFallback {
+			return nil
+		}
+		target = channels[0]
+	}
+	teamName := a.pendingInitialReadyTeamName
+	a.pendingInitialReadyTeamName = ""
+	a.pendingInitialRestoreChannelID = ""
+	if teamName != "" {
+		a.MarkWorkspaceReady(teamName)
+	}
+	a.sidebar.SelectByID(target.ID)
+	return func() tea.Msg {
+		return ChannelSelectedMsg{ID: target.ID, Name: target.Name, Type: target.Type}
+	}
+}
+
+func channelTargetByID(channels []sidebar.ChannelItem, ids ...string) (sidebar.ChannelItem, bool) {
+	if len(channels) == 0 {
+		return sidebar.ChannelItem{}, false
+	}
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		for _, ch := range channels {
+			if ch.ID == id {
+				return ch, true
+			}
+		}
+	}
+	return channels[0], true
 }
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1638,6 +1702,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, a.uploadToastCmd("Upload in progress", 2*time.Second))
 			break
 		}
+		// Any explicit channel selection means the user/app has moved past
+		// the deferred startup restore intent. If the selection came from the
+		// deferred helper, it already cleared these fields before emitting this
+		// message; otherwise this prevents a late DM hydration event from
+		// stealing focus back after timeout/manual navigation.
+		a.pendingInitialReadyTeamName = ""
+		a.pendingInitialRestoreChannelID = ""
 		a.cancelEdit()
 		// Picking a channel always exits synthetic list views.
 		a.view = ViewChannels
@@ -2026,6 +2097,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case SendMessageMsg:
+		debuglog.General("[send] SendMessageMsg channel=%s active=%s text_len=%d sender_wired=%v", msg.ChannelID, a.activeChannelID, len(msg.Text), a.messageSender != nil)
 		// Mark in-flight regardless of whether a sender is wired —
 		// the user's send intent is what controls WS-echo suppression
 		// for self-user messages on this channel.
@@ -2082,6 +2154,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case MessageSentMsg:
+		debuglog.General("[send] MessageSentMsg channel=%s active=%s ts=%s local=%s", msg.ChannelID, a.activeChannelID, msg.Message.TS, msg.LocalTS)
 		// The chat.postMessage HTTP response landed. If a "local:..."
 		// placeholder is in the pane from the instant-display path
 		// (SendMessageMsg above), swap it for the authoritative
@@ -2105,6 +2178,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case MessageSendFailedMsg:
+		debuglog.General("[send] MessageSendFailedMsg channel=%s active=%s local=%s reason=%q", msg.ChannelID, a.activeChannelID, msg.LocalTS, msg.Reason)
 		// The chat.postMessage HTTP call failed; roll back the
 		// optimistic placeholder so the user can see the send didn't
 		// go through. A toast surfaces the reason.
@@ -2342,6 +2416,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case SendThreadReplyMsg:
+		debuglog.General("[send] SendThreadReplyMsg channel=%s thread=%s text_len=%d sender_wired=%v", msg.ChannelID, msg.ThreadTS, len(msg.Text), a.threadReplySender != nil)
 		a.markSelfSendInFlight(msg.ChannelID)
 		// Instant-display: append an optimistic placeholder to the
 		// thread panel immediately, before the chat.postMessage HTTP
@@ -2582,16 +2657,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// one and it still exists; otherwise fall back to the first
 		// channel in the sidebar. Move the sidebar cursor to that
 		// channel as well so the highlight matches the messages pane.
-		if len(msg.Channels) > 0 {
-			target := msg.Channels[0]
-			if savedID, ok := a.lastChannelByTeam[msg.TeamID]; ok && savedID != "" {
-				for _, ch := range msg.Channels {
-					if ch.ID == savedID {
-						target = ch
-						break
-					}
-				}
-			}
+		if target, ok := channelTargetByID(msg.Channels, a.lastChannelByTeam[msg.TeamID], msg.LastViewedChannelID); ok {
 			a.sidebar.SelectByID(target.ID)
 			cmds = append(cmds, func() tea.Msg {
 				return ChannelSelectedMsg{ID: target.ID, Name: target.Name, Type: target.Type}
@@ -2629,6 +2695,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ConversationOpenedMsg:
 		if msg.TeamID == a.activeTeamID {
 			a.sidebar.UpsertItem(msg.Item)
+			if cmd := a.finishPendingInitialReadyWithChannels([]sidebar.ChannelItem{msg.Item}, false); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 		// Inactive-workspace events update WorkspaceContext.Channels
 		// from the rtmEventHandler in cmd/slk/main.go (Task 6); App.Update
@@ -2637,6 +2706,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case SectionsRefreshedMsg:
 		if msg.TeamID == a.activeTeamID {
 			a.SetChannels(msg.Channels)
+			if cmd := a.finishPendingInitialReadyWithChannels(msg.Channels, false); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 		// Inactive-workspace events have already updated the
 		// WorkspaceContext.Channels in cmd/slk; App.Update only mutates
@@ -2657,6 +2729,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case LoadingTimeoutMsg:
 		if a.loading {
+			a.pendingInitialReadyTeamName = ""
+			if a.activeChannelID == "" {
+				a.messagepane.SetLoading(false)
+			}
 			for i := range a.loadingStates {
 				if a.loadingStates[i].Status == "connecting" {
 					a.loadingStates[i].Status = "failed"
@@ -2666,7 +2742,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case WorkspaceReadyMsg:
-		a.MarkWorkspaceReady(msg.TeamName)
+		deferInitialReady := msg.InitialActive && len(msg.Channels) == 0 && msg.LastViewedChannelID != ""
+		if deferInitialReady {
+			a.pendingInitialReadyTeamName = msg.TeamName
+			a.pendingInitialRestoreChannelID = msg.LastViewedChannelID
+		} else {
+			a.MarkWorkspaceReady(msg.TeamName)
+		}
 		// Only the workspace flagged InitialActive auto-claims active state.
 		// main.go computes this deterministically (default_workspace match,
 		// else first to connect) so two simultaneous WorkspaceReadyMsgs
@@ -2713,16 +2795,22 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.statusbar.SetStatus("", false, time.Time{})
 			}
 			a.workspaceRail.SelectByID(msg.TeamID)
-			if len(msg.Channels) > 0 {
-				first := msg.Channels[0]
+			if target, ok := channelTargetByID(msg.Channels, msg.LastViewedChannelID); ok {
+				a.sidebar.SelectByID(target.ID)
 				a.messagepane.SetLoading(true)
 				a.messagepane.SetMessages(nil)
 				cmds = append(cmds, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
 					return SpinnerTickMsg{}
 				}))
 				cmds = append(cmds, func() tea.Msg {
-					return ChannelSelectedMsg{ID: first.ID, Name: first.Name, Type: first.Type}
+					return ChannelSelectedMsg{ID: target.ID, Name: target.Name, Type: target.Type}
 				})
+			} else if deferInitialReady {
+				a.messagepane.SetLoading(true)
+				a.messagepane.SetMessages(nil)
+				cmds = append(cmds, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+					return SpinnerTickMsg{}
+				}))
 			}
 		}
 		// Initial threads-list fetch fires for every workspace as it
@@ -2925,7 +3013,21 @@ func (a *App) shouldSuppressInsertText(msg tea.KeyMsg) bool {
 	return false
 }
 
+func (a *App) debugKey(msg tea.KeyMsg) {
+	if !a.keyDebugEnabled || !debuglog.Enabled() {
+		return
+	}
+	k := msg.Key()
+	kind := "press"
+	if _, ok := msg.(tea.KeyReleaseMsg); ok {
+		kind = "release"
+	}
+	debuglog.General("[key] kind=%s mode=%s string=%q keystroke=%q code=%U/%d text=%q mod=%v base=%U/%d shifted=%U/%d repeat=%v",
+		kind, a.mode, msg.String(), k.Keystroke(), k.Code, k.Code, k.Text, k.Mod, k.BaseCode, k.BaseCode, k.ShiftedCode, k.ShiftedCode, k.IsRepeat)
+}
+
 func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
+	a.debugKey(msg)
 	if _, ok := msg.(tea.KeyReleaseMsg); ok {
 		return nil
 	}
@@ -3560,6 +3662,7 @@ func (a *App) handleInsertMode(msg tea.KeyMsg) tea.Cmd {
 			return cmd
 		}
 		if isSend {
+			debuglog.General("[send] insert thread decision send=true newline=%v text_len=%d channel=%s thread=%s key=%q stroke=%q", isNewline, len(a.threadCompose.Value()), a.threadPanel.ChannelID(), a.threadPanel.ThreadTS(), stringForm, keystroke)
 			if len(a.threadCompose.Attachments()) > 0 {
 				cmd := a.submitWithAttachments(&a.threadCompose)
 				if a.threadCompose.Uploading() {
@@ -3615,6 +3718,7 @@ func (a *App) handleInsertMode(msg tea.KeyMsg) tea.Cmd {
 		return cmd
 	}
 	if isSend {
+		debuglog.General("[send] insert channel decision send=true newline=%v text_len=%d channel=%s active=%s key=%q stroke=%q", isNewline, len(a.compose.Value()), a.activeChannelID, a.activeChannelID, stringForm, keystroke)
 		if len(a.compose.Attachments()) > 0 {
 			cmd := a.submitWithAttachments(&a.compose)
 			if a.compose.Uploading() {
@@ -4886,6 +4990,9 @@ func (a *App) MarkWorkspaceFailed(teamName string) {
 }
 
 func (a *App) checkLoadingDone() {
+	if a.pendingInitialReadyTeamName != "" {
+		return
+	}
 	// Dismiss loading as soon as at least one workspace is ready.
 	// Other workspaces continue connecting in the background.
 	for _, e := range a.loadingStates {

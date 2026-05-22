@@ -56,6 +56,22 @@ var (
 	date    = "unknown"
 )
 
+// mostRecentlyVisitedChannelID returns the newest visited conversation ID.
+func mostRecentlyVisitedChannelID(visits map[string]int64) string {
+	var bestID string
+	var bestTS int64
+	for id, ts := range visits {
+		if id == "" {
+			continue
+		}
+		if bestID == "" || ts > bestTS || (ts == bestTS && id < bestID) {
+			bestID = id
+			bestTS = ts
+		}
+	}
+	return bestID
+}
+
 // UnresolvedDM tracks a DM channel whose user name wasn't in the initial user list.
 type UnresolvedDM struct {
 	ChannelID string
@@ -173,6 +189,10 @@ type WorkspaceContext struct {
 	// updated on every ChannelSelectedMsg via the visit recorder.
 	// Used to populate channelfinder.Item.LastVisited for sort.
 	LastVisitedByChannel map[string]int64
+	// LastViewedChannelID is the most recently visited conversation loaded
+	// from persistent channel_visits at workspace connect time. It is used
+	// to restore the initial channel/DM after an app restart.
+	LastViewedChannelID string
 	// UserResolver dispatches background users.info lookups for
 	// unknown message authors. Set in connectWorkspace once the
 	// in-memory UserNames map and the *tea.Program are both available.
@@ -912,10 +932,17 @@ func run() error {
 			if wctx == nil {
 				return
 			}
-			wctx.LastVisitedByChannel[channelID] = time.Now().Unix()
+			// Capture the visit timestamp synchronously so the async DB
+			// write below can't reorder visits that arrive close in time
+			// (e.g. user navigates A then B; without the snapshot, B's
+			// goroutine could schedule after A's and stamp A as newer,
+			// causing the next restart to restore A instead of B).
+			ts := time.Now().UnixMilli()
+			wctx.LastVisitedByChannel[channelID] = ts
+			wctx.LastViewedChannelID = channelID
 			teamID := wctx.TeamID
 			go func() {
-				if err := db.RecordChannelVisit(teamID, channelID); err != nil {
+				if err := db.RecordChannelVisit(teamID, channelID, ts); err != nil {
 					log.Printf("warning: recording channel visit %s/%s: %v", teamID, channelID, err)
 				}
 			}()
@@ -1351,17 +1378,18 @@ func run() error {
 		}
 
 		return ui.WorkspaceSwitchedMsg{
-			TeamID:           wctx.TeamID,
-			TeamName:         wctx.TeamName,
-			Theme:            cfg.ResolveTheme(teamID),
-			Channels:         wctx.Channels,
-			FinderItems:      wctx.FinderItems,
-			UserNames:        wctx.UserNames,
-			ExternalUsers:    external,
-			UserID:           wctx.UserID,
-			CustomEmoji:      wctx.CustomEmoji,
-			SlashCommands:    wctx.SlashCommands,
-			SectionsProvider: sectionsProviderAdapter{store: wctx.SectionStore},
+			TeamID:              wctx.TeamID,
+			TeamName:            wctx.TeamName,
+			Theme:               cfg.ResolveTheme(teamID),
+			Channels:            wctx.Channels,
+			FinderItems:         wctx.FinderItems,
+			UserNames:           wctx.UserNames,
+			ExternalUsers:       external,
+			UserID:              wctx.UserID,
+			CustomEmoji:         wctx.CustomEmoji,
+			SlashCommands:       wctx.SlashCommands,
+			SectionsProvider:    sectionsProviderAdapter{store: wctx.SectionStore},
+			LastViewedChannelID: wctx.LastViewedChannelID,
 		}
 	})
 
@@ -1496,18 +1524,19 @@ func run() error {
 			}
 
 			p.Send(ui.WorkspaceReadyMsg{
-				TeamID:           wctx.TeamID,
-				TeamName:         wctx.TeamName,
-				Theme:            cfg.ResolveTheme(wctx.TeamID),
-				Channels:         wctx.Channels,
-				FinderItems:      wctx.FinderItems,
-				UserNames:        wctx.UserNames,
-				ExternalUsers:    external,
-				UserID:           wctx.UserID,
-				CustomEmoji:      wctx.CustomEmoji, // empty at this point; filled by the goroutine below
-				SlashCommands:    wctx.SlashCommands,
-				SectionsProvider: sectionsProviderAdapter{store: wctx.SectionStore},
-				InitialActive:    isInitial,
+				TeamID:              wctx.TeamID,
+				TeamName:            wctx.TeamName,
+				Theme:               cfg.ResolveTheme(wctx.TeamID),
+				Channels:            wctx.Channels,
+				FinderItems:         wctx.FinderItems,
+				UserNames:           wctx.UserNames,
+				ExternalUsers:       external,
+				UserID:              wctx.UserID,
+				CustomEmoji:         wctx.CustomEmoji, // empty at this point; filled by the goroutine below
+				SlashCommands:       wctx.SlashCommands,
+				SectionsProvider:    sectionsProviderAdapter{store: wctx.SectionStore},
+				LastViewedChannelID: wctx.LastViewedChannelID,
+				InitialActive:       isInitial,
 			})
 
 			// Fetch workspace custom emojis in the background. When done,
@@ -1734,6 +1763,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		log.Printf("warning: loading channel visits for %s: %v", token.TeamName, err)
 	} else {
 		wctx.LastVisitedByChannel = visits
+		wctx.LastViewedChannelID = mostRecentlyVisitedChannelID(visits)
 	}
 	if commands, err := client.ListSlashCommands(ctx); err == nil {
 		if pickerCommands := buildSlashPickerCommands(commands); len(pickerCommands) > 0 {
