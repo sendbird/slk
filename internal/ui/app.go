@@ -2780,6 +2780,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			a.sidebar.SetSectionsProvider(msg.SectionsProvider)
 			a.SetChannels(msg.Channels)
+			if deferInitialReady {
+				// SetChannels just flipped sidebar.bootstrapLoading off
+				// (any SetItems call does). But we're explicitly waiting
+				// for DM hydration here, so re-arm the loading indicator
+				// so the sidebar shows the spinner instead of the empty-
+				// "No channels" placeholder until the late-arriving
+				// channels land.
+				a.sidebar.SetBootstrapLoading(true)
+			}
 			a.channelFinder.SetItems(msg.FinderItems)
 			// SetExternalUsers re-pushes user-names; calling SetUserNames
 			// last is the canonical state.
@@ -4967,6 +4976,14 @@ func (a *App) SetLoadingWorkspaces(names []string) {
 			Status:   "connecting",
 		})
 	}
+	// Flag the empty list panes as "still loading" so the global
+	// overlay's dismissal (which fires as soon as ONE workspace is
+	// ready — see checkLoadingDone) doesn't leave the active
+	// workspace's panes flashing "No channels" / "no threads" /
+	// "no activity" while their data is still in flight.
+	a.sidebar.SetBootstrapLoading(true)
+	a.threadsView.SetLoading(true)
+	a.activityView.SetLoading(true)
 }
 
 func (a *App) MarkWorkspaceReady(teamName string) {

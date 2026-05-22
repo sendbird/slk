@@ -254,6 +254,15 @@ type Model struct {
 	// Synthetic "Activity" row state.
 	activityUnread int
 
+	// bootstrapLoading is true between construction (or workspace
+	// switch) and the first SetItems call that delivers the
+	// workspace's channel list. While true, the empty-items branch
+	// renders a "Loading channels…" placeholder instead of the
+	// "No channels" placeholder, so a freshly-launched slk does not
+	// flash a wrongly-empty sidebar while users.conversations is
+	// still in flight.
+	bootstrapLoading bool
+
 	// focused tracks whether this panel currently has user focus. When
 	// false, the cursor "▌" glyph dims from Accent to TextMuted (via
 	// styles.SelectionBorderColor) so the unfocused selection doesn't
@@ -483,6 +492,12 @@ func New(items []ChannelItem) Model {
 		defaultChannelsSection: true,
 		defaultAppsSection:     true,
 	}
+	// bootstrapLoading defaults to false; callers that want the
+	// loading spinner placeholder for a not-yet-populated sidebar
+	// invoke SetBootstrapLoading(true) explicitly (the App layer does
+	// this via SetLoadingWorkspaces). Tests that construct a fresh
+	// Model with no items expect the "No channels" placeholder, not
+	// the spinner.
 	m.rebuildFilter()
 	m.rebuildNav()
 	// Default selection is the synthetic Threads row at the top.
@@ -640,8 +655,28 @@ func (m *Model) ActivityUnreadCount() int { return m.activityUnread }
 // SelectThreadsRow() after SetItems.
 func (m *Model) SetItems(items []ChannelItem) {
 	m.items = items
+	// Any SetItems call clears the bootstrap loading flag. An empty
+	// slice now legitimately means "this workspace has no joined
+	// conversations" and we want to show the "No channels"
+	// placeholder rather than spin forever.
+	m.bootstrapLoading = false
 	m.rebuildFilter()
 	m.rebuildNavPreserveCursor()
+	m.cacheValid = false
+	m.dirty()
+}
+
+// SetBootstrapLoading toggles the "still loading the workspace's
+// initial channel list" placeholder. Setting true forces the empty-
+// state branch in buildCache to render "Loading channels…" instead of
+// "No channels." Mostly useful for workspace switches that need to
+// suppress the previous workspace's "No channels" placeholder until
+// the new workspace's SetItems lands.
+func (m *Model) SetBootstrapLoading(loading bool) {
+	if m.bootstrapLoading == loading {
+		return
+	}
+	m.bootstrapLoading = loading
 	m.cacheValid = false
 	m.dirty()
 }
@@ -1471,10 +1506,17 @@ func (m *Model) buildCache(width int) {
 	}
 
 	// When there are no channel items at all, render a single muted
-	// "No channels" placeholder below the Threads row + separator so the
-	// Threads row remains globally visible even on an empty workspace.
+	// placeholder below the Threads row + separator so the Threads row
+	// remains globally visible even on an empty workspace. While we're
+	// still in the bootstrap loading window (no SetItems yet), label
+	// the row "Loading channels…" so the user has feedback that the
+	// workspace is still hydrating instead of seeing "No channels".
 	if len(m.items) == 0 {
-		placeholder := styles.SectionHeader.Render("No channels")
+		text := "No channels"
+		if m.bootstrapLoading {
+			text = "⏳  Loading channels…"
+		}
+		placeholder := styles.SectionHeader.Render(text)
 		m.cacheRows = append(m.cacheRows, renderRow{
 			normal:   placeholder,
 			selected: placeholder,
