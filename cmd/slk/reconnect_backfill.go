@@ -119,9 +119,10 @@ func (b *backfiller) runChannelPhase(ctx context.Context) error {
 		updates := make([]cache.ChannelReadStateUpdate, 0, len(unreads))
 		for _, u := range unreads {
 			updates = append(updates, cache.ChannelReadStateUpdate{
-				ChannelID:  u.ChannelID,
-				LastReadTS: u.LastRead,
-				HasUnread:  u.HasUnread,
+				ChannelID:    u.ChannelID,
+				LastReadTS:   u.LastRead,
+				HasUnread:    u.HasUnread,
+				MentionCount: u.MentionCount,
 			})
 			if u.HasUnread {
 				unreadIDs = append(unreadIDs, u.ChannelID)

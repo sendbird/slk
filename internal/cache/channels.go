@@ -224,3 +224,49 @@ func boolToInt(b bool) int {
 	}
 	return 0
 }
+
+// SetChannelMentionCount stores the absolute mention_count for a
+// channel. Negative values are clamped to 0. A missing row is a silent
+// no-op (matches SetChannelSyncedAt's pattern; callers must have
+// UpsertChannel'd the channel first).
+func (db *DB) SetChannelMentionCount(channelID string, count int) error {
+	if count < 0 {
+		count = 0
+	}
+	_, err := db.conn.Exec(
+		`UPDATE channels SET mention_count = ? WHERE id = ?`,
+		count, channelID,
+	)
+	if err != nil {
+		return fmt.Errorf("setting channel mention_count: %w", err)
+	}
+	return nil
+}
+
+// IncrementChannelMentionCount bumps mention_count by 1 for the given
+// channel. Used by the realtime message handler when an incoming
+// message mentions the current user and the channel isn't already
+// being viewed. Returns the resulting count or an error.
+func (db *DB) IncrementChannelMentionCount(channelID string) (int, error) {
+	if _, err := db.conn.Exec(
+		`UPDATE channels SET mention_count = mention_count + 1 WHERE id = ?`,
+		channelID,
+	); err != nil {
+		return 0, fmt.Errorf("incrementing channel mention_count: %w", err)
+	}
+	return db.GetChannelMentionCount(channelID), nil
+}
+
+// GetChannelMentionCount returns the persisted mention_count, or 0 for
+// a missing row.
+func (db *DB) GetChannelMentionCount(channelID string) int {
+	var n int
+	err := db.conn.QueryRow(
+		`SELECT COALESCE(mention_count, 0) FROM channels WHERE id = ?`,
+		channelID,
+	).Scan(&n)
+	if err != nil {
+		return 0
+	}
+	return n
+}

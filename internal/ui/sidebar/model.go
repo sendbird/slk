@@ -3,6 +3,7 @@ package sidebar
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -276,16 +277,25 @@ func (m *Model) SetSectionsProvider(p SectionsProvider) {
 // SetReadStateReader installs a callback that returns the per-channel
 // read state map for the workspace currently presented by this sidebar.
 // Called by View() at render time. Setting it invalidates the row cache
-// so the next render reflects the new source.
+// and re-runs rebuildFilter so the DM-recency and channel-mention
+// sort keys (sourced from the reader) take effect on the next View().
 func (m *Model) SetReadStateReader(f func() map[string]cache.ReadState) {
 	m.readStateReader = f
+	m.rebuildFilter()
+	m.rebuildNavPreserveCursor()
 	m.cacheValid = false
 	m.dirty()
 }
 
 // Invalidate forces the next View() call to re-read read state from
 // the installed reader. Called by App.Update on ReadStateChangedMsg.
+// Also re-runs the section sort because DM recency and channel mention
+// counts (the new intra-section sort keys) live in the same read-state
+// map; without re-sorting, a newly-arrived DM would still render in
+// its old position until the next workspace switch.
 func (m *Model) Invalidate() {
+	m.rebuildFilter()
+	m.rebuildNavPreserveCursor()
 	m.cacheValid = false
 	m.dirty()
 }
@@ -863,7 +873,18 @@ func (m *Model) rebuildFilter() {
 
 	// Sort filtered indices to match the visual section display order so that
 	// j/k navigation traverses items in the same order they're rendered.
-	// Within a section, preserve the original (Slack-provided) item order.
+	// Within a section, the intra-section ordering depends on item type:
+	//   - DM-typed sections (Direct Messages, group_dm) sort by the
+	//     channel's latest known message timestamp descending, so the
+	//     most recently active conversation is always on top. Items
+	//     without a known latest_ts fall to the bottom in their
+	//     original order.
+	//   - Channel-typed sections lift mention-bearing items to the top
+	//     (sorted by mention_count desc) so @-mentions are immediately
+	//     visible. Remaining items keep their Slack-provided order.
+	// Both signals are read from the readState map populated above; a
+	// nil reader or missing entry yields zero values that degrade
+	// gracefully to "preserve original order."
 	sectionOrder := m.modelOrderedSections(m.filtered)
 	rank := make(map[string]int, len(sectionOrder))
 	for i, name := range sectionOrder {
@@ -875,8 +896,54 @@ func (m *Model) rebuildFilter() {
 		if ra != rb {
 			return ra < rb
 		}
+		ia := m.items[m.filtered[a]]
+		ib := m.items[m.filtered[b]]
+		sa := readState[ia.ID]
+		sb := readState[ib.ID]
+		switch {
+		case isDMType(ia.Type) && isDMType(ib.Type):
+			// Empty LatestTS sinks; non-empty sorts lexicographically
+			// (Slack ts strings are width-stable and sort numerically).
+			ea := sa.LatestTS == ""
+			eb := sb.LatestTS == ""
+			if ea != eb {
+				return !ea
+			}
+			if sa.LatestTS != sb.LatestTS {
+				return sa.LatestTS > sb.LatestTS
+			}
+		case isChannelType(ia.Type) && isChannelType(ib.Type):
+			if sa.MentionCount != sb.MentionCount {
+				return sa.MentionCount > sb.MentionCount
+			}
+		}
 		return m.filtered[a] < m.filtered[b]
 	})
+}
+
+// isDMType reports whether an item belongs to the DM family (1:1 or
+// group_dm). Apps live in their own section and intentionally do not
+// participate in DM recency sort: their order is dominated by user
+// pinning and Slack's "recent apps" provider data.
+func isDMType(t string) bool {
+	return t == "dm" || t == "group_dm"
+}
+
+// isChannelType reports whether an item is a regular Slack channel
+// (public or private). DMs, group DMs, and apps are excluded; their
+// sort rules live in their own branches above.
+func isChannelType(t string) bool {
+	return t == "channel" || t == "private"
+}
+
+// formatMentionBadge renders a mention count as "•N" for 1..99 and
+// caps at "•99+" so the badge always fits in 3-4 columns. Callers
+// must guard with n > 0 — the helper does not draw an empty badge.
+func formatMentionBadge(n int) string {
+	if n > 99 {
+		return "•99+"
+	}
+	return "•" + strconv.Itoa(n)
 }
 
 // cursorKey captures what the cursor is logically pointing at, in a
@@ -1224,11 +1291,24 @@ func (m *Model) buildCache(width int) {
 		// "muted = no notification surface". The dimmer ChannelMuted
 		// style below distinguishes muted-with-unreads from a fully
 		// read row visually.
-		hasUnread := readState[item.ID].HasUnread && !item.IsMuted
+		state := readState[item.ID]
+		hasUnread := state.HasUnread && !item.IsMuted
 
-		// Unread dot indicator (same regardless of selection state).
+		// Unread indicator. Channels (public/private) with mention_count
+		// > 0 render a numeric badge ("•3") in place of the plain dot so
+		// @-mentions read at a glance. Muted channels suppress both the
+		// dot and the badge to honor the no-notification-surface
+		// contract. Badge values are capped at "99+" to keep row width
+		// predictable.
 		unreadDot := " "
-		if hasUnread {
+		mentionBadge := ""
+		switch {
+		case !hasUnread:
+			// no indicator
+		case isChannelType(item.Type) && state.MentionCount > 0:
+			mentionBadge = formatMentionBadge(state.MentionCount)
+			unreadDot = dotStyle.Render(mentionBadge)
+		default:
 			unreadDot = unreadDotStr
 		}
 
@@ -1267,8 +1347,17 @@ func (m *Model) buildCache(width int) {
 		// measurements for these chars, so use a conservative fixed budget:
 		//   cursor(2) + prefix(3) + name + space(1) + dot(2) = name + 8
 		// This assumes worst-case 2-col rendering for every ambiguous char.
+		//
+		// When a mention badge is present (e.g. "•3" or "•99+") we
+		// widen the reservation by the badge length minus the single
+		// dot we'd otherwise show, so the trailing badge never bleeds
+		// past the sidebar's right edge into the message pane.
 		name := item.Name
-		maxNameLen := (width - 2) - 8
+		indicatorReserve := 2
+		if mentionBadge != "" {
+			indicatorReserve = lipgloss.Width(mentionBadge) + 1
+		}
+		maxNameLen := (width - 2) - (6 + indicatorReserve)
 		if maxNameLen < 5 {
 			maxNameLen = 5
 		}

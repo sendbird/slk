@@ -223,6 +223,10 @@ func (db *DB) migrate() error {
 		"ALTER TABLE users ADD COLUMN is_external INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	if err := db.addColumnIfMissing("channels", "mention_count",
+		"ALTER TABLE channels ADD COLUMN mention_count INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
 
 	return nil
 }
