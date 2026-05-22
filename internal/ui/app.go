@@ -286,6 +286,9 @@ type (
 		// sidebar reverts to its existing name-keyed buckets).
 		SectionsProvider    sidebar.SectionsProvider
 		LastViewedChannelID string
+		// CollapsedSections is the per-section persisted collapse
+		// state for the destination workspace (see WorkspaceReadyMsg).
+		CollapsedSections map[string]bool
 	}
 	// ReadStateChangedMsg is sent whenever the persistent read state changes,
 	// so panels that read from cache.GetWorkspaceReadState re-render.
@@ -354,6 +357,12 @@ type (
 		// InitialActive=false as "workspace is up; threads-list kick only".
 		InitialActive       bool
 		LastViewedChannelID string
+		// CollapsedSections maps the sidebar's section keys (name in
+		// config mode, ID in Slack mode) to their persisted collapse
+		// state, loaded from cache.sidebar_section_collapsed at
+		// workspace bootstrap. Sections absent from the map keep
+		// sidebar.New's built-in defaults; sections present override.
+		CollapsedSections map[string]bool
 	}
 	// CustomEmojisLoadedMsg is sent when a workspace's custom emoji list
 	// finishes loading in the background, after WorkspaceReadyMsg has
@@ -2627,6 +2636,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.SetMode(ModeNormal)
 		a.compose.Blur()
 		a.sidebar.SetSectionsProvider(msg.SectionsProvider)
+		a.sidebar.ApplyPersistedCollapse(msg.CollapsedSections)
 		a.SetChannels(msg.Channels)
 		a.channelFinder.SetItems(msg.FinderItems)
 		// SetExternalUsers re-pushes user-names; calling SetUserNames
@@ -2794,6 +2804,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.threadCompose.RefreshStyles()
 			}
 			a.sidebar.SetSectionsProvider(msg.SectionsProvider)
+			a.sidebar.ApplyPersistedCollapse(msg.CollapsedSections)
 			a.SetChannels(msg.Channels)
 			if deferInitialReady || (syntheticRestore && len(msg.Channels) == 0) {
 				// SetChannels just flipped sidebar.bootstrapLoading off
@@ -5412,6 +5423,17 @@ func (a *App) SetWorkspaceUnreadReader(f func() []string) {
 // ChannelSelectedMsg.
 func (a *App) SetChannelVisitRecorder(fn ChannelVisitRecorder) {
 	a.channelVisitRecorder = fn
+}
+
+// SetSidebarCollapsePersister wires the callback that persists a
+// section's collapse state when the user toggles it. fn is invoked
+// from sidebar.ToggleCollapse with (sectionKey, collapsed); the
+// caller is expected to record it against the active workspace.
+// Wiring through the App rather than directly on the sidebar means
+// main.go can capture the workspace context (router.Active(), team
+// ID) in the closure without leaking it into internal/ui/sidebar.
+func (a *App) SetSidebarCollapsePersister(fn func(sectionKey string, collapsed bool)) {
+	a.sidebar.SetOnCollapseChange(fn)
 }
 
 // SetChannelLookupFunc wires the callback used by navigateBack /
