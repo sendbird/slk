@@ -27,6 +27,7 @@ import (
 	"github.com/gammons/slk/internal/slack/mrkdwn"
 	"github.com/gammons/slk/internal/ui/activityview"
 	"github.com/gammons/slk/internal/ui/channelfinder"
+	"github.com/gammons/slk/internal/ui/globalsearch"
 	"github.com/gammons/slk/internal/ui/channelpicker"
 	"github.com/gammons/slk/internal/ui/compose"
 	"github.com/gammons/slk/internal/ui/confirmprompt"
@@ -744,6 +745,7 @@ type App struct {
 	compose         compose.Model
 	statusbar       statusbar.Model
 	channelFinder   channelfinder.Model
+	globalSearch    globalsearch.Model
 	workspaceFinder workspacefinder.Model
 	filePicker      filepicker.Model
 	themeSwitcher   themeswitcher.Model
@@ -1067,6 +1069,7 @@ func NewApp() *App {
 		compose:               compose.New(""),
 		statusbar:             statusbar.New(),
 		channelFinder:         channelfinder.New(),
+		globalSearch:          globalsearch.New(),
 		workspaceFinder:       workspacefinder.New(),
 		filePicker:            filepicker.New(),
 		themeSwitcher:         themeswitcher.New(),
@@ -1109,6 +1112,20 @@ func NewApp() *App {
 		Joined: true,
 	}, {
 		ID:     channelfinder.ActivityViewID,
+		Name:   "Activity",
+		Type:   "activity",
+		Joined: true,
+	}})
+	// Mirror the synthetic destinations into the global search overlay so
+	// that pressing `/` offers the same Threads / Activity shortcuts as
+	// Ctrl+T.
+	app.globalSearch.SetSyntheticItems([]globalsearch.Item{{
+		ID:     globalsearch.ThreadsViewID,
+		Name:   "Threads",
+		Type:   "threads",
+		Joined: true,
+	}, {
+		ID:     globalsearch.ActivityViewID,
 		Name:   "Activity",
 		Type:   "activity",
 		Joined: true,
@@ -1658,6 +1675,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// sees this channel at the top of the recents.
 		now := time.Now().Unix()
 		a.channelFinder.UpdateLastVisited(msg.ID, now)
+		a.globalSearch.UpdateLastVisited(msg.ID, now)
 		// Persist the visit (SQLite write + WorkspaceContext map update)
 		// asynchronously via main.go's recorder closure.
 		if a.channelVisitRecorder != nil {
@@ -2553,6 +2571,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.sidebar.SetSectionsProvider(msg.SectionsProvider)
 		a.SetChannels(msg.Channels)
 		a.channelFinder.SetItems(msg.FinderItems)
+		a.globalSearch.SetItems(globalSearchItemsFromFinder(msg.FinderItems))
 		// SetExternalUsers re-pushes user-names; calling SetUserNames
 		// last is the canonical state.
 		a.SetExternalUsers(msg.ExternalUsers)
@@ -2699,6 +2718,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.sidebar.SetSectionsProvider(msg.SectionsProvider)
 			a.SetChannels(msg.Channels)
 			a.channelFinder.SetItems(msg.FinderItems)
+			a.globalSearch.SetItems(globalSearchItemsFromFinder(msg.FinderItems))
 			// SetExternalUsers re-pushes user-names; calling SetUserNames
 			// last is the canonical state.
 			a.SetExternalUsers(msg.ExternalUsers)
@@ -2768,6 +2788,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.SetChannels(items)
 		}
 		a.channelFinder.MarkJoined(msg.ID)
+		a.globalSearch.MarkJoined(msg.ID)
 		a.sidebar.SelectByID(msg.ID)
 		cmds = append(cmds, func() tea.Msg {
 			// ChannelJoinedMsg only fires for public channels via the
@@ -2785,6 +2806,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// are kept in main.go's WorkspaceContext for any future switch.
 		if msg.TeamID == a.activeTeamID {
 			a.channelFinder.SetBrowseable(msg.Items)
+			a.globalSearch.SetBrowseable(globalSearchItemsFromFinder(msg.Items))
 		}
 
 	case WorkspaceFailedMsg:
@@ -2955,6 +2977,8 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return a.handleCommandMode(msg)
 	case ModeChannelFinder:
 		return a.handleChannelFinderMode(msg)
+	case ModeSearch:
+		return a.handleGlobalSearchMode(msg)
 	case ModeReactionPicker:
 		return a.handleReactionPickerMode(msg)
 	case ModeConfirm:
@@ -3325,6 +3349,10 @@ func (a *App) handleNormalMode(msg tea.KeyMsg) tea.Cmd {
 	case a.matchesKey(msg, a.keys.FuzzyFinder) || a.matchesKey(msg, a.keys.FuzzyFinderAlt):
 		a.channelFinder.Open()
 		a.SetMode(ModeChannelFinder)
+
+	case a.matchesKey(msg, a.keys.SearchMode):
+		a.globalSearch.Open()
+		a.SetMode(ModeSearch)
 
 	case a.matchesKey(msg, a.keys.Reaction):
 		if a.focusedPanel == PanelMessages {
@@ -3713,6 +3741,58 @@ func (a *App) handleChannelFinderMode(msg tea.KeyMsg) tea.Cmd {
 		a.SetMode(ModeNormal)
 	}
 
+	return nil
+}
+
+// handleGlobalSearchMode dispatches keys to the global search overlay
+// (opened with `/`). Mirrors the channel finder dispatcher: special
+// keys are translated to short strings consumed by the model, and
+// confirmed results route to the same App-level handlers (channel
+// switch, join, view activation) so behavior stays consistent with
+// Ctrl+T.
+func (a *App) handleGlobalSearchMode(msg tea.KeyMsg) tea.Cmd {
+	keyStr := msg.String()
+	switch msg.Key().Code {
+	case tea.KeyEnter:
+		keyStr = "enter"
+	case tea.KeyEscape:
+		keyStr = "esc"
+	case tea.KeyUp:
+		keyStr = "up"
+	case tea.KeyDown:
+		keyStr = "down"
+	case tea.KeyBackspace:
+		keyStr = "backspace"
+	}
+
+	result := a.globalSearch.HandleKey(keyStr)
+	if result != nil {
+		a.globalSearch.Close()
+		a.SetMode(ModeNormal)
+		if result.Type == "threads" {
+			return func() tea.Msg { return ThreadsViewActivatedMsg{} }
+		}
+		if result.Type == "activity" {
+			return func() tea.Msg { return ActivityViewActivatedMsg{} }
+		}
+		if result.Joined {
+			a.sidebar.SelectByID(result.ID)
+			return func() tea.Msg {
+				return ChannelSelectedMsg{ID: result.ID, Name: result.Name, Type: result.Type}
+			}
+		}
+		if a.channelJoiner != nil {
+			joiner := a.channelJoiner
+			id, name := result.ID, result.Name
+			return func() tea.Msg {
+				return joiner(id, name)
+			}
+		}
+	}
+
+	if !a.globalSearch.IsVisible() {
+		a.SetMode(ModeNormal)
+	}
 	return nil
 }
 
@@ -5144,6 +5224,31 @@ func (a *App) SetActivityListFetcher(f ActivityListFetchFunc) {
 
 func (a *App) SetChannelFinderItems(items []channelfinder.Item) {
 	a.channelFinder.SetItems(items)
+	a.globalSearch.SetItems(globalSearchItemsFromFinder(items))
+}
+
+// globalSearchItemsFromFinder converts the channelfinder Item list into
+// the globalsearch Item shape so the App can keep a single source of
+// truth (the workspace's joined channels + DMs) and feed both overlays.
+func globalSearchItemsFromFinder(items []channelfinder.Item) []globalsearch.Item {
+	out := make([]globalsearch.Item, 0, len(items))
+	for _, it := range items {
+		if it.Synthetic {
+			// Synthetic destinations are seeded into globalSearch directly
+			// by NewApp; do not duplicate them when forwarding channel
+			// items.
+			continue
+		}
+		out = append(out, globalsearch.Item{
+			ID:          it.ID,
+			Name:        it.Name,
+			Type:        it.Type,
+			Presence:    it.Presence,
+			Joined:      it.Joined,
+			LastVisited: it.LastVisited,
+		})
+	}
+	return out
 }
 
 // SetAvatarFunc sets the function used to get rendered avatars for messages.
@@ -6304,6 +6409,10 @@ func (a *App) View() tea.View {
 		screen = a.channelFinder.ViewOverlay(a.width, a.height, screen)
 	}
 
+	if a.globalSearch.IsVisible() {
+		screen = a.globalSearch.ViewOverlay(a.width, a.height, screen)
+	}
+
 	if a.reactionPicker.IsVisible() {
 		screen = a.reactionPicker.ViewOverlay(a.width, a.height, screen)
 	}
@@ -6350,6 +6459,7 @@ func (a *App) View() tea.View {
 	// sized output; conservatively re-wrap in that case.
 	finalScreen := screen
 	overlayActive := a.channelFinder.IsVisible() ||
+		a.globalSearch.IsVisible() ||
 		a.reactionPicker.IsVisible() ||
 		a.confirmPrompt.IsVisible() ||
 		a.workspaceFinder.IsVisible() ||
