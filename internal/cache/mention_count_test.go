@@ -55,6 +55,47 @@ func TestIncrementChannelMentionCount(t *testing.T) {
 	}
 }
 
+func TestIncrementChannelMentionCountIfUnread_NoOpWhenRead(t *testing.T) {
+	// Closes the WS-handler race documented on
+	// IncrementChannelMentionCountIfUnread: if channel_marked clears
+	// has_unread between OnMessage's two writes, the late increment
+	// must not resurrect the badge. Verify by leaving has_unread=0
+	// and confirming mention_count stays 0.
+	db := setupDBWithWorkspace(t)
+	defer db.Close()
+	db.UpsertChannel(Channel{ID: "C1", WorkspaceID: "T1", Name: "general", Type: "channel", IsMember: true})
+
+	// Simulate post-mark-read state: has_unread=0, mention_count=0.
+	if err := db.UpdateChannelReadState("C1", "1.0", false); err != nil {
+		t.Fatalf("UpdateChannelReadState: %v", err)
+	}
+
+	got, err := db.IncrementChannelMentionCountIfUnread("C1")
+	if err != nil {
+		t.Fatalf("IncrementChannelMentionCountIfUnread: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("incrementing a read channel = %d, want 0", got)
+	}
+}
+
+func TestIncrementChannelMentionCountIfUnread_BumpsWhenUnread(t *testing.T) {
+	db := setupDBWithWorkspace(t)
+	defer db.Close()
+	db.UpsertChannel(Channel{ID: "C1", WorkspaceID: "T1", Name: "general", Type: "channel", IsMember: true})
+
+	if err := db.UpdateChannelReadState("C1", "", true); err != nil {
+		t.Fatalf("UpdateChannelReadState: %v", err)
+	}
+	got, err := db.IncrementChannelMentionCountIfUnread("C1")
+	if err != nil {
+		t.Fatalf("IncrementChannelMentionCountIfUnread: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("incrementing an unread channel = %d, want 1", got)
+	}
+}
+
 func TestUpdateChannelReadState_ResetsMentionCountWhenRead(t *testing.T) {
 	db := setupDBWithWorkspace(t)
 	defer db.Close()

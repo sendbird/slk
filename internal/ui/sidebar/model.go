@@ -913,8 +913,10 @@ func (m *Model) rebuildFilter() {
 				return sa.LatestTS > sb.LatestTS
 			}
 		case isChannelType(ia.Type) && isChannelType(ib.Type):
-			if sa.MentionCount != sb.MentionCount {
-				return sa.MentionCount > sb.MentionCount
+			ma := effectiveMentionCount(sa, ia)
+			mb := effectiveMentionCount(sb, ib)
+			if ma != mb {
+				return ma > mb
 			}
 		}
 		return m.filtered[a] < m.filtered[b]
@@ -934,6 +936,28 @@ func isDMType(t string) bool {
 // sort rules live in their own branches above.
 func isChannelType(t string) bool {
 	return t == "channel" || t == "private"
+}
+
+// effectiveMentionCount returns the mention_count value that the
+// sidebar should actually act on. It mirrors the render-time gate
+// (HasUnread && !IsMuted) so a stale row in the cache cannot lift a
+// read-or-muted channel to the top of its section. The render path
+// suppresses the badge in those cases; the sort path must agree, or
+// the channel floats up with no visible reason. Two situations are
+// covered:
+//
+//   - Muted channels never participate in the notification surface
+//     (no dot, no badge); they must also not get reordered.
+//   - has_unread=false with a leftover mention_count > 0 is the race
+//     IncrementChannelMentionCountIfUnread closes at the SQL layer,
+//     but this is a belt-and-suspenders guard for any other path
+//     that might leave the two columns inconsistent (e.g. a future
+//     migration that lands without resetting mention_count).
+func effectiveMentionCount(s cache.ReadState, item ChannelItem) int {
+	if !s.HasUnread || item.IsMuted {
+		return 0
+	}
+	return s.MentionCount
 }
 
 // formatMentionBadge renders a mention count as "•N" for 1..99 and
@@ -1294,19 +1318,22 @@ func (m *Model) buildCache(width int) {
 		state := readState[item.ID]
 		hasUnread := state.HasUnread && !item.IsMuted
 
-		// Unread indicator. Channels (public/private) with mention_count
-		// > 0 render a numeric badge ("•3") in place of the plain dot so
-		// @-mentions read at a glance. Muted channels suppress both the
-		// dot and the badge to honor the no-notification-surface
-		// contract. Badge values are capped at "99+" to keep row width
-		// predictable.
+		// Unread indicator. Channels (public/private) with an effective
+		// mention count > 0 render a numeric badge ("•3") in place of
+		// the plain dot so @-mentions read at a glance. Muted channels
+		// suppress both the dot and the badge to honor the no-
+		// notification-surface contract. Badge values are capped at
+		// "99+" to keep row width predictable. The
+		// effectiveMentionCount helper enforces the same gate the sort
+		// comparator uses, so the visible badge and the channel's
+		// position in the section stay in sync.
 		unreadDot := " "
 		mentionBadge := ""
 		switch {
 		case !hasUnread:
 			// no indicator
-		case isChannelType(item.Type) && state.MentionCount > 0:
-			mentionBadge = formatMentionBadge(state.MentionCount)
+		case isChannelType(item.Type) && effectiveMentionCount(state, item) > 0:
+			mentionBadge = formatMentionBadge(effectiveMentionCount(state, item))
 			unreadDot = dotStyle.Render(mentionBadge)
 		default:
 			unreadDot = unreadDotStr

@@ -162,3 +162,49 @@ func TestSidebar_DMSort_DoesNotReorderChannels(t *testing.T) {
 		t.Errorf("Channels order must remain general → random; view=\n%s", view)
 	}
 }
+
+func TestSidebar_MutedChannelWithMentions_DoesNotFloat(t *testing.T) {
+	// A muted channel with a stale mention_count must not lift above
+	// non-muted siblings. The render gate already hides the badge;
+	// the sort gate (effectiveMentionCount) must agree, otherwise the
+	// muted row floats to the top with no visible reason.
+	items := []ChannelItem{
+		{ID: "C1", Name: "ops", Type: "channel"},
+		{ID: "C2", Name: "noise", Type: "channel", IsMuted: true},
+	}
+	m := New(items)
+	m.ToggleCollapse(defaultChannelsSection)
+	m.SetReadStateReader(fakeReader(map[string]cache.ReadState{
+		"C1": {HasUnread: true, MentionCount: 0},
+		"C2": {HasUnread: true, MentionCount: 5}, // muted: should not lift
+	}))
+
+	view := m.View(40, 30)
+	posOps := strings.Index(view, "ops")
+	posNoise := strings.Index(view, "noise")
+	if !(posOps < posNoise) {
+		t.Errorf("expected non-muted ops above muted noise; view=\n%s", view)
+	}
+}
+
+func TestSidebar_StaleMentionOnReadChannel_DoesNotFloat(t *testing.T) {
+	// Race-safety net: if mention_count is somehow > 0 while
+	// HasUnread is false (e.g., a future code path leaves them out
+	// of sync), the channel must NOT float above an unread sibling.
+	// effectiveMentionCount treats has_unread=false as "no mention."
+	items := []ChannelItem{
+		{ID: "C1", Name: "ops", Type: "channel"},
+		{ID: "C2", Name: "stale", Type: "channel"},
+	}
+	m := New(items)
+	m.ToggleCollapse(defaultChannelsSection)
+	m.SetReadStateReader(fakeReader(map[string]cache.ReadState{
+		"C1": {HasUnread: true, MentionCount: 0},
+		"C2": {HasUnread: false, MentionCount: 3}, // stale; should be ignored
+	}))
+
+	view := m.View(40, 30)
+	if strings.Index(view, "ops") > strings.Index(view, "stale") {
+		t.Errorf("stale mention_count on read channel must not lift; view=\n%s", view)
+	}
+}

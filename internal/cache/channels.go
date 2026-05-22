@@ -257,6 +257,29 @@ func (db *DB) IncrementChannelMentionCount(channelID string) (int, error) {
 	return db.GetChannelMentionCount(channelID), nil
 }
 
+// IncrementChannelMentionCountIfUnread bumps mention_count by 1 only
+// while the channel still has has_unread=1. This is the WS-handler-
+// safe variant: between the handler's UpdateChannelReadState(true) and
+// its increment call, a `channel_marked` event from another Slack
+// client can race in and clear has_unread back to 0 (along with
+// mention_count). Without the guard the late increment would write 1
+// onto a channel the user has just read, leaving an invisible badge
+// (mention_count=1, has_unread=0) that nonetheless lifts the channel
+// to the top of the sidebar's Channels section. The atomic WHERE
+// clause makes the late increment a no-op in that race instead.
+//
+// Returns the resulting count or an error. When the channel was
+// already read the function returns the current (unchanged) count.
+func (db *DB) IncrementChannelMentionCountIfUnread(channelID string) (int, error) {
+	if _, err := db.conn.Exec(
+		`UPDATE channels SET mention_count = mention_count + 1 WHERE id = ? AND has_unread = 1`,
+		channelID,
+	); err != nil {
+		return 0, fmt.Errorf("incrementing channel mention_count: %w", err)
+	}
+	return db.GetChannelMentionCount(channelID), nil
+}
+
 // GetChannelMentionCount returns the persisted mention_count, or 0 for
 // a missing row.
 func (db *DB) GetChannelMentionCount(channelID string) int {

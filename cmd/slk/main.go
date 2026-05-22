@@ -2940,13 +2940,26 @@ func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subty
 		// Bump mention_count when this message @-mentions the current
 		// user. Restricted to top-level channel messages (the same gate
 		// as has_unread, since channel_marked is the only mechanism
-		// that clears the count back to 0). 1:1 DMs are excluded
-		// because client.counts.Ims carries no mention_count on the
-		// wire — incrementing here would silently diverge from Slack's
-		// authoritative value on the next bootstrap.
+		// that clears the count back to 0). Exclusions:
+		//
+		//   - Edits (edited=true / subtype="message_changed") are not
+		//     new mentions; they would double-count a still-unread
+		//     message and could fabricate a mention badge on an
+		//     already-read message that the sender edited to add a
+		//     mention after the user had moved on.
+		//   - Messages authored by the current user (e.g., from another
+		//     Slack client) — Slack never counts your own messages as
+		//     mentions of yourself.
+		//   - 1:1 DMs: client.counts.Ims carries no mention_count on
+		//     the wire, so incrementing here would silently diverge
+		//     from Slack's authoritative value on the next bootstrap.
 		chType := h.channelTypes[channelID]
-		if h.currentUserID != "" && chType != "dm" && containsSelfMention(text, h.currentUserID) {
-			if _, err := h.db.IncrementChannelMentionCount(channelID); err != nil {
+		if h.currentUserID != "" &&
+			userID != h.currentUserID &&
+			!edited &&
+			chType != "dm" &&
+			containsSelfMention(text, h.currentUserID) {
+			if _, err := h.db.IncrementChannelMentionCountIfUnread(channelID); err != nil {
 				log.Printf("Warning: failed to bump mention_count for %s: %v", channelID, err)
 			}
 		}
