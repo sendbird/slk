@@ -204,6 +204,14 @@ type Model struct {
 	// Populated lazily; lookups treat nil as empty. Used in Task 9.
 	collapseByID map[string]bool
 
+	// onCollapseChange is fired by ToggleCollapse with the section key
+	// (name in config mode, ID in Slack mode) and the new collapsed
+	// boolean. The App layer wires this to a persistence callback so
+	// the user's expanded/collapsed selections survive restart.
+	// ApplyPersistedCollapse intentionally does NOT fire it —
+	// restoration is not a toggle.
+	onCollapseChange func(section string, collapsed bool)
+
 	// Staleness filter: items whose last_read_ts (from the read-state
 	// DB, fetched via readStateReader in rebuildFilter) is older than
 	// staleThreshold are dropped from `filtered` (i.e. hidden from the
@@ -584,21 +592,79 @@ func (m *Model) IsCollapsed(section string) bool {
 // cursor stays on the section's header (if it was already there) so a
 // subsequent toggle just expands again. Dispatches to collapseByID in
 // Slack mode (ID-keyed; survives renames), collapsed in config mode.
+// Notifies onCollapseChange (if installed) with the new state so the
+// App layer can persist the toggle across launches.
 func (m *Model) ToggleCollapse(section string) {
+	collapsed := false
 	if m.useSlackSections() {
 		if m.collapseByID == nil {
 			m.collapseByID = map[string]bool{}
 		}
 		m.collapseByID[section] = !m.collapseByID[section]
+		collapsed = m.collapseByID[section]
 	} else {
 		if m.collapsed == nil {
 			m.collapsed = map[string]bool{}
 		}
 		m.collapsed[section] = !m.collapsed[section]
+		collapsed = m.collapsed[section]
+	}
+	if m.onCollapseChange != nil {
+		m.onCollapseChange(section, collapsed)
 	}
 	// Rebuild nav since the set of selectable rows changed. Preserve
 	// the cursor's logical target (header / threads / channel ID) so
 	// the user keeps their place.
+	m.rebuildNavPreserveCursor()
+	m.cacheValid = false
+	m.dirty()
+}
+
+// SetOnCollapseChange installs a callback fired on every ToggleCollapse
+// with the section key (name in config mode, ID in Slack mode) and
+// the new collapsed boolean. The App wires this to a SQLite write so
+// the next launch restores whatever the user had open last.
+func (m *Model) SetOnCollapseChange(fn func(section string, collapsed bool)) {
+	m.onCollapseChange = fn
+}
+
+// ApplyPersistedCollapse RESETS the model's per-section collapse
+// state to the supplied set, then re-applies the built-in defaults
+// for any section absent from the input. The reset step is essential
+// for workspace switches: the App reuses one *sidebar.Model across
+// every workspace, so leaving prior entries in m.collapsed /
+// m.collapseByID would silently inherit (e.g.) workspace A's
+// "Channels expanded" state into workspace B even though B has no
+// persisted row for that section. Sections present in the input
+// override the defaults; sections absent fall back to defaults.
+//
+// Routes through the collapseByID map when a SectionsProvider is
+// installed so the keys match what ToggleCollapse will later read.
+//
+// Does NOT fire onCollapseChange — restoration is not a user toggle.
+func (m *Model) ApplyPersistedCollapse(persisted map[string]bool) {
+	if m.useSlackSections() {
+		// Slack-mode has no built-in defaults (sections are server-
+		// supplied), so a clean nil-map suffices.
+		m.collapseByID = nil
+		if len(persisted) > 0 {
+			m.collapseByID = make(map[string]bool, len(persisted))
+			for k, v := range persisted {
+				m.collapseByID[k] = v
+			}
+		}
+	} else {
+		// Config-mode defaults: Channels + Apps collapsed, others
+		// expanded. Rebuild from scratch so prior-workspace entries
+		// can't leak through.
+		m.collapsed = map[string]bool{
+			defaultChannelsSection: true,
+			defaultAppsSection:     true,
+		}
+		for k, v := range persisted {
+			m.collapsed[k] = v
+		}
+	}
 	m.rebuildNavPreserveCursor()
 	m.cacheValid = false
 	m.dirty()
@@ -1279,6 +1345,12 @@ func (m *Model) buildCache(width int) {
 		navIdx:       threadsIdx,
 		isThreadsRow: true,
 	})
+	// Blank separator between the synthetic Threads and Activity rows so
+	// the four top-level entries (Threads / Activity / Direct Messages /
+	// Channels) sit at the same vertical rhythm — without it Threads
+	// and Activity stacked tightly while Activity → Direct Messages had
+	// a blank row, which read as a visual hiccup.
+	m.cacheRows = append(m.cacheRows, renderRow{height: 1, navIdx: -1})
 
 	activityLabel := " ⚡ Activity"
 	activityCursor := cursorSelected + "⚡ Activity"

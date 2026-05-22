@@ -948,6 +948,20 @@ func run() error {
 			}()
 		})
 
+		app.SetSidebarCollapsePersister(func(sectionKey string, collapsed bool) {
+			wctx := router.Active()
+			if wctx == nil {
+				return
+			}
+			teamID := wctx.TeamID
+			go func() {
+				if err := db.SetSidebarSectionCollapsed(teamID, sectionKey, collapsed); err != nil {
+					log.Printf("warning: persisting sidebar collapse %s/%s=%v: %v",
+						teamID, sectionKey, collapsed, err)
+				}
+			}()
+		})
+
 		app.SetChannelLookupFunc(func(channelID string) (string, string, bool) {
 			wctx := router.Active()
 			if wctx == nil {
@@ -1377,6 +1391,10 @@ func run() error {
 			}
 		}
 
+		collapsed, err := db.GetSidebarSectionCollapsed(wctx.TeamID)
+		if err != nil {
+			log.Printf("warning: loading sidebar collapse state for %s: %v", wctx.TeamID, err)
+		}
 		return ui.WorkspaceSwitchedMsg{
 			TeamID:              wctx.TeamID,
 			TeamName:            wctx.TeamName,
@@ -1390,6 +1408,7 @@ func run() error {
 			SlashCommands:       wctx.SlashCommands,
 			SectionsProvider:    sectionsProviderAdapter{store: wctx.SectionStore},
 			LastViewedChannelID: wctx.LastViewedChannelID,
+			CollapsedSections:   collapsed,
 		}
 	})
 
@@ -1523,6 +1542,10 @@ func run() error {
 				}
 			}
 
+			collapsed, err := db.GetSidebarSectionCollapsed(wctx.TeamID)
+			if err != nil {
+				log.Printf("warning: loading sidebar collapse state for %s: %v", wctx.TeamID, err)
+			}
 			p.Send(ui.WorkspaceReadyMsg{
 				TeamID:              wctx.TeamID,
 				TeamName:            wctx.TeamName,
@@ -1537,6 +1560,7 @@ func run() error {
 				SectionsProvider:    sectionsProviderAdapter{store: wctx.SectionStore},
 				LastViewedChannelID: wctx.LastViewedChannelID,
 				InitialActive:       isInitial,
+				CollapsedSections:   collapsed,
 			})
 
 			// Fetch workspace custom emojis in the background. When done,

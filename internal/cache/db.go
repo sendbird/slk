@@ -191,6 +191,14 @@ func (db *DB) migrate() error {
 
 	CREATE INDEX IF NOT EXISTS idx_channel_members_channel
 		ON channel_members(workspace_id, channel_id);
+
+	CREATE TABLE IF NOT EXISTS sidebar_section_collapsed (
+		workspace_id TEXT NOT NULL,
+		section_key  TEXT NOT NULL,
+		collapsed    INTEGER NOT NULL,
+		updated_at   INTEGER NOT NULL,
+		PRIMARY KEY (workspace_id, section_key)
+	);
 	`
 
 	if _, err := db.conn.Exec(schema); err != nil {
