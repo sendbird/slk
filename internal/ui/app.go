@@ -3530,19 +3530,19 @@ func (a *App) handleInsertMode(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		}
 	}
-	// Plain Enter sends. Ctrl+Enter also sends when the terminal reports it
-	// distinctly, which gives IME users a send key that is less likely to be
-	// consumed as composition commit. Shift/Alt+Enter, backslash+Enter, and
-	// Ctrl+J insert a newline.
+	// Plain Enter sends. Ctrl+Enter also sends. When the terminal supports
+	// enhanced keyboard reporting, Ctrl+Enter arrives as Enter+Ctrl. In legacy
+	// paths it commonly collapses to Ctrl+J/LF, so treat that ambiguous form as
+	// send too; Shift/Alt+Enter and backslash+Enter remain the newline paths.
 	keystroke := msg.Key().Keystroke()
 	stringForm := msg.String()
 	isModifiedEnter := stringForm == "shift+enter" || keystroke == "shift+enter" || stringForm == "shift+return" || keystroke == "shift+return" || stringForm == "alt+enter" || keystroke == "alt+enter" || stringForm == "alt+return" || keystroke == "alt+return"
 	textValue := target.Value()
 	isBackslashEnter := (code == tea.KeyEnter || code == tea.KeyReturn) && strings.HasSuffix(textValue, "\\")
 	isPlainEnter := (code == tea.KeyEnter || code == tea.KeyReturn) && !mod.Contains(tea.ModShift) && !mod.Contains(tea.ModAlt)
-	isSend := isPlainEnter && !isModifiedEnter && !isBackslashEnter
-	isNewline := ((code == tea.KeyEnter || code == tea.KeyReturn) && (mod.Contains(tea.ModShift) || mod.Contains(tea.ModAlt))) || isModifiedEnter || isBackslashEnter ||
-		(code == 'j' && mod == tea.ModCtrl)
+	isCollapsedCtrlEnter := (code == 'j' && mod == tea.ModCtrl) || (code == '\n' && (mod == 0 || mod == tea.ModCtrl)) || stringForm == "ctrl+j" || keystroke == "ctrl+j"
+	isSend := (isPlainEnter || isCollapsedCtrlEnter) && !isModifiedEnter && !isBackslashEnter
+	isNewline := ((code == tea.KeyEnter || code == tea.KeyReturn) && (mod.Contains(tea.ModShift) || mod.Contains(tea.ModAlt))) || isModifiedEnter || isBackslashEnter
 
 	// Determine which compose box is active based on focused panel
 	if a.focusedPanel == PanelThread && a.threadVisible {

@@ -498,6 +498,61 @@ func TestHandleInsertMode_ThreadReplyCtrlEnterSends(t *testing.T) {
 	}
 }
 
+func TestHandleInsertMode_CollapsedCtrlEnterSends(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  tea.KeyPressMsg
+	}{
+		{
+			name: "enhanced ctrl+j",
+			msg:  tea.KeyPressMsg{Code: 'j', Mod: tea.ModCtrl},
+		},
+		{
+			name: "legacy lf",
+			msg:  tea.KeyPressMsg{Code: '\n'},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app := NewApp()
+			app.activeChannelID = "C1"
+			app.focusedPanel = PanelMessages
+			app.SetMode(ModeInsert)
+			app.compose.SetValue("hello")
+
+			cmd := app.handleInsertMode(tc.msg)
+			if cmd == nil {
+				t.Fatalf("collapsed Ctrl+Enter with text should return a send cmd")
+			}
+			if _, ok := cmd().(SendMessageMsg); !ok {
+				t.Fatalf("expected SendMessageMsg, got %T", cmd())
+			}
+			if app.compose.Value() != "" {
+				t.Fatalf("expected compose to be reset after collapsed Ctrl+Enter send, got %q", app.compose.Value())
+			}
+		})
+	}
+}
+
+func TestHandleInsertMode_ThreadReplyCollapsedCtrlEnterSends(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.threadPanel.SetThread(messages.MessageItem{TS: "P1"}, nil, "C1", "P1")
+	app.threadVisible = true
+	app.focusedPanel = PanelThread
+	app.SetMode(ModeInsert)
+	app.threadCompose.SetValue("reply")
+
+	cmd := app.handleInsertMode(tea.KeyPressMsg{Code: 'j', Mod: tea.ModCtrl})
+	if cmd == nil {
+		t.Fatalf("collapsed Ctrl+Enter with thread text should return a send cmd")
+	}
+	if _, ok := cmd().(SendThreadReplyMsg); !ok {
+		t.Fatalf("expected SendThreadReplyMsg, got %T", cmd())
+	}
+}
+
 func TestHandleInsertMode_ShiftReturnInsertsNewline(t *testing.T) {
 	app := NewApp()
 	app.activeChannelID = "C1"
