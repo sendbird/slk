@@ -1339,11 +1339,24 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return ChannelSelectedMsg{ID: item.ID, Name: item.Name, Type: item.Type}
 					}
 				}
-				// ClickAt returns ok=false for the synthetic Threads
-				// row; if the click landed there (sidebar updates its
-				// own selection state), activate the threads view.
+				// ClickAt moved the sidebar cursor onto the row even
+				// when no ChannelItem was returned (Threads row,
+				// Activity row, or section header). Mirror the Enter
+				// dispatch so a mouse click on each non-channel row
+				// type does the same thing the keyboard does:
+				//
+				//   - Threads / Activity row → activate that view
+				//   - Section header (Channels / Direct Messages /
+				//     Apps / custom) → toggle its collapsed state in
+				//     place, without leaving the sidebar focus
 				if a.sidebar.IsThreadsSelected() {
 					return a, func() tea.Msg { return ThreadsViewActivatedMsg{} }
+				}
+				if a.sidebar.IsActivitySelected() {
+					return a, func() tea.Msg { return ActivityViewActivatedMsg{} }
+				}
+				if _, ok := a.sidebar.IsSectionHeaderSelected(); ok {
+					a.sidebar.ToggleCollapseSelected()
 				}
 			}
 		} else if x < a.layoutMsgEnd {
@@ -4503,6 +4516,13 @@ func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 	if !ok {
 		return nil
 	}
+
+	// Shift keyboard focus to the pane being scrolled. The actual
+	// cursor movement is coalesced through flushMouseWheel, but focus
+	// follow-through is cheap and must happen on the *first* notch so
+	// the highlight bar (and any subsequent j/k/Enter) is already on
+	// the right pane by the time the user finishes the burst.
+	a.focusedPanel = panel
 
 	wasActive := a.pendingWheelActive
 	if a.pendingWheelActive && (a.pendingWheelPanel != panel || a.pendingWheelView != a.view) {
