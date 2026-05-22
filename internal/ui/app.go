@@ -4684,8 +4684,18 @@ func (a *App) handleEnter() tea.Cmd {
 		// place. Section headers are also navigable via j/k so the
 		// user can expand/collapse the firehose Channels section
 		// (collapsed by default) without leaving the keyboard.
-		if a.sidebar.ToggleCollapseSelected() {
-			return nil
+		//
+		// IMPORTANT: scope the toggle to header rows only via
+		// IsSectionHeaderSelected. ToggleCollapseSelected was widened
+		// (for the spacebar affordance) to also collapse from inside a
+		// section when invoked from a channel row, but Enter on a
+		// channel row must keep its "open this channel" meaning — the
+		// user navigates with j/k and hits Enter to enter the channel,
+		// not to hide its section.
+		if _, ok := a.sidebar.IsSectionHeaderSelected(); ok {
+			if a.sidebar.ToggleCollapseSelected() {
+				return nil
+			}
 		}
 		item, ok := a.sidebar.SelectedItem()
 		if ok {
