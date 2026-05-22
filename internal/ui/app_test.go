@@ -303,6 +303,44 @@ func TestHandleInsertMode_PlainEnterSends(t *testing.T) {
 	}
 }
 
+func TestHandleInsertMode_CtrlEnterSends(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.focusedPanel = PanelMessages
+	app.SetMode(ModeInsert)
+	app.compose.SetValue("hello")
+
+	cmd := app.handleInsertMode(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModCtrl})
+	if cmd == nil {
+		t.Fatalf("Ctrl+Enter with text should return a send cmd")
+	}
+	msg := cmd()
+	if _, ok := msg.(SendMessageMsg); !ok {
+		t.Fatalf("expected SendMessageMsg, got %T", msg)
+	}
+	if app.compose.Value() != "" {
+		t.Fatalf("expected compose to be reset after Ctrl+Enter send, got %q", app.compose.Value())
+	}
+}
+
+func TestHandleInsertMode_ThreadReplyCtrlEnterSends(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.threadPanel.SetThread(messages.MessageItem{TS: "P1"}, nil, "C1", "P1")
+	app.threadVisible = true
+	app.focusedPanel = PanelThread
+	app.SetMode(ModeInsert)
+	app.threadCompose.SetValue("reply")
+
+	cmd := app.handleInsertMode(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModCtrl})
+	if cmd == nil {
+		t.Fatalf("Ctrl+Enter with thread text should return a send cmd")
+	}
+	if _, ok := cmd().(SendThreadReplyMsg); !ok {
+		t.Fatalf("expected SendThreadReplyMsg, got %T", cmd())
+	}
+}
+
 // TestHandleInsertMode_PlainEnterReturnsToNormalMode locks in the
 // vim-style UX: hitting Enter to submit a channel message drops the
 // user back to ModeNormal instead of leaving them in insert mode.
