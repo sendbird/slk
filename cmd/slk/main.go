@@ -1898,9 +1898,10 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		updates := make([]cache.ChannelReadStateUpdate, 0, len(unreadCounts))
 		for _, u := range unreadCounts {
 			updates = append(updates, cache.ChannelReadStateUpdate{
-				ChannelID:  u.ChannelID,
-				LastReadTS: u.LastRead, // may be ""; BatchUpdate preserves existing in that case
-				HasUnread:  u.HasUnread,
+				ChannelID:    u.ChannelID,
+				LastReadTS:   u.LastRead, // may be ""; BatchUpdate preserves existing in that case
+				HasUnread:    u.HasUnread,
+				MentionCount: u.MentionCount,
 			})
 		}
 		if err := db.BatchUpdateChannelReadState(updates); err != nil {
@@ -2081,6 +2082,20 @@ func pickAttachmentURL(f slack.File, kind string) string {
 		return f.Permalink
 	}
 	return f.URLPrivate
+}
+
+// containsSelfMention reports whether text contains a Slack-style
+// angle-bracketed mention of selfUserID, e.g. "<@U12345>". This is the
+// exact form the realtime message handler sees on the wire, so a
+// substring check is sufficient. Both arguments must be non-empty for
+// the answer to be true; callers pass an empty selfUserID before the
+// bootstrap resolves the workspace's own user, and we treat that as
+// "no mentions detectable yet" rather than matching everything.
+func containsSelfMention(text, selfUserID string) bool {
+	if text == "" || selfUserID == "" {
+		return false
+	}
+	return strings.Contains(text, "<@"+selfUserID+">")
 }
 
 // resolveUserCached returns the display name for userID using only
@@ -2921,6 +2936,40 @@ func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subty
 	if h.db != nil && shouldMarkChannel && activeChIDForRead != channelID {
 		if err := h.db.UpdateChannelReadState(channelID, "", true); err != nil {
 			log.Printf("Warning: failed to set has_unread for %s: %v", channelID, err)
+		}
+		// Bump mention_count when this message @-mentions the current
+		// user. Restricted to top-level channel messages (the same gate
+		// as has_unread, since channel_marked is the only mechanism
+		// that clears the count back to 0). Exclusions:
+		//
+		//   - Edits (edited=true / subtype="message_changed") are not
+		//     new mentions; they would double-count a still-unread
+		//     message and could fabricate a mention badge on an
+		//     already-read message that the sender edited to add a
+		//     mention after the user had moved on.
+		//   - Messages authored by the current user (e.g., from another
+		//     Slack client) — Slack never counts your own messages as
+		//     mentions of yourself.
+		//   - Non-channel types: only public/private channels surface
+		//     the mention badge in the sidebar (sidebar.isChannelType
+		//     and the bootstrap path keep "channel" + "private" as
+		//     the read side). Anything else (1:1 DMs, group DMs, apps)
+		//     must not write to mention_count, otherwise the column
+		//     accumulates values that nothing renders — silent storage
+		//     drift and a foot-gun for the next person to touch the
+		//     read path. 1:1 DMs additionally lack mention_count on
+		//     the wire (client.counts.Ims), so any value we'd write
+		//     would also diverge from Slack's authoritative state.
+		chType := h.channelTypes[channelID]
+		isChannelKind := chType == "channel" || chType == "private"
+		if h.currentUserID != "" &&
+			userID != h.currentUserID &&
+			!edited &&
+			isChannelKind &&
+			containsSelfMention(text, h.currentUserID) {
+			if _, err := h.db.IncrementChannelMentionCountIfUnread(channelID); err != nil {
+				log.Printf("Warning: failed to bump mention_count for %s: %v", channelID, err)
+			}
 		}
 	}
 

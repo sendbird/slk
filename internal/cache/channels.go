@@ -224,3 +224,72 @@ func boolToInt(b bool) int {
 	}
 	return 0
 }
+
+// SetChannelMentionCount stores the absolute mention_count for a
+// channel. Negative values are clamped to 0. A missing row is a silent
+// no-op (matches SetChannelSyncedAt's pattern; callers must have
+// UpsertChannel'd the channel first).
+func (db *DB) SetChannelMentionCount(channelID string, count int) error {
+	if count < 0 {
+		count = 0
+	}
+	_, err := db.conn.Exec(
+		`UPDATE channels SET mention_count = ? WHERE id = ?`,
+		count, channelID,
+	)
+	if err != nil {
+		return fmt.Errorf("setting channel mention_count: %w", err)
+	}
+	return nil
+}
+
+// IncrementChannelMentionCount bumps mention_count by 1 for the given
+// channel. Used by the realtime message handler when an incoming
+// message mentions the current user and the channel isn't already
+// being viewed. Returns the resulting count or an error.
+func (db *DB) IncrementChannelMentionCount(channelID string) (int, error) {
+	if _, err := db.conn.Exec(
+		`UPDATE channels SET mention_count = mention_count + 1 WHERE id = ?`,
+		channelID,
+	); err != nil {
+		return 0, fmt.Errorf("incrementing channel mention_count: %w", err)
+	}
+	return db.GetChannelMentionCount(channelID), nil
+}
+
+// IncrementChannelMentionCountIfUnread bumps mention_count by 1 only
+// while the channel still has has_unread=1. This is the WS-handler-
+// safe variant: between the handler's UpdateChannelReadState(true) and
+// its increment call, a `channel_marked` event from another Slack
+// client can race in and clear has_unread back to 0 (along with
+// mention_count). Without the guard the late increment would write 1
+// onto a channel the user has just read, leaving an invisible badge
+// (mention_count=1, has_unread=0) that nonetheless lifts the channel
+// to the top of the sidebar's Channels section. The atomic WHERE
+// clause makes the late increment a no-op in that race instead.
+//
+// Returns the resulting count or an error. When the channel was
+// already read the function returns the current (unchanged) count.
+func (db *DB) IncrementChannelMentionCountIfUnread(channelID string) (int, error) {
+	if _, err := db.conn.Exec(
+		`UPDATE channels SET mention_count = mention_count + 1 WHERE id = ? AND has_unread = 1`,
+		channelID,
+	); err != nil {
+		return 0, fmt.Errorf("incrementing channel mention_count: %w", err)
+	}
+	return db.GetChannelMentionCount(channelID), nil
+}
+
+// GetChannelMentionCount returns the persisted mention_count, or 0 for
+// a missing row.
+func (db *DB) GetChannelMentionCount(channelID string) int {
+	var n int
+	err := db.conn.QueryRow(
+		`SELECT COALESCE(mention_count, 0) FROM channels WHERE id = ?`,
+		channelID,
+	).Scan(&n)
+	if err != nil {
+		return 0
+	}
+	return n
+}

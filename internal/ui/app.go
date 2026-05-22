@@ -1177,6 +1177,26 @@ func exactChannelByID(channels []sidebar.ChannelItem, id string) (sidebar.Channe
 	return sidebar.ChannelItem{}, false
 }
 
+// Synthetic last-viewed IDs encode non-channel views (Threads / Activity)
+// in the same channel_visits row the channel restore flow already uses.
+// They start with "__" so they cannot collide with Slack's real channel
+// IDs (which always begin with C/D/G letters) and a channelTargetByID
+// lookup against the real channel list returns false on them — the App
+// branches on IsThreadsLastViewedID / IsActivityLastViewedID and
+// dispatches the matching view-activation message instead.
+const (
+	LastViewedKindThreads  = "__threads__"
+	LastViewedKindActivity = "__activity__"
+)
+
+// IsSyntheticLastViewedID reports whether id is one of the synthetic
+// last-viewed sentinels (Threads / Activity). Callers use it to fork
+// between "restore a channel" and "restore a view" without hard-coding
+// the sentinel strings.
+func IsSyntheticLastViewedID(id string) bool {
+	return id == LastViewedKindThreads || id == LastViewedKindActivity
+}
+
 func (a *App) finishPendingInitialReadyWithChannels(channels []sidebar.ChannelItem, allowFallback bool) tea.Cmd {
 	if a.pendingInitialRestoreChannelID == "" || len(channels) == 0 || a.activeChannelID != "" {
 		return nil
@@ -2317,6 +2337,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.sidebar.SetThreadsActive(true)
 		a.sidebar.SetActivityActive(false)
 		a.focusedPanel = PanelMessages
+		// Record "user is on Threads" using the synthetic visit ID so
+		// the next launch's last-viewed restore can land back here
+		// instead of the most-recent channel.
+		if a.channelVisitRecorder != nil {
+			a.channelVisitRecorder(LastViewedKindThreads)
+		}
 		if a.threadsListFetcher != nil && a.activeTeamID != "" {
 			fetcher := a.threadsListFetcher
 			team := a.activeTeamID
@@ -2333,6 +2359,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.sidebar.SetThreadsActive(false)
 		a.sidebar.SetActivityActive(true)
 		a.focusedPanel = PanelMessages
+		if a.channelVisitRecorder != nil {
+			a.channelVisitRecorder(LastViewedKindActivity)
+		}
 		if a.activityListFetcher != nil && a.activeTeamID != "" {
 			fetcher := a.activityListFetcher
 			team := a.activeTeamID
@@ -2612,11 +2641,21 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.threadCompose.RefreshStyles()
 		}
 		a.workspaceRail.SelectByID(msg.TeamID)
-		// Restore the last-viewed channel for this workspace if we have
-		// one and it still exists; otherwise fall back to the first
-		// channel in the sidebar. Move the sidebar cursor to that
-		// channel as well so the highlight matches the messages pane.
-		if target, ok := channelTargetByID(msg.Channels, a.lastChannelByTeam[msg.TeamID], msg.LastViewedChannelID); ok {
+		// Synthetic last-viewed IDs encode a view restore (Threads /
+		// Activity) instead of a channel restore. They only apply when
+		// there is no session-scoped channel for the destination
+		// workspace; an explicit channel in lastChannelByTeam wins so
+		// quick toggle workspaces still feel responsive.
+		if a.lastChannelByTeam[msg.TeamID] == "" && IsSyntheticLastViewedID(msg.LastViewedChannelID) {
+			switch msg.LastViewedChannelID {
+			case LastViewedKindThreads:
+				a.sidebar.SelectThreadsRow()
+				cmds = append(cmds, func() tea.Msg { return ThreadsViewActivatedMsg{} })
+			case LastViewedKindActivity:
+				a.sidebar.SelectActivityRow()
+				cmds = append(cmds, func() tea.Msg { return ActivityViewActivatedMsg{} })
+			}
+		} else if target, ok := channelTargetByID(msg.Channels, a.lastChannelByTeam[msg.TeamID], msg.LastViewedChannelID); ok {
 			a.sidebar.SelectByID(target.ID)
 			cmds = append(cmds, func() tea.Msg {
 				return ChannelSelectedMsg{ID: target.ID, Name: target.Name, Type: target.Type}
@@ -2701,7 +2740,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case WorkspaceReadyMsg:
-		deferInitialReady := msg.InitialActive && len(msg.Channels) == 0 && msg.LastViewedChannelID != ""
+		// Synthetic last-viewed IDs (Threads / Activity) restore a view
+		// instead of a channel, so they bypass the channel-hydration
+		// deferral entirely — there's no channel to wait for.
+		syntheticRestore := IsSyntheticLastViewedID(msg.LastViewedChannelID)
+		deferInitialReady := msg.InitialActive && len(msg.Channels) == 0 && msg.LastViewedChannelID != "" && !syntheticRestore
 		if deferInitialReady {
 			a.pendingInitialReadyTeamName = msg.TeamName
 			a.pendingInitialRestoreChannelID = msg.LastViewedChannelID
@@ -2739,6 +2782,17 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			a.sidebar.SetSectionsProvider(msg.SectionsProvider)
 			a.SetChannels(msg.Channels)
+			if deferInitialReady || (syntheticRestore && len(msg.Channels) == 0) {
+				// SetChannels just flipped sidebar.bootstrapLoading off
+				// (any SetItems call does). But we still expect channels
+				// to arrive (either via the late DM hydration we're
+				// explicitly deferring for, or as a follow-up to the
+				// non-channel view restore), so re-arm the loading
+				// indicator so the sidebar shows the spinner instead of
+				// the empty-"No channels" placeholder until the late-
+				// arriving channels land.
+				a.sidebar.SetBootstrapLoading(true)
+			}
 			a.channelFinder.SetItems(msg.FinderItems)
 			// SetExternalUsers re-pushes user-names; calling SetUserNames
 			// last is the canonical state.
@@ -2754,22 +2808,37 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.statusbar.SetStatus("", false, time.Time{})
 			}
 			a.workspaceRail.SelectByID(msg.TeamID)
-			if target, ok := channelTargetByID(msg.Channels, msg.LastViewedChannelID); ok {
-				a.sidebar.SelectByID(target.ID)
-				a.messagepane.SetLoading(true)
-				a.messagepane.SetMessages(nil)
-				cmds = append(cmds, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
-					return SpinnerTickMsg{}
-				}))
-				cmds = append(cmds, func() tea.Msg {
-					return ChannelSelectedMsg{ID: target.ID, Name: target.Name, Type: target.Type}
-				})
-			} else if deferInitialReady {
-				a.messagepane.SetLoading(true)
-				a.messagepane.SetMessages(nil)
-				cmds = append(cmds, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
-					return SpinnerTickMsg{}
-				}))
+			switch {
+			case syntheticRestore:
+				// Restore non-channel view (Threads / Activity). Dispatched
+				// as a tea.Cmd so the normal activation path runs (sidebar
+				// indicators, fetcher, focus).
+				switch msg.LastViewedChannelID {
+				case LastViewedKindThreads:
+					a.sidebar.SelectThreadsRow()
+					cmds = append(cmds, func() tea.Msg { return ThreadsViewActivatedMsg{} })
+				case LastViewedKindActivity:
+					a.sidebar.SelectActivityRow()
+					cmds = append(cmds, func() tea.Msg { return ActivityViewActivatedMsg{} })
+				}
+			default:
+				if target, ok := channelTargetByID(msg.Channels, msg.LastViewedChannelID); ok {
+					a.sidebar.SelectByID(target.ID)
+					a.messagepane.SetLoading(true)
+					a.messagepane.SetMessages(nil)
+					cmds = append(cmds, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+						return SpinnerTickMsg{}
+					}))
+					cmds = append(cmds, func() tea.Msg {
+						return ChannelSelectedMsg{ID: target.ID, Name: target.Name, Type: target.Type}
+					})
+				} else if deferInitialReady {
+					a.messagepane.SetLoading(true)
+					a.messagepane.SetMessages(nil)
+					cmds = append(cmds, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+						return SpinnerTickMsg{}
+					}))
+				}
 			}
 		}
 		// Initial threads-list fetch fires for every workspace as it
@@ -4704,6 +4773,10 @@ func (a *App) handleEnter() tea.Cmd {
 		// place. Section headers are also navigable via j/k so the
 		// user can expand/collapse the firehose Channels section
 		// (collapsed by default) without leaving the keyboard.
+		// ToggleCollapseSelected is scoped to header rows only, so
+		// channel rows fall straight through to the SelectedItem
+		// dispatch below — Enter on a channel row opens the channel,
+		// not collapses its section.
 		if a.sidebar.ToggleCollapseSelected() {
 			return nil
 		}
@@ -5056,6 +5129,14 @@ func (a *App) SetLoadingWorkspaces(names []string) {
 			Status:   "connecting",
 		})
 	}
+	// Flag the empty list panes as "still loading" so the global
+	// overlay's dismissal (which fires as soon as ONE workspace is
+	// ready — see checkLoadingDone) doesn't leave the active
+	// workspace's panes flashing "No channels" / "no threads" /
+	// "no activity" while their data is still in flight.
+	a.sidebar.SetBootstrapLoading(true)
+	a.threadsView.SetLoading(true)
+	a.activityView.SetLoading(true)
 }
 
 func (a *App) MarkWorkspaceReady(teamName string) {

@@ -272,3 +272,77 @@ func TestListSubscribedThreads_PerWorkspaceIsolation(t *testing.T) {
 		t.Fatalf("T1 should have 0 subscribed threads, got %d", len(got))
 	}
 }
+
+func TestListSubscribedThreads_IncludesCachedInvolvedReply(t *testing.T) {
+	const selfID = "U1"
+	db := setupDBWithWorkspace(t)
+	if err := db.UpsertChannel(Channel{ID: "C1", WorkspaceID: "T1", Name: "general", Type: "channel"}); err != nil {
+		t.Fatalf("UpsertChannel: %v", err)
+	}
+
+	// No active thread_subscription row. The user participated by
+	// replying, so the cached thread should still appear in Threads.
+	mustUpsertMsg(t, db, "1700000100.000000", "C1", "U2", "parent", "1700000100.000000")
+	mustUpsertMsg(t, db, "1700000200.000000", "C1", selfID, "my reply", "1700000100.000000")
+	mustUpsertMsg(t, db, "1700000300.000000", "C1", "U3", "later reply", "1700000100.000000")
+
+	got, err := db.ListSubscribedThreads("T1", selfID)
+	if err != nil {
+		t.Fatalf("ListSubscribedThreads: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want cached involved thread, got %d: %+v", len(got), got)
+	}
+	if got[0].ThreadTS != "1700000100.000000" || got[0].LastReplyTS != "1700000300.000000" {
+		t.Fatalf("unexpected summary: %+v", got[0])
+	}
+}
+
+func TestListSubscribedThreads_IncludesCachedMentionedParent(t *testing.T) {
+	const selfID = "U1"
+	db := setupDBWithWorkspace(t)
+	if err := db.UpsertChannel(Channel{ID: "C1", WorkspaceID: "T1", Name: "general", Type: "channel"}); err != nil {
+		t.Fatalf("UpsertChannel: %v", err)
+	}
+
+	// Parent mentions the user and has replies, but no active
+	// thread_subscription row exists. The parent-side cached-involved
+	// branch should include it.
+	if err := db.UpsertMessage(Message{
+		TS: "1700000100.000000", ChannelID: "C1", WorkspaceID: "T1", UserID: "U2",
+		Text: "hey <@U1>", ReplyCount: 1,
+	}); err != nil {
+		t.Fatalf("Upsert parent: %v", err)
+	}
+	mustUpsertMsg(t, db, "1700000200.000000", "C1", "U3", "reply", "1700000100.000000")
+
+	got, err := db.ListSubscribedThreads("T1", selfID)
+	if err != nil {
+		t.Fatalf("ListSubscribedThreads: %v", err)
+	}
+	if len(got) != 1 || got[0].ThreadTS != "1700000100.000000" {
+		t.Fatalf("want mentioned parent thread, got %+v", got)
+	}
+	if got[0].ParentText != "hey <@U1>" {
+		t.Fatalf("ParentText = %q, want mention text", got[0].ParentText)
+	}
+}
+
+func TestListSubscribedThreads_IgnoresCachedUninvolvedThread(t *testing.T) {
+	const selfID = "U1"
+	db := setupDBWithWorkspace(t)
+	if err := db.UpsertChannel(Channel{ID: "C1", WorkspaceID: "T1", Name: "general", Type: "channel"}); err != nil {
+		t.Fatalf("UpsertChannel: %v", err)
+	}
+
+	mustUpsertMsg(t, db, "1700000100.000000", "C1", "U2", "parent", "1700000100.000000")
+	mustUpsertMsg(t, db, "1700000200.000000", "C1", "U3", "reply", "1700000100.000000")
+
+	got, err := db.ListSubscribedThreads("T1", selfID)
+	if err != nil {
+		t.Fatalf("ListSubscribedThreads: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("uninvolved cached thread should not appear, got %+v", got)
+	}
+}
