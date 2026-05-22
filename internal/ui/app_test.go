@@ -4103,6 +4103,103 @@ func TestWorkspaceReadyFallsBackWhenLastViewedMissing(t *testing.T) {
 	}
 }
 
+// queuedSyntheticActivationMsg walks the batched tea.Cmd tree looking
+// for either ThreadsViewActivatedMsg or ActivityViewActivatedMsg. Used
+// by the synthetic last-viewed restore tests.
+func queuedSyntheticActivationMsg(cmd tea.Cmd) (string, bool) {
+	if cmd == nil {
+		return "", false
+	}
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, child := range batch {
+			if kind, ok := queuedSyntheticActivationMsg(child); ok {
+				return kind, true
+			}
+		}
+		return "", false
+	}
+	switch msg.(type) {
+	case ThreadsViewActivatedMsg:
+		return "threads", true
+	case ActivityViewActivatedMsg:
+		return "activity", true
+	}
+	return "", false
+}
+
+func TestWorkspaceReadyRestoresThreadsView(t *testing.T) {
+	// LastViewedChannelID set to the synthetic Threads sentinel must
+	// dispatch ThreadsViewActivatedMsg and NOT queue a
+	// ChannelSelectedMsg for a phantom channel.
+	app := NewApp()
+
+	_, cmd := app.Update(WorkspaceReadyMsg{
+		TeamID:              "T1",
+		TeamName:            "Acme",
+		Channels:            []sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}},
+		InitialActive:       true,
+		LastViewedChannelID: LastViewedKindThreads,
+	})
+
+	kind, ok := queuedSyntheticActivationMsg(cmd)
+	if !ok {
+		t.Fatal("expected WorkspaceReadyMsg to queue ThreadsViewActivatedMsg")
+	}
+	if kind != "threads" {
+		t.Fatalf("queued activation kind = %q, want threads", kind)
+	}
+	if sel, ok := queuedChannelSelectedMsg(cmd); ok {
+		t.Fatalf("synthetic restore must not queue ChannelSelectedMsg, got %+v", sel)
+	}
+}
+
+func TestWorkspaceReadyRestoresActivityView(t *testing.T) {
+	app := NewApp()
+
+	_, cmd := app.Update(WorkspaceReadyMsg{
+		TeamID:              "T1",
+		TeamName:            "Acme",
+		Channels:            []sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}},
+		InitialActive:       true,
+		LastViewedChannelID: LastViewedKindActivity,
+	})
+
+	kind, ok := queuedSyntheticActivationMsg(cmd)
+	if !ok {
+		t.Fatal("expected WorkspaceReadyMsg to queue ActivityViewActivatedMsg")
+	}
+	if kind != "activity" {
+		t.Fatalf("queued activation kind = %q, want activity", kind)
+	}
+}
+
+func TestThreadsViewActivationRecordsSyntheticVisit(t *testing.T) {
+	// Activating Threads view records a visit against the synthetic
+	// Threads ID so the next launch restores it.
+	app := NewApp()
+	var got string
+	app.SetChannelVisitRecorder(func(id string) { got = id })
+
+	app.Update(ThreadsViewActivatedMsg{})
+
+	if got != LastViewedKindThreads {
+		t.Errorf("ThreadsViewActivatedMsg recorded id=%q, want %q", got, LastViewedKindThreads)
+	}
+}
+
+func TestActivityViewActivationRecordsSyntheticVisit(t *testing.T) {
+	app := NewApp()
+	var got string
+	app.SetChannelVisitRecorder(func(id string) { got = id })
+
+	app.Update(ActivityViewActivatedMsg{})
+
+	if got != LastViewedKindActivity {
+		t.Errorf("ActivityViewActivatedMsg recorded id=%q, want %q", got, LastViewedKindActivity)
+	}
+}
+
 func TestWorkspaceSwitchedPrefersSessionChannelOverPersisted(t *testing.T) {
 	app := NewApp()
 	app.activeTeamID = "T1"

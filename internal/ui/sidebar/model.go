@@ -605,13 +605,36 @@ func (m *Model) ToggleCollapse(section string) {
 }
 
 // ToggleCollapseSelected toggles the section currently under the cursor.
-// No-op if the cursor isn't on a section header.
+// When the cursor is on a navHeader, that section toggles. When it's on
+// a channel row, the row's parent section toggles — this is the
+// affordance space-on-a-channel uses so users don't have to land the
+// cursor on the header line precisely to hide a section. Returns true
+// when a section was toggled, false on the Threads/Activity rows where
+// "collapse" has no meaning.
 func (m *Model) ToggleCollapseSelected() bool {
-	name, ok := m.IsSectionHeaderSelected()
-	if !ok {
+	if name, ok := m.IsSectionHeaderSelected(); ok {
+		m.ToggleCollapse(name)
+		return true
+	}
+	if m.cursor < 0 || m.cursor >= len(m.nav) {
 		return false
 	}
-	m.ToggleCollapse(name)
+	n := m.nav[m.cursor]
+	if n.kind != navChannel {
+		return false
+	}
+	if n.fi < 0 || n.fi >= len(m.filtered) {
+		return false
+	}
+	itemIdx := m.filtered[n.fi]
+	if itemIdx < 0 || itemIdx >= len(m.items) {
+		return false
+	}
+	section := m.sectionFor(m.items[itemIdx])
+	if section == "" {
+		return false
+	}
+	m.ToggleCollapse(section)
 	return true
 }
 
