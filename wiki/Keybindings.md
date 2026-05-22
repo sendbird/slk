@@ -10,7 +10,7 @@
 | `Enter` | Normal (message) | Open thread |
 | `i` / `F2` | Normal | Enter insert mode (`F2` is useful when a CJK IME consumes alphabetic keys for composition) |
 | `Esc` | Insert / Command | Return to normal mode |
-| `Enter` | Insert | Send message |
+| `Enter` / `Ctrl+Enter` | Insert | Send message (`Ctrl+Enter` is useful when IME composition consumes plain Enter) |
 | `Shift+Enter` | Insert | Newline |
 | `Ctrl+V` | Insert | Smart paste — image / file path / text (use `Ctrl+V`, not the terminal's `Ctrl+Shift+V`) |
 | `Ctrl+U` | Insert | Clear compose (text + pending attachments) |

@@ -3311,8 +3311,10 @@ func (a *App) handleInsertMode(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		}
 	}
-	// Plain Enter sends; Shift+Enter (and Ctrl+J as a fallback for terminals
-	// that don't disambiguate modifiers) inserts a newline.
+	// Plain Enter sends. Ctrl+Enter also sends when the terminal reports it
+	// distinctly, which gives IME users a send key that is less likely to be
+	// consumed as composition commit. Shift+Enter (and Ctrl+J as a fallback for
+	// terminals that don't disambiguate modifiers) inserts a newline.
 	isSend := code == tea.KeyEnter && !mod.Contains(tea.ModShift)
 	isNewline := (code == tea.KeyEnter && mod.Contains(tea.ModShift)) ||
 		(code == 'j' && mod == tea.ModCtrl)
