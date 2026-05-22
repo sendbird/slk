@@ -1,10 +1,28 @@
 package image
 
 import (
+	"image"
 	"strconv"
 
 	"github.com/gammons/slk/internal/debuglog"
 )
+
+var renderCellPixels = image.Pt(8, 16)
+
+// SetRenderCellPixels records the actual terminal cell size used by renderers
+// that emit pixel-addressed protocols like kitty and sixel.
+func SetRenderCellPixels(px image.Point) {
+	if px.X > 0 {
+		renderCellPixels.X = px.X
+	}
+	if px.Y > 0 {
+		renderCellPixels.Y = px.Y
+	}
+}
+
+func currentRenderCellPixels() image.Point {
+	return renderCellPixels
+}
 
 // CellPixels returns the (width, height) of a terminal cell in pixels.
 // It honors $COLORTERM_CELL_WIDTH/$COLORTERM_CELL_HEIGHT, then attempts

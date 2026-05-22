@@ -1,6 +1,7 @@
 package image
 
 import (
+	"image"
 	"image/color"
 	"strings"
 	"testing"
@@ -12,7 +13,7 @@ func TestPreview_RenderShape(t *testing.T) {
 		FileID: "F1",
 		Img:    makeSolid(800, 600, color.RGBA{1, 2, 3, 255}),
 	})
-	out := p.View(60, 30, ProtoHalfBlock)
+	out := p.View(60, 30, ProtoHalfBlock, image.Point{})
 	if out == "" {
 		t.Fatal("empty view")
 	}
@@ -39,7 +40,7 @@ func TestPreview_SiblingsShownInCaptionAndHint(t *testing.T) {
 		FileID: "F1",
 		Img:    makeSolid(50, 50, color.RGBA{0, 0, 0, 255}),
 	})
-	out := solo.View(80, 30, ProtoHalfBlock)
+	out := solo.View(80, 30, ProtoHalfBlock, image.Point{})
 	if strings.Contains(out, "(1/1)") {
 		t.Error("solo preview should not show sibling counter")
 	}
@@ -55,7 +56,7 @@ func TestPreview_SiblingsShownInCaptionAndHint(t *testing.T) {
 		SiblingCount: 4,
 		SiblingIndex: 2,
 	})
-	out = multi.View(80, 30, ProtoHalfBlock)
+	out = multi.View(80, 30, ProtoHalfBlock, image.Point{})
 	if !strings.Contains(out, "(3/4)") {
 		t.Errorf("expected '(3/4)' in caption, got: %s", out)
 	}

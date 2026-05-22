@@ -29,8 +29,9 @@ func (s *SixelRenderer) Render(img image.Image, target image.Point) Render {
 		return Render{Cells: target}
 	}
 
-	pxW := target.X * 8
-	pxH := target.Y * 16
+	px := currentRenderCellPixels()
+	pxW := target.X * px.X
+	pxH := target.Y * px.Y
 	resized := image.NewRGBA(image.Rect(0, 0, pxW, pxH))
 	draw.BiLinear.Scale(resized, resized.Bounds(), img, img.Bounds(), draw.Over, nil)
 

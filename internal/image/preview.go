@@ -138,13 +138,14 @@ func (p *Preview) SwapImage(in PreviewInput) {
 var previewSpinnerFrames = []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
 
 // View renders the preview into a string of size width × height. proto is
-// the active rendering protocol (kitty / sixel / halfblock). Reserves
-// 1 row top for the caption, 1 row bottom for the hint, and centers the
-// image (aspect-preserved) in the remaining area.
+// the active rendering protocol (kitty / sixel / halfblock). cellPixels is
+// the terminal cell size in pixels; when unknown, the renderer falls back to
+// 8×16. Reserves 1 row top for the caption, 1 row bottom for the hint, and
+// centers the image (aspect-preserved) in the remaining area.
 //
 // While loading, the image area shows a centered spinner + filename
 // instead of an image. Caption and hint render the same way.
-func (p *Preview) View(width, height int, proto Protocol) string {
+func (p *Preview) View(width, height int, proto Protocol, cellPixels image.Point) string {
 	if !p.open || width <= 0 || height <= 0 {
 		return ""
 	}
@@ -165,7 +166,7 @@ func (p *Preview) View(width, height int, proto Protocol) string {
 	imgCols := width
 
 	srcW, srcH := p.img.Bounds().Dx(), p.img.Bounds().Dy()
-	target := fitInto(srcW, srcH, imgCols, imgRows)
+	target := fitInto(srcW, srcH, imgCols, imgRows, cellPixels)
 
 	render := RenderImage(proto, p.img, target)
 
@@ -276,17 +277,18 @@ func (p *Preview) viewLoading(width, height int) string {
 // fitInto returns the largest (cols, rows) that preserve the source
 // image's pixel aspect ratio when rendered into terminal cells.
 //
-// Terminal cells are roughly twice as tall as wide (typical font metric:
-// 8×16 px). A square pixel image therefore covers twice as many columns
-// as rows: e.g. a 100×100 image in 8×16 cells fills 12.5 cols × 6.25 rows.
-// The cell aspect ratio in cell units is thus:
-//
-//	cols/rows = (srcW/srcH) × (cellH/cellW) = (srcW/srcH) × cellAspect
-//
-// Given maxCols and maxRows we pick the larger axis-fit that respects
-// this ratio.
-func fitInto(srcW, srcH, maxCols, maxRows int) image.Point {
-	const cellAspect = 2.0 // cellH / cellW
+// cellPixels describes the terminal cell size in pixels. When unknown,
+// callers can pass image.Point{} and the function falls back to 8×16.
+func fitInto(srcW, srcH, maxCols, maxRows int, cellPixels image.Point) image.Point {
+	cellW := cellPixels.X
+	cellH := cellPixels.Y
+	if cellW <= 0 {
+		cellW = 8
+	}
+	if cellH <= 0 {
+		cellH = 16
+	}
+	cellAspect := float64(cellH) / float64(cellW)
 	cellRatio := float64(srcW) / float64(srcH) * cellAspect
 
 	// Try filling width; compute the height that preserves ratio.

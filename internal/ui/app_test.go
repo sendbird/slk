@@ -294,7 +294,6 @@ func TestHandleInsertMode_ShiftEnterInsertsNewline(t *testing.T) {
 	cmd := app.handleInsertMode(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModShift})
 
 	if cmd != nil {
-		// Anything non-nil here likely means a SendMessageMsg was queued.
 		if msg := cmd(); msg != nil {
 			if _, ok := msg.(SendMessageMsg); ok {
 				t.Fatalf("Shift+Enter should not send the message")
@@ -313,45 +312,25 @@ func TestHandleInsertMode_ShiftEnterInsertsNewline(t *testing.T) {
 	}
 }
 
-// Regression: Shift+Enter must keep working past the visible-row cap of
-// the compose box. The textarea's MaxHeight used to be 5, which also
-// gated InsertNewline via atContentLimit, so users hit a silent
-// 4-newline ceiling once the box was full.
-func TestHandleInsertMode_ShiftEnterPastVisibleHeight(t *testing.T) {
+func TestHandleInsertMode_BackslashEnterInsertsNewline(t *testing.T) {
 	app := NewApp()
 	app.activeChannelID = "C1"
 	app.focusedPanel = PanelMessages
 	app.SetMode(ModeInsert)
 	app.compose.Focus()
-
-	app.compose.SetValue("a\nb\nc\nd\ne\nf")
-	app.compose.MoveCursorToEnd()
-
-	app.handleInsertMode(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModShift})
-
-	val := app.compose.Value()
-	if got, want := strings.Count(val, "\n"), 6; got != want {
-		t.Fatalf("expected %d newlines after shift+enter on a 6-line draft, got %d (value=%q)", want, got, val)
-	}
-}
-
-func TestHandleInsertMode_PlainEnterSends(t *testing.T) {
-	app := NewApp()
-	app.activeChannelID = "C1"
-	app.focusedPanel = PanelMessages
-	app.SetMode(ModeInsert)
-	app.compose.SetValue("hello")
+	app.compose.SetValue("hello\\")
 
 	cmd := app.handleInsertMode(tea.KeyPressMsg{Code: tea.KeyEnter})
-	if cmd == nil {
-		t.Fatalf("plain Enter with text should return a send cmd")
+	if cmd != nil {
+		if msg := cmd(); msg != nil {
+			if _, ok := msg.(SendMessageMsg); ok {
+				t.Fatalf("backslash+Enter should not send the message")
+			}
+		}
 	}
-	msg := cmd()
-	if _, ok := msg.(SendMessageMsg); !ok {
-		t.Fatalf("expected SendMessageMsg, got %T", msg)
-	}
-	if app.compose.Value() != "" {
-		t.Fatalf("expected compose to be reset after send, got %q", app.compose.Value())
+	val := app.compose.Value()
+	if !strings.Contains(val, "\n") {
+		t.Fatalf("expected newline in compose value, got %q", val)
 	}
 }
 
@@ -561,24 +540,45 @@ func TestHandleInsertMode_AltEnterInsertsNewline(t *testing.T) {
 	}
 }
 
-func TestHandleInsertMode_BackslashEnterInsertsNewline(t *testing.T) {
+// Regression: Shift+Enter must keep working past the visible-row cap of
+// the compose box. The textarea's MaxHeight used to be 5, which also
+// gated InsertNewline via atContentLimit, so users hit a silent
+// 4-newline ceiling once the box was full.
+func TestHandleInsertMode_ShiftEnterPastVisibleHeight(t *testing.T) {
 	app := NewApp()
 	app.activeChannelID = "C1"
 	app.focusedPanel = PanelMessages
 	app.SetMode(ModeInsert)
 	app.compose.Focus()
-	app.compose.SetValue("hello\\")
+
+	app.compose.SetValue("a\nb\nc\nd\ne\nf")
+	app.compose.MoveCursorToEnd()
+
+	app.handleInsertMode(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModShift})
+
+	val := app.compose.Value()
+	if got, want := strings.Count(val, "\n"), 6; got != want {
+		t.Fatalf("expected %d newlines after shift+enter on a 6-line draft, got %d (value=%q)", want, got, val)
+	}
+}
+
+func TestHandleInsertMode_PlainEnterSends(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.focusedPanel = PanelMessages
+	app.SetMode(ModeInsert)
+	app.compose.SetValue("hello")
 
 	cmd := app.handleInsertMode(tea.KeyPressMsg{Code: tea.KeyEnter})
-	if cmd != nil {
-		if msg := cmd(); msg != nil {
-			if _, ok := msg.(SendMessageMsg); ok {
-				t.Fatalf("backslash+Enter should not send the message")
-			}
-		}
+	if cmd == nil {
+		t.Fatalf("plain Enter with text should return a send cmd")
 	}
-	if !strings.Contains(app.compose.Value(), "\n") {
-		t.Fatalf("expected newline in compose value, got %q", app.compose.Value())
+	msg := cmd()
+	if _, ok := msg.(SendMessageMsg); !ok {
+		t.Fatalf("expected SendMessageMsg, got %T", msg)
+	}
+	if app.compose.Value() != "" {
+		t.Fatalf("expected compose to be reset after send, got %q", app.compose.Value())
 	}
 }
 
@@ -2965,6 +2965,49 @@ func TestHandleInsertMode_Up_OnSecondLine_ForwardsToTextarea(t *testing.T) {
 
 	if !app.compose.CursorAtFirstLine() {
 		t.Error("expected cursor moved to first line via standard Up")
+	}
+}
+
+func TestNormalMode_KoreanKeyboardJMovesDown(t *testing.T) {
+	app := NewApp()
+	app.focusedPanel = PanelSidebar
+	app.sidebar.SetItems([]sidebar.ChannelItem{
+		{ID: "C1", Name: "general", Type: "channel"},
+		{ID: "C2", Name: "random", Type: "channel"},
+	})
+	app.sidebar.SelectByID("C1")
+
+	app.handleNormalMode(tea.KeyPressMsg{Code: 'ㅓ', Text: "ㅓ"})
+
+	if got := app.sidebar.SelectedID(); got != "C2" {
+		t.Fatalf("Korean keyboard j should move down; selected ID = %q", got)
+	}
+}
+
+func TestNormalMode_KoreanKeyboardShiftQOpensConfirmPrompt(t *testing.T) {
+	app := NewApp()
+
+	cmd := app.handleNormalMode(tea.KeyPressMsg{Code: 'ㅃ', Text: "ㅃ"})
+	if cmd != nil {
+		if _, ok := cmd().(tea.QuitMsg); ok {
+			t.Fatal("Korean keyboard Q should open confirm prompt, not quit immediately")
+		}
+	}
+	if !app.confirmPrompt.IsVisible() {
+		t.Fatal("Korean keyboard Q should open the confirm prompt")
+	}
+	if app.mode != ModeConfirm {
+		t.Errorf("expected mode=ModeConfirm, got %v", app.mode)
+	}
+}
+
+func TestShortcutNormalization_KoreanTextMapsOnlyWhenRequested(t *testing.T) {
+	msg := tea.KeyPressMsg{Code: 'ㅑ', Text: "ㅑ"}
+	if got := msg.String(); got != "ㅑ" {
+		t.Fatalf("precondition: raw key string = %q", got)
+	}
+	if got := normalizeShortcutKeyMsg(msg).String(); got != "i" {
+		t.Fatalf("normalized Korean keyboard i = %q, want i", got)
 	}
 }
 

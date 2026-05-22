@@ -1002,6 +1002,11 @@ type App struct {
 	// startup. Used to render the full-screen preview overlay.
 	imgProtocol imgpkg.Protocol
 
+	// imgCellPixels is the actual terminal cell size used by the active image
+	// protocol renderers. The preview overlay uses the same metric so fullscreen
+	// sizing matches inline image sizing on terminals whose cells aren't 8×16.
+	imgCellPixels image.Point
+
 	// previewOverlay holds the full-screen image preview state. nil when
 	// no preview is open. View() composes its output over the
 	// messages+thread region; key handling routes through it while
@@ -2931,7 +2936,7 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// user. `Q` (capital) remains the no-prompt force-quit, and an
 	// already-open quit prompt isn't reopened (Enter confirms, Esc
 	// cancels via the existing confirm-mode handler).
-	if key.Matches(msg, a.keys.Quit) {
+	if key.Matches(normalizeShortcutKeyMsg(msg), a.keys.Quit) {
 		if a.mode != ModeConfirm {
 			a.openQuitConfirm()
 		}
@@ -3172,6 +3177,7 @@ var koreanIMEQWERTY = map[rune]string{
 }
 
 func (a *App) handleNormalMode(msg tea.KeyMsg) tea.Cmd {
+	msg = normalizeShortcutKeyMsg(msg)
 	if key.Matches(msg, a.keys.Top) {
 		if a.pendingTopKey {
 			a.pendingTopKey = false
@@ -3817,6 +3823,9 @@ func (a *App) handleThemeSwitcherMode(msg tea.KeyMsg) tea.Cmd {
 // handleHelpMode dispatches key events to the help overlay and tears down
 // the mode when the overlay closes itself (esc/q/?).
 func (a *App) handleHelpMode(msg tea.KeyMsg) tea.Cmd {
+	if !a.help.IsSearching() {
+		msg = normalizeShortcutKeyMsg(msg)
+	}
 	keyStr := msg.String()
 	switch msg.Key().Code {
 	case tea.KeyEnter:
@@ -3994,6 +4003,7 @@ func (a *App) handleReactionPickerMode(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (a *App) handleConfirmMode(msg tea.KeyMsg) tea.Cmd {
+	msg = normalizeShortcutKeyMsg(msg)
 	keyStr := msg.String()
 	switch msg.Key().Code {
 	case tea.KeyEscape:
@@ -5148,6 +5158,7 @@ func (a *App) SetAvatarFunc(fn messages.AvatarFunc) {
 func (a *App) SetImageContext(ctx imgrender.ImageContext) {
 	a.messagepane.SetImageContext(ctx)
 	a.threadPanel.SetImageContext(ctx)
+	a.imgCellPixels = ctx.CellPixels
 }
 
 // SetImageFetcher records the image fetcher so the preview overlay can
@@ -6266,7 +6277,7 @@ func (a *App) View() tea.View {
 		if a.threadVisible && threadWidth > 0 {
 			overlayW += threadWidth + threadBorder
 		}
-		overlayContent := a.previewOverlay.View(overlayW, contentHeight, a.imgProtocol)
+		overlayContent := a.previewOverlay.View(overlayW, contentHeight, a.imgProtocol, a.imgCellPixels)
 		overlayPanel := exactSize(overlayContent, overlayW, contentHeight)
 		panels = append(panels, overlayPanel)
 	}

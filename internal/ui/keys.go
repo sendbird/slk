@@ -1,7 +1,14 @@
 // internal/ui/keys.go
 package ui
 
-import "charm.land/bubbles/v2/key"
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+)
 
 type KeyMap struct {
 	Up                  key.Binding
@@ -89,4 +96,113 @@ func DefaultKeyMap() KeyMap {
 		NavForward:          key.NewBinding(key.WithKeys("ctrl+k"), key.WithHelp("ctrl+k", "navigate forward")),
 		Help:                key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "show keybindings")),
 	}
+}
+
+type shortcutKeyMsg struct {
+	tea.KeyMsg
+	keyString string
+}
+
+func (m shortcutKeyMsg) String() string { return m.keyString }
+
+func normalizeShortcutKeyMsg(msg tea.KeyMsg) tea.KeyMsg {
+	keyString, ok := koreanShortcutKeyString(msg)
+	if !ok {
+		return msg
+	}
+	return shortcutKeyMsg{KeyMsg: msg, keyString: keyString}
+}
+
+func koreanShortcutKeyString(msg tea.KeyMsg) (string, bool) {
+	k := msg.Key()
+	r, ok := koreanShortcutRune(k.Text)
+	if !ok {
+		r, ok = koreanDubeolsikShortcut[k.Code]
+		if !ok {
+			return "", false
+		}
+	}
+	return shortcutStringWithModifiers(r, k.Mod), true
+}
+
+func koreanShortcutRune(text string) (rune, bool) {
+	if text == "" || text == " " {
+		return 0, false
+	}
+	r, size := utf8.DecodeRuneInString(text)
+	if r == utf8.RuneError || size != len(text) {
+		return 0, false
+	}
+	mapped, ok := koreanDubeolsikShortcut[r]
+	return mapped, ok
+}
+
+func shortcutStringWithModifiers(r rune, mod tea.KeyMod) string {
+	withChordModifier := mod.Contains(tea.ModCtrl) ||
+		mod.Contains(tea.ModAlt) ||
+		mod.Contains(tea.ModMeta) ||
+		mod.Contains(tea.ModHyper) ||
+		mod.Contains(tea.ModSuper)
+
+	if !withChordModifier {
+		if mod.Contains(tea.ModShift) && isASCIIAlpha(r) {
+			r = unicode.ToUpper(r)
+		}
+		return string(r)
+	}
+
+	var b strings.Builder
+	if mod.Contains(tea.ModCtrl) {
+		b.WriteString("ctrl+")
+	}
+	if mod.Contains(tea.ModAlt) {
+		b.WriteString("alt+")
+	}
+	if mod.Contains(tea.ModShift) {
+		b.WriteString("shift+")
+	}
+	if mod.Contains(tea.ModMeta) {
+		b.WriteString("meta+")
+	}
+	if mod.Contains(tea.ModHyper) {
+		b.WriteString("hyper+")
+	}
+	if mod.Contains(tea.ModSuper) {
+		b.WriteString("super+")
+	}
+	b.WriteRune(unicode.ToLower(r))
+	return b.String()
+}
+
+func isASCIIAlpha(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+}
+
+var koreanDubeolsikShortcut = map[rune]rune{
+	'ㅂ': 'q', 'ㅃ': 'Q',
+	'ㅈ': 'w', 'ㅉ': 'W',
+	'ㄷ': 'e', 'ㄸ': 'E',
+	'ㄱ': 'r', 'ㄲ': 'R',
+	'ㅅ': 't', 'ㅆ': 'T',
+	'ㅛ': 'y',
+	'ㅕ': 'u',
+	'ㅑ': 'i',
+	'ㅐ': 'o', 'ㅒ': 'O',
+	'ㅔ': 'p', 'ㅖ': 'P',
+	'ㅁ': 'a',
+	'ㄴ': 's',
+	'ㅇ': 'd',
+	'ㄹ': 'f',
+	'ㅎ': 'g',
+	'ㅗ': 'h',
+	'ㅓ': 'j',
+	'ㅏ': 'k',
+	'ㅣ': 'l',
+	'ㅋ': 'z',
+	'ㅌ': 'x',
+	'ㅊ': 'c',
+	'ㅍ': 'v',
+	'ㅠ': 'b',
+	'ㅜ': 'n',
+	'ㅡ': 'm',
 }

@@ -360,11 +360,11 @@ func (m *Model) SetUploading(on bool) {
 	if m.uploading == on {
 		return
 	}
-		m.uploading = on
-		if on {
-			m.selectedAttachment = -1
-		}
-		m.dirty()
+	m.uploading = on
+	if on {
+		m.selectedAttachment = -1
+	}
+	m.dirty()
 }
 
 // Uploading reports whether an upload is currently in flight.

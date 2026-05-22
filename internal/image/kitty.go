@@ -144,8 +144,9 @@ func (k *KittyRenderer) RenderKey(key string, target image.Point) Render {
 		// On repeat calls (fresh=false) the registered ID has already
 		// been confirmed delivered via MarkUploaded; no need to re-do
 		// the bilinear downscale or PNG encode.
-		pxW := target.X * 8
-		pxH := target.Y * 16
+		px := currentRenderCellPixels()
+		pxW := target.X * px.X
+		pxH := target.Y * px.Y
 		resized := image.NewRGBA(image.Rect(0, 0, pxW, pxH))
 		draw.BiLinear.Scale(resized, resized.Bounds(), src, src.Bounds(), draw.Over, nil)
 		var pngBuf bytes.Buffer
@@ -155,14 +156,6 @@ func (k *KittyRenderer) RenderKey(key string, target image.Point) Render {
 			cellsCols := target.X
 			cellsRows := target.Y
 			reg := k.registry
-			// fired guards against per-closure double-emission (e.g. the
-			// same viewEntry being flushed twice in one frame). The
-			// registry's MarkUploaded guards against double-emission
-			// across DIFFERENT closures for the same (key, target) —
-			// without that, a cache rebuild that discards an unfired
-			// closure (e.g. SetMessages on the messages pane) would
-			// leave the registry thinking the upload had landed when in
-			// fact no bytes were ever sent.
 			var fired atomic.Bool
 			r.OnFlush = func(w io.Writer) error {
 				if !fired.CompareAndSwap(false, true) {
@@ -218,15 +211,6 @@ func emitKittyUpload(w io.Writer, id uint32, payload string, cols, rows int) err
 }
 
 func buildPlaceholderLines(id uint32, cells image.Point) []string {
-	// Per kitty spec: image ID is encoded in the foreground color as a
-	// 24-bit number. In truecolor SGR \e[38;2;R;G;Bm the natural
-	// interpretation is (R << 16) | (G << 8) | B, so R = byte 2 (high),
-	// G = byte 1, B = byte 0 (low). Verified against the spec's worked
-	// example: ID 42 in 256-color mode is \e[38;5;42m, which means the
-	// truecolor equivalent is \e[38;2;0;0;42m (low byte → B), NOT
-	// \e[38;2;42;0;0m. The high byte (byte 3) of a >24-bit ID would
-	// require the optional third diacritic; we don't need that since
-	// our IDs are well under 2^24.
 	r := byte((id >> 16) & 0xFF)
 	g := byte((id >> 8) & 0xFF)
 	b := byte(id & 0xFF)
