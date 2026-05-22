@@ -628,31 +628,38 @@ func (m *Model) SetOnCollapseChange(fn func(section string, collapsed bool)) {
 	m.onCollapseChange = fn
 }
 
-// ApplyPersistedCollapse seeds the model's per-section collapse state
-// from a persisted set. Sections present in the map override the
-// built-in defaults (Channels + Apps collapsed); sections absent from
-// the map keep their default behavior so workspaces the user has
-// never touched still open on the tidy view. Routes through the
-// collapseByID map when a SectionsProvider is installed so the keys
-// match what ToggleCollapse will later read.
+// ApplyPersistedCollapse RESETS the model's per-section collapse
+// state to the supplied set, then re-applies the built-in defaults
+// for any section absent from the input. The reset step is essential
+// for workspace switches: the App reuses one *sidebar.Model across
+// every workspace, so leaving prior entries in m.collapsed /
+// m.collapseByID would silently inherit (e.g.) workspace A's
+// "Channels expanded" state into workspace B even though B has no
+// persisted row for that section. Sections present in the input
+// override the defaults; sections absent fall back to defaults.
+//
+// Routes through the collapseByID map when a SectionsProvider is
+// installed so the keys match what ToggleCollapse will later read.
 //
 // Does NOT fire onCollapseChange — restoration is not a user toggle.
 func (m *Model) ApplyPersistedCollapse(persisted map[string]bool) {
-	if len(persisted) == 0 {
-		m.cacheValid = false
-		m.dirty()
-		return
-	}
 	if m.useSlackSections() {
-		if m.collapseByID == nil {
-			m.collapseByID = map[string]bool{}
-		}
-		for k, v := range persisted {
-			m.collapseByID[k] = v
+		// Slack-mode has no built-in defaults (sections are server-
+		// supplied), so a clean nil-map suffices.
+		m.collapseByID = nil
+		if len(persisted) > 0 {
+			m.collapseByID = make(map[string]bool, len(persisted))
+			for k, v := range persisted {
+				m.collapseByID[k] = v
+			}
 		}
 	} else {
-		if m.collapsed == nil {
-			m.collapsed = map[string]bool{}
+		// Config-mode defaults: Channels + Apps collapsed, others
+		// expanded. Rebuild from scratch so prior-workspace entries
+		// can't leak through.
+		m.collapsed = map[string]bool{
+			defaultChannelsSection: true,
+			defaultAppsSection:     true,
 		}
 		for k, v := range persisted {
 			m.collapsed[k] = v
