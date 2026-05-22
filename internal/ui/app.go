@@ -6645,7 +6645,18 @@ func (a *App) View() tea.View {
 	}
 	v := tea.NewView(finalScreen)
 	v.AltScreen = true
-	v.MouseMode = tea.MouseModeCellMotion
+	// While a wheel burst is waiting for its coalesced flush, temporarily
+	// disable terminal mouse reporting. Bubble Tea renders after every
+	// Update, even when queueMouseWheel intentionally avoids mutating the
+	// model; without this backpressure, high-resolution trackpads can keep
+	// feeding wheel messages faster than the UI loop can drain them, which
+	// makes the app appear to hang. The flush re-enables mouse mode on the
+	// next render, so normal clicks/drags are only paused for one frame.
+	if a.pendingWheelActive {
+		v.MouseMode = tea.MouseModeNone
+	} else {
+		v.MouseMode = tea.MouseModeCellMotion
+	}
 	if !overlayActive {
 		v.Cursor = activeCursor
 	}

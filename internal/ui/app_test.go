@@ -5181,3 +5181,28 @@ func TestApp_MouseWheelBurstIsCoalesced(t *testing.T) {
 		t.Fatalf("full burst selected %d, want 0", got)
 	}
 }
+
+func TestApp_MouseWheelBurstTemporarilyDisablesMouseMode(t *testing.T) {
+	a := NewApp()
+	a.width = 160
+	a.height = 30
+	a.sidebar.SetItems([]sidebar.ChannelItem{
+		{ID: "C1", Name: "general", Type: "channel"},
+		{ID: "C2", Name: "random", Type: "channel"},
+	})
+	_ = a.View() // populate sidebar hit-test layout
+
+	x := a.layoutRailWidth + 1
+	_, cmd := a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelDown})
+	if cmd == nil {
+		t.Fatal("first wheel event should schedule a coalesced flush")
+	}
+	if v := a.View(); v.MouseMode != tea.MouseModeNone {
+		t.Fatalf("pending wheel burst MouseMode = %v, want MouseModeNone", v.MouseMode)
+	}
+
+	a.Update(mouseWheelFlushMsg{})
+	if v := a.View(); v.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("after wheel flush MouseMode = %v, want MouseModeCellMotion", v.MouseMode)
+	}
+}
