@@ -341,6 +341,69 @@ func TestHandleInsertMode_ThreadReplyCtrlEnterSends(t *testing.T) {
 	}
 }
 
+func TestHandleInsertMode_ShiftReturnInsertsNewline(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.focusedPanel = PanelMessages
+	app.SetMode(ModeInsert)
+	app.compose.Focus()
+	app.compose.SetValue("hello")
+
+	cmd := app.handleInsertMode(tea.KeyPressMsg{Code: tea.KeyReturn, Mod: tea.ModShift})
+	if cmd != nil {
+		if msg := cmd(); msg != nil {
+			if _, ok := msg.(SendMessageMsg); ok {
+				t.Fatalf("Shift+Return should not send the message")
+			}
+		}
+	}
+	if !strings.Contains(app.compose.Value(), "\n") {
+		t.Fatalf("expected newline in compose value, got %q", app.compose.Value())
+	}
+}
+
+func TestHandleInsertMode_AltEnterInsertsNewline(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.focusedPanel = PanelMessages
+	app.SetMode(ModeInsert)
+	app.compose.Focus()
+	app.compose.SetValue("hello")
+
+	cmd := app.handleInsertMode(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModAlt})
+	if cmd != nil {
+		if msg := cmd(); msg != nil {
+			if _, ok := msg.(SendMessageMsg); ok {
+				t.Fatalf("Alt+Enter should not send the message")
+			}
+		}
+	}
+	if !strings.Contains(app.compose.Value(), "\n") {
+		t.Fatalf("expected newline in compose value, got %q", app.compose.Value())
+	}
+}
+
+func TestHandleInsertMode_BackslashEnterInsertsNewline(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.focusedPanel = PanelMessages
+	app.SetMode(ModeInsert)
+	app.compose.Focus()
+	app.compose.SetValue("hello\\")
+
+	cmd := app.handleInsertMode(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd != nil {
+		if msg := cmd(); msg != nil {
+			if _, ok := msg.(SendMessageMsg); ok {
+				t.Fatalf("backslash+Enter should not send the message")
+			}
+		}
+	}
+	if !strings.Contains(app.compose.Value(), "\n") {
+		t.Fatalf("expected newline in compose value, got %q", app.compose.Value())
+	}
+}
+
 // TestHandleInsertMode_PlainEnterReturnsToNormalMode locks in the
 // vim-style UX: hitting Enter to submit a channel message drops the
 // user back to ModeNormal instead of leaving them in insert mode.

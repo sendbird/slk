@@ -694,9 +694,9 @@ type ChannelJoinFailedMsg struct {
 // clipboard contents. Production code uses the real clipboard.Read.
 type clipboardReader func(format clipboard.Format) []byte
 
-// defaultClipboardReader is the real clipboard read function. It's
+// defaultClipboardReader is the platform clipboard reader. It's
 // overridable per-App via SetClipboardReader for tests.
-var defaultClipboardReader clipboardReader = clipboard.Read
+var defaultClipboardReader clipboardReader = platformClipboardReader()
 
 type App struct {
 	// Sub-models
@@ -3313,10 +3313,16 @@ func (a *App) handleInsertMode(msg tea.KeyMsg) tea.Cmd {
 	}
 	// Plain Enter sends. Ctrl+Enter also sends when the terminal reports it
 	// distinctly, which gives IME users a send key that is less likely to be
-	// consumed as composition commit. Shift+Enter (and Ctrl+J as a fallback for
-	// terminals that don't disambiguate modifiers) inserts a newline.
-	isSend := code == tea.KeyEnter && !mod.Contains(tea.ModShift)
-	isNewline := (code == tea.KeyEnter && mod.Contains(tea.ModShift)) ||
+	// consumed as composition commit. Shift/Alt+Enter, backslash+Enter, and
+	// Ctrl+J insert a newline.
+	keystroke := msg.Key().Keystroke()
+	stringForm := msg.String()
+	isModifiedEnter := stringForm == "shift+enter" || keystroke == "shift+enter" || stringForm == "shift+return" || keystroke == "shift+return" || stringForm == "alt+enter" || keystroke == "alt+enter" || stringForm == "alt+return" || keystroke == "alt+return"
+	textValue := target.Value()
+	isBackslashEnter := (code == tea.KeyEnter || code == tea.KeyReturn) && strings.HasSuffix(textValue, "\\")
+	isPlainEnter := (code == tea.KeyEnter || code == tea.KeyReturn) && !mod.Contains(tea.ModShift) && !mod.Contains(tea.ModAlt)
+	isSend := isPlainEnter && !isModifiedEnter && !isBackslashEnter
+	isNewline := ((code == tea.KeyEnter || code == tea.KeyReturn) && (mod.Contains(tea.ModShift) || mod.Contains(tea.ModAlt))) || isModifiedEnter || isBackslashEnter ||
 		(code == 'j' && mod == tea.ModCtrl)
 
 	// Determine which compose box is active based on focused panel
