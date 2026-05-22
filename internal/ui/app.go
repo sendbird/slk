@@ -420,6 +420,21 @@ type (
 		Files    []globalsearch.Item
 		Err      error
 	}
+
+	// ChannelSearchDebounceMsg is the Ctrl+F counterpart to
+	// SearchDebounceMsg, scoped to a single channel/DM.
+	ChannelSearchDebounceMsg struct {
+		Gen uint64
+	}
+
+	// ChannelSearchResultsMsg carries channel-scoped server search
+	// results. Same stale-state guards as SearchResultsMsg apply.
+	ChannelSearchResultsMsg struct {
+		Gen      uint64
+		Query    string
+		Messages []globalsearch.Item
+		Err      error
+	}
 )
 
 type loadingEntry struct {
@@ -525,6 +540,23 @@ type ChannelFetchFunc func(channelID, channelName string) tea.Msg
 // the request generation the result must report back so the App can
 // drop stale results.
 type SearchFunc func(ctx context.Context, query string, gen uint64) tea.Msg
+
+// ChannelSearchScope identifies which channel/DM the Ctrl+F search
+// should target. The App captures this at Open time so a network
+// result that lands later still applies to the right channel even if
+// the user has since switched away.
+type ChannelSearchScope struct {
+	ChannelID string
+	Name      string
+	Type      string // channel, private, dm, group_dm, app
+	DMUserID  string // populated for dm / app rows
+}
+
+// ChannelSearchFunc runs scoped search.messages — same wire as
+// SearchFunc but with the channel filter applied. Implementations are
+// expected to translate `scope` into the appropriate Slack search
+// query syntax (`in:#name`, `with:<@U…>`, …).
+type ChannelSearchFunc func(ctx context.Context, scope ChannelSearchScope, query string, gen uint64) tea.Msg
 
 // ChannelCacheReadFunc is called synchronously when the user selects a
 // channel; it returns cached messages from local storage. Returning a
@@ -772,6 +804,7 @@ type App struct {
 	statusbar       statusbar.Model
 	channelFinder   channelfinder.Model
 	globalSearch    globalsearch.Model
+	channelSearch   globalsearch.Model
 	workspaceFinder workspacefinder.Model
 	filePicker      filepicker.Model
 	themeSwitcher   themeswitcher.Model
@@ -845,6 +878,14 @@ type App struct {
 	// HandleKey call so the App can detect changes and bump
 	// searchGen.
 	searchLastQuery string
+
+	// channelRemoteSearcher fires search.messages with a channel
+	// filter (in:#… / with:@…) when the Ctrl+F overlay's query
+	// changes. Wired by main.go.
+	channelRemoteSearcher  ChannelSearchFunc
+	channelSearchScope     ChannelSearchScope
+	channelSearchGen       uint64
+	channelSearchLastQuery string
 	// pendingJumpChannelID + pendingJumpTS encode a "scroll the
 	// messagepane to this ts after the channel finishes loading"
 	// request. Set when the user picks a remote message hit from
@@ -1113,6 +1154,7 @@ func NewApp() *App {
 		statusbar:             statusbar.New(),
 		channelFinder:         channelfinder.New(),
 		globalSearch:          globalsearch.New(),
+		channelSearch:         globalsearch.New(),
 		workspaceFinder:       workspacefinder.New(),
 		filePicker:            filepicker.New(),
 		themeSwitcher:         themeswitcher.New(),
@@ -1801,6 +1843,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				chID := msg.ID
 				latestTS := cached[len(cached)-1].TS
 				cmds = append(cmds, func() tea.Msg { return marker(chID, latestTS) })
+			}
+			// Tier 1 does not fire MessagesLoadedMsg, so consume any
+			// pending jump (e.g., from a global / channel search hit)
+			// right here. Without this the hit silently fails to
+			// focus when the target channel's cache is fresh.
+			if a.pendingJumpChannelID == msg.ID && a.pendingJumpTS != "" {
+				a.messagepane.SelectByTS(a.pendingJumpTS)
+				a.pendingJumpChannelID = ""
+				a.pendingJumpTS = ""
 			}
 			debuglog.Cache("ChannelSelectedMsg: channel=%s tier=1_fresh", msg.ID)
 
@@ -2993,6 +3044,45 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.globalSearch.SetMessageResults(msg.Query, msg.Messages)
 		a.globalSearch.SetFileResults(msg.Query, msg.Files)
 
+	case ChannelSearchDebounceMsg:
+		if msg.Gen != a.channelSearchGen {
+			break
+		}
+		if !a.channelSearch.IsVisible() {
+			break
+		}
+		q := a.channelSearch.Query()
+		if strings.TrimSpace(q) == "" {
+			break
+		}
+		if a.channelRemoteSearcher == nil {
+			break
+		}
+		gen := a.channelSearchGen
+		scope := a.channelSearchScope
+		searcher := a.channelRemoteSearcher
+		cmds = append(cmds, func() tea.Msg {
+			return searcher(context.Background(), scope, q, gen)
+		})
+
+	case ChannelSearchResultsMsg:
+		if msg.Gen != a.channelSearchGen {
+			break
+		}
+		if !a.channelSearch.IsVisible() {
+			break
+		}
+		if msg.Query != a.channelSearch.Query() {
+			break
+		}
+		if msg.Err != nil {
+			cmds = append(cmds, func() tea.Msg {
+				return ToastMsg{Text: "Channel search failed: " + msg.Err.Error()}
+			})
+			break
+		}
+		a.channelSearch.SetMessageResults(msg.Query, msg.Messages)
+
 	case TypingExpiredMsg:
 		a.expireTypingUsers()
 		// Continue ticking if there are still active typers
@@ -3085,6 +3175,8 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return a.handleChannelFinderMode(msg)
 	case ModeSearch:
 		return a.handleGlobalSearchMode(msg)
+	case ModeChannelSearch:
+		return a.handleChannelSearchMode(msg)
 	case ModeReactionPicker:
 		return a.handleReactionPickerMode(msg)
 	case ModeConfirm:
@@ -3459,6 +3551,14 @@ func (a *App) handleNormalMode(msg tea.KeyMsg) tea.Cmd {
 	case a.matchesKey(msg, a.keys.SearchMode):
 		a.globalSearch.Open()
 		a.SetMode(ModeSearch)
+
+	case a.matchesKey(msg, a.keys.ChannelSearch):
+		if scope, ok := a.activeChannelSearchScope(); ok {
+			a.channelSearchScope = scope
+			a.channelSearch.Open()
+			a.channelSearchLastQuery = ""
+			a.SetMode(ModeChannelSearch)
+		}
 
 	case a.matchesKey(msg, a.keys.Reaction):
 		if a.focusedPanel == PanelMessages {
@@ -3949,6 +4049,116 @@ func (a *App) handleGlobalSearchMode(msg tea.KeyMsg) tea.Cmd {
 		gen := a.searchGen
 		return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
 			return SearchDebounceMsg{Gen: gen}
+		})
+	}
+	return nil
+}
+
+// activeChannelSearchScope returns the scope for a Ctrl+F search rooted
+// at the currently active channel/DM. Returns ok=false when there is
+// no active channel, when the sidebar has not seen it yet, when the
+// channel type is one the scoped-search closure can't filter for
+// (group_dm — Slack's `with:` filter doesn't take a multi-user list),
+// or when the necessary metadata to build a server-side filter is
+// missing (e.g., a DM row without DMUserID). Refusing here is
+// deliberate: silently falling back to an unscoped search would lie
+// to the user about what overlay they're looking at.
+func (a *App) activeChannelSearchScope() (ChannelSearchScope, bool) {
+	if a.activeChannelID == "" {
+		return ChannelSearchScope{}, false
+	}
+	for _, it := range a.sidebar.Items() {
+		if it.ID != a.activeChannelID {
+			continue
+		}
+		switch it.Type {
+		case "channel", "private":
+			if it.Name == "" {
+				return ChannelSearchScope{}, false
+			}
+		case "dm", "app":
+			if it.DMUserID == "" {
+				return ChannelSearchScope{}, false
+			}
+		default:
+			return ChannelSearchScope{}, false
+		}
+		return ChannelSearchScope{
+			ChannelID: it.ID,
+			Name:      it.Name,
+			Type:      it.Type,
+			DMUserID:  it.DMUserID,
+		}, true
+	}
+	return ChannelSearchScope{}, false
+}
+
+// handleChannelSearchMode is the Ctrl+F dispatcher. Mirrors
+// handleGlobalSearchMode but only feeds the Messages section and
+// hooks the channel-scoped searcher.
+func (a *App) handleChannelSearchMode(msg tea.KeyMsg) tea.Cmd {
+	keyStr := msg.String()
+	switch msg.Key().Code {
+	case tea.KeyEnter:
+		keyStr = "enter"
+	case tea.KeyEscape:
+		keyStr = "esc"
+	case tea.KeyUp:
+		keyStr = "up"
+	case tea.KeyDown:
+		keyStr = "down"
+	case tea.KeyBackspace:
+		keyStr = "backspace"
+	}
+
+	result := a.channelSearch.HandleKey(keyStr)
+	if result != nil {
+		a.channelSearch.Close()
+		a.SetMode(ModeNormal)
+		if result.Type == "message" && result.ChannelID != "" {
+			// Fast path: when the hit is in the channel the user is
+			// already looking at, try to focus it directly. The
+			// pending-jump pipeline below requires a downstream
+			// MessagesLoadedMsg, which the tier-1 cache-fresh path
+			// of ChannelSelectedMsg doesn't emit — that would silently
+			// swallow the jump. SelectByTS returns false when the ts
+			// is not in the rendered slice; in that case we fall
+			// through to the pending-jump path.
+			if result.ChannelID == a.activeChannelID && a.messagepane.SelectByTS(result.MessageTS) {
+				return nil
+			}
+			// Reuse PR3's pending-jump pipeline. If the user is
+			// already on this channel (the common case), the
+			// stash + MessagesLoadedMsg consume path falls
+			// through immediately via the existing handler.
+			a.pendingJumpChannelID = result.ChannelID
+			a.pendingJumpTS = result.MessageTS
+			a.sidebar.SelectByID(result.ChannelID)
+			channelName := result.ChannelName
+			if channelName == "" {
+				channelName = a.channelSearchScope.Name
+			}
+			return func() tea.Msg {
+				return ChannelSelectedMsg{ID: result.ChannelID, Name: channelName, Type: "channel"}
+			}
+		}
+		return nil
+	}
+
+	if !a.channelSearch.IsVisible() {
+		a.SetMode(ModeNormal)
+		return nil
+	}
+
+	if q := a.channelSearch.Query(); q != a.channelSearchLastQuery {
+		a.channelSearchLastQuery = q
+		a.channelSearchGen++
+		if a.channelRemoteSearcher == nil || strings.TrimSpace(q) == "" {
+			return nil
+		}
+		gen := a.channelSearchGen
+		return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
+			return ChannelSearchDebounceMsg{Gen: gen}
 		})
 	}
 	return nil
@@ -5394,6 +5604,13 @@ func (a *App) SetRemoteSearcher(fn SearchFunc) {
 	a.remoteSearcher = fn
 }
 
+// SetChannelRemoteSearcher wires the closure that performs scoped
+// search.messages for the Ctrl+F channel-search overlay. Called from
+// cmd/slk/main.go.
+func (a *App) SetChannelRemoteSearcher(fn ChannelSearchFunc) {
+	a.channelRemoteSearcher = fn
+}
+
 // globalSearchItemsFromFinder converts the channelfinder Item list into
 // the globalsearch Item shape so the App can keep a single source of
 // truth (the workspace's joined channels + DMs) and feed both overlays.
@@ -6580,6 +6797,10 @@ func (a *App) View() tea.View {
 		screen = a.globalSearch.ViewOverlay(a.width, a.height, screen)
 	}
 
+	if a.channelSearch.IsVisible() {
+		screen = a.channelSearch.ViewOverlay(a.width, a.height, screen)
+	}
+
 	if a.reactionPicker.IsVisible() {
 		screen = a.reactionPicker.ViewOverlay(a.width, a.height, screen)
 	}
@@ -6627,6 +6848,7 @@ func (a *App) View() tea.View {
 	finalScreen := screen
 	overlayActive := a.channelFinder.IsVisible() ||
 		a.globalSearch.IsVisible() ||
+		a.channelSearch.IsVisible() ||
 		a.reactionPicker.IsVisible() ||
 		a.confirmPrompt.IsVisible() ||
 		a.workspaceFinder.IsVisible() ||

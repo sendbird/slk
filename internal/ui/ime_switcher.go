@@ -47,6 +47,7 @@ type inputSourceSwitcher struct {
 
 	mu                   sync.Mutex
 	previousInsertSource string
+	previousFinderSource string
 	disabled             bool
 }
 
@@ -113,6 +114,22 @@ func (s *inputSourceSwitcher) OnModeChange(prev, next Mode) {
 	}
 	if prev != ModeInsert && next == ModeInsert {
 		s.dispatch(s.restoreForInsert)
+		return
+	}
+	// Channel finder (Ctrl+T) only matches single-byte ASCII keys, so
+	// Korean / CJK queries are silently dropped. Force the input source
+	// to the configured English layout on entry and restore the prior
+	// source on exit. Stored separately from previousInsertSource so
+	// the two restore paths don't clobber each other (a stash from
+	// Insert→Normal is not the same as a stash from
+	// Normal→ChannelFinder).
+	if prev != ModeChannelFinder && next == ModeChannelFinder {
+		s.dispatch(s.enterChannelFinder)
+		return
+	}
+	if prev == ModeChannelFinder && next != ModeChannelFinder {
+		s.dispatch(s.leaveChannelFinder)
+		return
 	}
 }
 
@@ -164,6 +181,39 @@ func (s *inputSourceSwitcher) restoreForInsert() {
 	}
 	if err := s.selectSource(s.previousInsertSource); err != nil {
 		log.Printf("ime switcher: restore %q: %v", s.previousInsertSource, err)
+	}
+}
+
+func (s *inputSourceSwitcher) enterChannelFinder() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.disabled {
+		return
+	}
+	// Always stash so leaveChannelFinder can put it back even when
+	// restoreInsert is disabled — the user-facing promise here is
+	// "force English for the duration of the overlay", and the
+	// restore is independent from the Insert-mode restore policy.
+	if current, err := s.current(); err != nil {
+		log.Printf("ime switcher: current input source: %v", err)
+	} else if current != "" {
+		s.previousFinderSource = current
+	}
+	if err := s.selectSource(s.normalInputSource); err != nil {
+		log.Printf("ime switcher: switch to %q: %v", s.normalInputSource, err)
+	}
+}
+
+func (s *inputSourceSwitcher) leaveChannelFinder() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.disabled || s.previousFinderSource == "" {
+		return
+	}
+	target := s.previousFinderSource
+	s.previousFinderSource = ""
+	if err := s.selectSource(target); err != nil {
+		log.Printf("ime switcher: restore %q: %v", target, err)
 	}
 }
 

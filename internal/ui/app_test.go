@@ -5042,3 +5042,189 @@ func TestGlobalSearch_MessagesLoadedConsumesPendingJump(t *testing.T) {
 		t.Fatalf("pending jump must be cleared after consume: %q/%q", app.pendingJumpChannelID, app.pendingJumpTS)
 	}
 }
+
+func TestChannelSearch_CtrlFRequiresActiveChannel(t *testing.T) {
+	app := NewApp()
+	if app.mode != ModeNormal {
+		app.SetMode(ModeNormal)
+	}
+	// activeChannelID is empty in a fresh App — Ctrl+F must no-op.
+	_ = app.handleKey(tea.KeyPressMsg{Code: 'f', Mod: tea.ModCtrl})
+	if app.channelSearch.IsVisible() {
+		t.Fatalf("Ctrl+F must not open the overlay without an active channel")
+	}
+	if app.mode != ModeNormal {
+		t.Fatalf("Ctrl+F must keep mode=Normal without an active channel, got %v", app.mode)
+	}
+}
+
+func TestChannelSearch_OpenCapturesScope(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	app.activeChannelID = "C42"
+	app.SetChannels([]sidebar.ChannelItem{
+		{ID: "C42", Name: "eng-deploy", Type: "channel"},
+	})
+
+	_ = app.handleKey(tea.KeyPressMsg{Code: 'f', Mod: tea.ModCtrl})
+	if !app.channelSearch.IsVisible() {
+		t.Fatalf("Ctrl+F must open the channel-search overlay")
+	}
+	if app.mode != ModeChannelSearch {
+		t.Fatalf("mode must be ModeChannelSearch, got %v", app.mode)
+	}
+	if got := app.channelSearchScope; got.ChannelID != "C42" || got.Name != "eng-deploy" || got.Type != "channel" {
+		t.Fatalf("scope captured: got %+v", got)
+	}
+}
+
+func TestChannelSearch_SkipsGroupDM(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	app.activeChannelID = "G1"
+	app.SetChannels([]sidebar.ChannelItem{
+		{ID: "G1", Name: "alice,bob,charlie", Type: "group_dm"},
+	})
+	_ = app.handleKey(tea.KeyPressMsg{Code: 'f', Mod: tea.ModCtrl})
+	if app.channelSearch.IsVisible() {
+		t.Fatalf("Ctrl+F must not open on group_dm")
+	}
+}
+
+func TestChannelSearch_ResultsArrivePopulateMessageSection(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	app.activeChannelID = "C42"
+	app.SetChannels([]sidebar.ChannelItem{
+		{ID: "C42", Name: "eng-deploy", Type: "channel"},
+	})
+	_ = app.handleKey(tea.KeyPressMsg{Code: 'f', Mod: tea.ModCtrl})
+	app.handleChannelSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+
+	_, _ = app.Update(ChannelSearchResultsMsg{
+		Gen:   app.channelSearchGen,
+		Query: app.channelSearch.Query(),
+		Messages: []globalsearch.Item{
+			{ID: "9.99", Name: "jinku — deploy", ChannelID: "C42", ChannelName: "eng-deploy", MessageTS: "9.99"},
+		},
+	})
+	if got := app.channelSearch.SectionLen(globalsearch.CategoryMessage); got != 1 {
+		t.Fatalf("expected 1 channel-scoped hit, got %d", got)
+	}
+}
+
+func TestChannelSearch_StaleDebounceDropped(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	app.activeChannelID = "C42"
+	app.SetChannels([]sidebar.ChannelItem{{ID: "C42", Name: "eng-deploy", Type: "channel"}})
+	called := 0
+	app.SetChannelRemoteSearcher(func(ctx context.Context, scope ChannelSearchScope, q string, gen uint64) tea.Msg {
+		called++
+		return ChannelSearchResultsMsg{Gen: gen, Query: q}
+	})
+
+	_ = app.handleKey(tea.KeyPressMsg{Code: 'f', Mod: tea.ModCtrl})
+	app.handleChannelSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	staleGen := app.channelSearchGen
+	app.handleChannelSearchMode(tea.KeyPressMsg{Code: 'e', Text: "e"})
+
+	_, _ = app.Update(ChannelSearchDebounceMsg{Gen: staleGen})
+	if called != 0 {
+		t.Fatalf("stale debounce tick must not invoke the channel searcher (called=%d)", called)
+	}
+}
+
+func TestChannelSearch_EnterOnHitSchedulesPendingJump(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	app.activeChannelID = "C42"
+	app.SetChannels([]sidebar.ChannelItem{{ID: "C42", Name: "eng-deploy", Type: "channel"}})
+
+	_ = app.handleKey(tea.KeyPressMsg{Code: 'f', Mod: tea.ModCtrl})
+	app.handleChannelSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	_, _ = app.Update(ChannelSearchResultsMsg{
+		Gen:   app.channelSearchGen,
+		Query: app.channelSearch.Query(),
+		Messages: []globalsearch.Item{
+			{ID: "9.99", Name: "jinku — deploy", ChannelID: "C42", ChannelName: "eng-deploy", MessageTS: "9.99"},
+		},
+	})
+	if got := app.channelSearch.SectionLen(globalsearch.CategoryMessage); got != 1 {
+		t.Fatalf("setup precondition: got %d", got)
+	}
+
+	cmd := app.handleChannelSearchMode(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("enter on channel-search hit must return a ChannelSelected cmd")
+	}
+	if app.pendingJumpChannelID != "C42" || app.pendingJumpTS != "9.99" {
+		t.Fatalf("pending jump must be set: channel=%q ts=%q", app.pendingJumpChannelID, app.pendingJumpTS)
+	}
+}
+
+func TestChannelSearch_SkipsDMWithoutDMUserID(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	app.activeChannelID = "D1"
+	app.SetChannels([]sidebar.ChannelItem{
+		// Missing DMUserID: scope is unbuildable, so Ctrl+F must
+		// no-op rather than silently fall through to an unscoped
+		// search.
+		{ID: "D1", Name: "alice", Type: "dm"},
+	})
+	_ = app.handleKey(tea.KeyPressMsg{Code: 'f', Mod: tea.ModCtrl})
+	if app.channelSearch.IsVisible() {
+		t.Fatalf("Ctrl+F must not open on a DM row with no DMUserID")
+	}
+}
+
+func TestChannelSearch_SkipsChannelWithoutName(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	app.activeChannelID = "C1"
+	app.SetChannels([]sidebar.ChannelItem{
+		{ID: "C1", Name: "", Type: "channel"},
+	})
+	_ = app.handleKey(tea.KeyPressMsg{Code: 'f', Mod: tea.ModCtrl})
+	if app.channelSearch.IsVisible() {
+		t.Fatalf("Ctrl+F must not open when the active channel row has no name")
+	}
+}
+
+func TestChannelSearch_HitOnActiveChannelSelectsImmediately(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	app.activeChannelID = "C42"
+	app.SetChannels([]sidebar.ChannelItem{{ID: "C42", Name: "eng-deploy", Type: "channel"}})
+	app.messagepane.SetMessages([]messages.MessageItem{
+		{TS: "1.0", UserID: "U1", Text: "first"},
+		{TS: "2.0", UserID: "U2", Text: "target"},
+		{TS: "3.0", UserID: "U3", Text: "third"},
+	})
+
+	_ = app.handleKey(tea.KeyPressMsg{Code: 'f', Mod: tea.ModCtrl})
+	app.handleChannelSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	_, _ = app.Update(ChannelSearchResultsMsg{
+		Gen:   app.channelSearchGen,
+		Query: app.channelSearch.Query(),
+		Messages: []globalsearch.Item{
+			{ID: "2.0", Name: "u2 — target", ChannelID: "C42", ChannelName: "eng-deploy", MessageTS: "2.0"},
+		},
+	})
+
+	cmd := app.handleChannelSearchMode(tea.KeyPressMsg{Code: tea.KeyEnter})
+	// When the hit is already on the active channel, the handler
+	// short-circuits via SelectByTS — no ChannelSelectedMsg needed,
+	// no pending jump should remain (otherwise tier-1 cache renders
+	// in unrelated future switches could replay this jump).
+	if cmd != nil {
+		t.Fatalf("hit on active channel must not dispatch a ChannelSelectedMsg, got %T", cmd())
+	}
+	if app.pendingJumpChannelID != "" || app.pendingJumpTS != "" {
+		t.Fatalf("pending jump must be empty after immediate select, got %q/%q", app.pendingJumpChannelID, app.pendingJumpTS)
+	}
+	if got := app.messagepane.SelectedIndex(); got != 1 {
+		t.Fatalf("messagepane must focus the target row immediately, got selected=%d", got)
+	}
+}

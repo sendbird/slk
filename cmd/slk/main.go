@@ -1056,6 +1056,37 @@ func run() error {
 			return result
 		})
 
+		app.SetChannelRemoteSearcher(func(ctx context.Context, scope ui.ChannelSearchScope, query string, gen uint64) tea.Msg {
+			wctx := router.Active()
+			if wctx == nil {
+				return ui.ChannelSearchResultsMsg{Gen: gen, Query: query, Err: fmt.Errorf("no active workspace")}
+			}
+			client := wctx.Client
+			ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			defer cancel()
+
+			prefix := channelSearchPrefix(scope)
+			if prefix == "" {
+				// activeChannelSearchScope is the gatekeeper: if it
+				// hands us a scope we can't translate into a Slack
+				// filter, the call here is a programmer error rather
+				// than user input. Fail closed instead of running an
+				// unscoped search and pretending the result is
+				// channel-restricted.
+				return ui.ChannelSearchResultsMsg{Gen: gen, Query: query, Err: fmt.Errorf("channel search not supported for this conversation")}
+			}
+			wire := prefix + " " + query
+			msgs, err := client.SearchMessages(ctx, wire, 10)
+			if err != nil {
+				return ui.ChannelSearchResultsMsg{Gen: gen, Query: query, Err: err}
+			}
+			return ui.ChannelSearchResultsMsg{
+				Gen:      gen,
+				Query:    query,
+				Messages: messageHitsToItems(msgs, wctx.UserNames),
+			}
+		})
+
 		app.SetSlashCommandRunner(func(channelID, text string) tea.Msg {
 			wctx := router.Active()
 			if wctx == nil {

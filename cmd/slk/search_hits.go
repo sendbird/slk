@@ -5,8 +5,34 @@ import (
 	"strings"
 
 	slackclient "github.com/gammons/slk/internal/slack"
+	"github.com/gammons/slk/internal/ui"
 	"github.com/gammons/slk/internal/ui/globalsearch"
 )
+
+// channelSearchPrefix turns a Ctrl+F scope into the Slack search
+// query prefix that restricts results to the active channel or DM.
+//
+// Mappings:
+//   - channel / private  → "in:#<name>"
+//   - dm / app           → "with:<@U…>" when DMUserID is set; otherwise empty
+//   - group_dm           → empty (the App's open path already filters this out)
+//
+// Returns an empty string if no prefix can be derived, in which case
+// the caller should run an unscoped search rather than block on a
+// scope mismatch.
+func channelSearchPrefix(scope ui.ChannelSearchScope) string {
+	switch scope.Type {
+	case "channel", "private":
+		if scope.Name != "" {
+			return "in:#" + scope.Name
+		}
+	case "dm", "app":
+		if scope.DMUserID != "" {
+			return "with:<@" + scope.DMUserID + ">"
+		}
+	}
+	return ""
+}
 
 // messageHitsToItems converts the slack client's normalized message
 // search hits into globalsearch Items. `userNames` is the workspace's
