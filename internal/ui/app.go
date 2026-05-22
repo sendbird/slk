@@ -3439,17 +3439,6 @@ func (a *App) handleNormalMode(msg tea.KeyMsg) tea.Cmd {
 	case a.matchesKey(msg, a.keys.Enter):
 		return a.handleEnter()
 
-	case a.matchesKey(msg, a.keys.ToggleSection):
-		// Space on a sidebar section header toggles its collapsed
-		// state; elsewhere it falls through to whatever the focused
-		// panel does with a literal space (typically nothing in
-		// normal mode).
-		if a.focusedPanel == PanelSidebar {
-			if a.sidebar.ToggleCollapseSelected() {
-				return nil
-			}
-		}
-
 	case a.matchesKey(msg, a.keys.Bottom):
 		if cmd := a.handleGoToBottom(); cmd != nil {
 			return cmd
@@ -4684,18 +4673,12 @@ func (a *App) handleEnter() tea.Cmd {
 		// place. Section headers are also navigable via j/k so the
 		// user can expand/collapse the firehose Channels section
 		// (collapsed by default) without leaving the keyboard.
-		//
-		// IMPORTANT: scope the toggle to header rows only via
-		// IsSectionHeaderSelected. ToggleCollapseSelected was widened
-		// (for the spacebar affordance) to also collapse from inside a
-		// section when invoked from a channel row, but Enter on a
-		// channel row must keep its "open this channel" meaning — the
-		// user navigates with j/k and hits Enter to enter the channel,
-		// not to hide its section.
-		if _, ok := a.sidebar.IsSectionHeaderSelected(); ok {
-			if a.sidebar.ToggleCollapseSelected() {
-				return nil
-			}
+		// ToggleCollapseSelected is scoped to header rows only, so
+		// channel rows fall straight through to the SelectedItem
+		// dispatch below — Enter on a channel row opens the channel,
+		// not collapses its section.
+		if a.sidebar.ToggleCollapseSelected() {
+			return nil
 		}
 		item, ok := a.sidebar.SelectedItem()
 		if ok {

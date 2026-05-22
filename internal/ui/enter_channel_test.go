@@ -76,3 +76,39 @@ func TestEnterOnSectionHeader_TogglesSection(t *testing.T) {
 		t.Errorf("Enter on Channels header should toggle collapse state")
 	}
 }
+
+// Enter on a DM row must open the DM exactly the same way as a
+// channel row — the user's expectation is "Enter on whatever row I'm
+// standing on opens it" regardless of conversation type.
+func TestEnterOnDMRow_OpensDM(t *testing.T) {
+	app := NewApp()
+	app.SetChannels([]sidebar.ChannelItem{
+		{ID: "D1", Name: "alice", Type: "dm"},
+	})
+	// DMs section starts expanded. Nav: Threads → Activity → Direct
+	// Messages header → D1.
+	app.sidebar.MoveDown() // Activity
+	app.sidebar.MoveDown() // Direct Messages header
+	app.sidebar.MoveDown() // D1
+	if got := app.sidebar.SelectedID(); got != "D1" {
+		t.Fatalf("setup: cursor should be on D1, got %q", got)
+	}
+
+	app.focusedPanel = PanelSidebar
+	app.SetMode(ModeNormal)
+
+	cmd := app.handleNormalMode(tea.KeyPressMsg{Code: tea.KeyEnter})
+	selected, ok := queuedChannelSelectedMsg(cmd)
+	if !ok {
+		t.Fatalf("expected Enter on D1 to queue ChannelSelectedMsg")
+	}
+	if selected.ID != "D1" {
+		t.Errorf("queued ChannelSelectedMsg.ID = %q, want D1", selected.ID)
+	}
+	if selected.Type != "dm" {
+		t.Errorf("queued ChannelSelectedMsg.Type = %q, want dm", selected.Type)
+	}
+	if app.sidebar.IsCollapsed("Direct Messages") {
+		t.Errorf("Enter on a DM row must NOT collapse the Direct Messages section")
+	}
+}
