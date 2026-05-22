@@ -439,6 +439,17 @@ type dragState struct {
 // terminates when the cursor leaves the edge or the drag ends.
 type autoScrollTickMsg struct{}
 
+// mouseWheelFlushMsg coalesces bursts of terminal wheel events into bounded
+// UI updates. Some terminals can deliver hundreds of wheel messages before
+// Bubble Tea gets a chance to render; applying each one immediately starves
+// the update/render loop and makes the TUI appear frozen.
+type mouseWheelFlushMsg struct{}
+
+const (
+	mouseWheelFlushDelay  = 16 * time.Millisecond
+	maxMouseWheelPerFrame = 12
+)
+
 // threadFetchDebounceMsg is delivered after the user's threadsview selection
 // stops moving for openThreadDebounceDelay. Carries the (channelID, threadTS,
 // generation) the user had selected at scheduling time; if the App's current
@@ -781,6 +792,13 @@ type App struct {
 	layoutMsgHeight     int
 	layoutSidebarHeight int
 	layoutThreadHeight  int
+
+	// Coalesced mouse-wheel state. pendingWheelDelta is negative for upward
+	// notches and positive for downward notches against pendingWheelPanel.
+	pendingWheelActive bool
+	pendingWheelPanel  Panel
+	pendingWheelView   View
+	pendingWheelDelta  int
 
 	// Per-panel render caches. Each panel exposes Version() that increments
 	// on any state change that could alter its View() output. The App caches
@@ -1275,72 +1293,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.loading {
 			break
 		}
-		// Wheel notches move the selection like j/k rather than scrolling the
-		// viewport directly. Targets the panel under the cursor regardless of
-		// which panel currently has keyboard focus.
-		up := false
-		switch msg.Button {
-		case tea.MouseWheelUp:
-			up = true
-		case tea.MouseWheelDown:
-			up = false
-		default:
-			break
+		if cmd := a.queueMouseWheel(msg); cmd != nil {
+			cmds = append(cmds, cmd)
 		}
-		x := msg.X
-		switch {
-		case x < a.layoutRailWidth:
-			// Workspace rail: no selection navigation here.
-		case a.sidebarVisible && x < a.layoutSidebarEnd:
-			if up {
-				a.sidebar.MoveUp()
-			} else {
-				a.sidebar.MoveDown()
-			}
-		case x < a.layoutMsgEnd:
-			if a.view == ViewThreads {
-				if up {
-					a.threadsView.MoveUp()
-				} else {
-					a.threadsView.MoveDown()
-				}
-				cmds = append(cmds, a.openSelectedThreadCmd(true))
-			} else if a.view == ViewActivity {
-				if up {
-					a.activityView.MoveUp()
-				} else {
-					a.activityView.MoveDown()
-				}
-			} else {
-				if up {
-					a.messagepane.MoveUp()
-					// Mirror j/k: when selection hits the top, backfill older history.
-					if a.messagepane.AtTop() && !a.fetchingOlder && a.olderMessagesFetcher != nil {
-						a.fetchingOlder = true
-						a.messagepane.SetLoading(true)
-						chID := a.activeChannelID
-						oldestTS := a.messagepane.OldestTS()
-						fetcher := a.olderMessagesFetcher
-						// Kick the spinner tick: if a.loading is already
-						// false (workspace fully loaded), no tick is alive
-						// and the glyph would freeze on its last frame.
-						cmds = append(cmds, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
-							return SpinnerTickMsg{}
-						}))
-						cmds = append(cmds, func() tea.Msg {
-							return fetcher(chID, oldestTS)
-						})
-					}
-				} else {
-					a.messagepane.MoveDown()
-				}
-			}
-		case a.threadVisible && x < a.layoutThreadEnd:
-			if up {
-				a.threadPanel.MoveUp()
-			} else {
-				a.threadPanel.MoveDown()
-			}
+
+	case mouseWheelFlushMsg:
+		if cmd := a.flushMouseWheel(); cmd != nil {
+			cmds = append(cmds, cmd)
 		}
 
 	case tea.MouseClickMsg:
@@ -4523,6 +4482,147 @@ func (a *App) handleGoToBottom() tea.Cmd {
 		a.threadPanel.GoToBottom()
 	}
 	return nil
+}
+
+// queueMouseWheel records a wheel notch and schedules one bounded flush for the
+// current burst. It intentionally does not mutate panel models immediately:
+// terminals can emit wheel messages much faster than the TUI can render, and
+// rendering after every notch starves the event loop.
+func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
+	delta := 0
+	switch msg.Button {
+	case tea.MouseWheelUp:
+		delta = -1
+	case tea.MouseWheelDown:
+		delta = 1
+	default:
+		return nil
+	}
+
+	panel, ok := a.wheelTargetPanel(msg.X)
+	if !ok {
+		return nil
+	}
+
+	wasActive := a.pendingWheelActive
+	if a.pendingWheelActive && (a.pendingWheelPanel != panel || a.pendingWheelView != a.view) {
+		// If the cursor jumps to another pane mid-burst, drop the stale
+		// accumulator rather than replaying old notches into the new target.
+		a.pendingWheelDelta = 0
+	}
+
+	a.pendingWheelActive = true
+	a.pendingWheelPanel = panel
+	a.pendingWheelView = a.view
+	a.pendingWheelDelta += delta
+	if a.pendingWheelDelta == 0 || wasActive {
+		return nil
+	}
+	return tea.Tick(mouseWheelFlushDelay, func(time.Time) tea.Msg { return mouseWheelFlushMsg{} })
+}
+
+func (a *App) wheelTargetPanel(x int) (Panel, bool) {
+	switch {
+	case x < a.layoutRailWidth:
+		return PanelWorkspace, false
+	case a.sidebarVisible && x < a.layoutSidebarEnd:
+		return PanelSidebar, true
+	case x < a.layoutMsgEnd:
+		return PanelMessages, true
+	case a.threadVisible && x < a.layoutThreadEnd:
+		return PanelThread, true
+	default:
+		return PanelWorkspace, false
+	}
+}
+
+func (a *App) flushMouseWheel() tea.Cmd {
+	if !a.pendingWheelActive || a.pendingWheelDelta == 0 {
+		a.pendingWheelActive = false
+		return nil
+	}
+
+	delta := a.pendingWheelDelta
+	steps := delta
+	if steps < 0 {
+		steps = -steps
+	}
+	if steps > maxMouseWheelPerFrame {
+		steps = maxMouseWheelPerFrame
+	}
+	up := delta < 0
+	var cmds []tea.Cmd
+
+	switch a.pendingWheelPanel {
+	case PanelSidebar:
+		for i := 0; i < steps; i++ {
+			if up {
+				a.sidebar.MoveUp()
+			} else {
+				a.sidebar.MoveDown()
+			}
+		}
+	case PanelMessages:
+		switch a.pendingWheelView {
+		case ViewThreads:
+			for i := 0; i < steps; i++ {
+				if up {
+					a.threadsView.MoveUp()
+				} else {
+					a.threadsView.MoveDown()
+				}
+			}
+			cmds = append(cmds, a.openSelectedThreadCmd(true))
+		case ViewActivity:
+			for i := 0; i < steps; i++ {
+				if up {
+					a.activityView.MoveUp()
+				} else {
+					a.activityView.MoveDown()
+				}
+			}
+		default:
+			for i := 0; i < steps; i++ {
+				if up {
+					a.messagepane.MoveUp()
+				} else {
+					a.messagepane.MoveDown()
+				}
+			}
+			if up && a.messagepane.AtTop() && !a.fetchingOlder && a.olderMessagesFetcher != nil {
+				a.fetchingOlder = true
+				a.messagepane.SetLoading(true)
+				chID := a.activeChannelID
+				oldestTS := a.messagepane.OldestTS()
+				fetcher := a.olderMessagesFetcher
+				cmds = append(cmds, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+					return SpinnerTickMsg{}
+				}))
+				cmds = append(cmds, func() tea.Msg { return fetcher(chID, oldestTS) })
+			}
+		}
+	case PanelThread:
+		for i := 0; i < steps; i++ {
+			if up {
+				a.threadPanel.MoveUp()
+			} else {
+				a.threadPanel.MoveDown()
+			}
+		}
+	}
+
+	if delta < 0 {
+		a.pendingWheelDelta += steps
+	} else {
+		a.pendingWheelDelta -= steps
+	}
+	if a.pendingWheelDelta != 0 {
+		cmds = append(cmds, tea.Tick(mouseWheelFlushDelay, func(time.Time) tea.Msg { return mouseWheelFlushMsg{} }))
+	} else {
+		a.pendingWheelActive = false
+	}
+
+	return tea.Batch(cmds...)
 }
 
 // pageSize returns the number of lines to scroll for a full-page jump in the

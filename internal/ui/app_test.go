@@ -5133,3 +5133,51 @@ func TestChannelSelectedReturnsPromptlyEvenIfFetcherBlocks(t *testing.T) {
 		t.Fatal("Update did not return within 100ms; fetcher is being called synchronously on the Update goroutine — risks bubbletea Send-from-Update deadlock")
 	}
 }
+
+func TestApp_MouseWheelBurstIsCoalesced(t *testing.T) {
+	a := NewApp()
+	a.width = 160
+	a.height = 30
+	items := make([]messages.MessageItem, 30)
+	for i := range items {
+		items[i] = messages.MessageItem{
+			TS:        fmt.Sprintf("%d.0", i+1),
+			UserName:  "u",
+			UserID:    "U1",
+			Text:      fmt.Sprintf("message %d", i+1),
+			Timestamp: "12:00 PM",
+		}
+	}
+	a.messagepane.SetMessages(items)
+	_ = a.View() // populate mouse hit-test layout
+
+	x := a.layoutSidebarEnd + 5
+	firstCmds := 0
+	for i := 0; i < 100; i++ {
+		_, cmd := a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelUp})
+		if cmd != nil {
+			firstCmds++
+		}
+	}
+	if firstCmds != 1 {
+		t.Fatalf("wheel burst scheduled %d flush commands, want 1", firstCmds)
+	}
+	if got := a.messagepane.SelectedIndex(); got != len(items)-1 {
+		t.Fatalf("wheel events should coalesce before mutating selection; got %d want %d", got, len(items)-1)
+	}
+
+	_, cmd := a.Update(mouseWheelFlushMsg{})
+	if got, want := a.messagepane.SelectedIndex(), len(items)-1-maxMouseWheelPerFrame; got != want {
+		t.Fatalf("first flush selected %d, want %d", got, want)
+	}
+	if cmd == nil {
+		t.Fatal("first flush should schedule the next bounded flush for the remaining burst")
+	}
+
+	for a.pendingWheelActive {
+		a.Update(mouseWheelFlushMsg{})
+	}
+	if got := a.messagepane.SelectedIndex(); got != 0 {
+		t.Fatalf("full burst selected %d, want 0", got)
+	}
+}
