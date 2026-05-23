@@ -3,6 +3,12 @@ package globalsearch
 import (
 	"strings"
 	"testing"
+
+	"charm.land/lipgloss/v2"
+
+	"github.com/gammons/slk/internal/config"
+	"github.com/gammons/slk/internal/ui/messages"
+	"github.com/gammons/slk/internal/ui/styles"
 )
 
 func newWithItems(t *testing.T, items []Item) *Model {
@@ -498,5 +504,78 @@ func TestCursorAvailableForKoreanFocusedInput(t *testing.T) {
 
 	if c := m.Cursor(80, 24); c == nil {
 		t.Fatal("focused search overlay must expose a real terminal cursor for IME composition")
+	}
+}
+
+func itoaU8(n uint8) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [3]byte
+	i := len(buf)
+	v := int(n)
+	for v > 0 {
+		i--
+		buf[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return string(buf[i:])
+}
+
+func fmtRGBBg(r, g, b uint8) string {
+	return "48;2;" + itoaU8(r) + ";" + itoaU8(g) + ";" + itoaU8(b)
+}
+
+func inputBgRGB(t *testing.T) (uint8, uint8, uint8) {
+	t.Helper()
+	r, g, b, _ := styles.ComposeInsertBG.RGBA()
+	return uint8(r >> 8), uint8(g >> 8), uint8(b >> 8)
+}
+
+func TestView_RendersComposeStyleInputBackground(t *testing.T) {
+	styles.Apply("dark", config.Theme{})
+	t.Cleanup(func() { styles.Apply("dark", config.Theme{}) })
+
+	mv := New()
+	m := &mv
+	m.Open()
+	m.HandleKey("한")
+	out := m.View(80)
+	r, g, b := inputBgRGB(t)
+	if want := fmtRGBBg(r, g, b); !strings.Contains(out, want) {
+		t.Fatalf("search input must render ComposeInsertBG tint; want %q in output", want)
+	}
+}
+
+func TestView_ReappliesInputAttrsAfterReset(t *testing.T) {
+	styles.Apply("dark", config.Theme{})
+	t.Cleanup(func() { styles.Apply("dark", config.Theme{}) })
+
+	mv := New()
+	m := &mv
+	m.Open()
+	m.HandleKey("한")
+	out := m.View(80)
+
+	inputAttrs := ansiAttrs(inputBackground(), styles.TextPrimary)
+	outerAttrs := messages.BgANSI() + messages.FgANSI()
+	want := "\x1b[m" + outerAttrs + inputAttrs
+	if !strings.Contains(out, want) {
+		t.Fatalf("search input resets must recover outer attrs then input attrs; want %q in output", want)
+	}
+}
+
+func TestRefreshStylesTracksThemeChanges(t *testing.T) {
+	mv := New()
+	m := &mv
+	m.Open()
+
+	old := styles.ComposeInsertBG
+	t.Cleanup(func() { styles.ComposeInsertBG = old })
+	styles.ComposeInsertBG = lipgloss.Color("#123456")
+	m.RefreshStyles()
+	out := m.View(80)
+	if want := fmtRGBBg(0x12, 0x34, 0x56); !strings.Contains(out, want) {
+		t.Fatalf("RefreshStyles must repaint search input with the updated background; want %q", want)
 	}
 }
