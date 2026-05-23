@@ -489,9 +489,12 @@ type autoScrollTickMsg struct{}
 // the update/render loop and makes the TUI appear frozen.
 type mouseWheelFlushMsg struct{}
 
+type mouseWheelResumeMsg struct{ gen uint64 }
+
 const (
-	mouseWheelFlushDelay  = 16 * time.Millisecond
-	maxMouseWheelPerFrame = 12
+	mouseWheelFlushDelay    = 16 * time.Millisecond
+	mouseWheelCooldownDelay = 120 * time.Millisecond
+	maxMouseWheelPerFrame   = 12
 )
 
 // threadFetchDebounceMsg is delivered after the user's threadsview selection
@@ -869,6 +872,8 @@ type App struct {
 	pendingWheelPanel  Panel
 	pendingWheelView   View
 	pendingWheelDelta  int
+	mouseWheelCooldown bool
+	mouseWheelGen      uint64
 
 	// Per-panel render caches. Each panel exposes Version() that increments
 	// on any state change that could alter its View() output. The App caches
@@ -1413,6 +1418,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
+	case mouseWheelResumeMsg:
+		if msg.gen == a.mouseWheelGen {
+			a.mouseWheelCooldown = false
+		}
+
 	case tea.MouseClickMsg:
 		if a.loading {
 			break
@@ -1536,6 +1546,17 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.drag = dragState{panel: PanelMessages, pressX: px, pressY: py, lastX: px, lastY: py}
 				a.messagepane.BeginSelectionAt(py, px)
 				a.messagepane.ClickAt(py)
+				// If the click landed on a message cell that participates
+				// in a thread (parent with replies or a reply itself),
+				// open the corresponding thread in the right panel. Focus
+				// stays on the message pane so a drag-to-copy still
+				// works; users get the thread view from a plain click
+				// without an extra keystroke.
+				if selectedMsg, ok := a.messagepane.SelectedMessage(); ok && messageHasThread(selectedMsg) {
+					if cmd := a.openThreadForMessage(selectedMsg, false); cmd != nil {
+						cmds = append(cmds, cmd)
+					}
+				}
 			}
 		} else if a.threadVisible && x < a.layoutThreadEnd {
 			a.focusedPanel = PanelThread
@@ -4984,20 +5005,49 @@ func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 	a.focusedPanel = panel
 
 	wasActive := a.pendingWheelActive
+	needsCooldown := false
 	if a.pendingWheelActive && (a.pendingWheelPanel != panel || a.pendingWheelView != a.view) {
 		// If the cursor jumps to another pane mid-burst, drop the stale
 		// accumulator rather than replaying old notches into the new target.
 		a.pendingWheelDelta = 0
 	}
 
+	// If the user reverses direction before the previous burst has drained,
+	// discard the stale backlog instead of making the cursor keep chasing old
+	// wheel notches. This is the failure mode users see as "the cursor can't
+	// catch up, then dies" when they scroll hard upward and immediately switch
+	// downward (or vice versa). The newest direction should win.
+	if a.pendingWheelDelta != 0 && (a.pendingWheelDelta < 0) != (delta < 0) {
+		a.pendingWheelDelta = 0
+		needsCooldown = true
+	}
+
 	a.pendingWheelActive = true
 	a.pendingWheelPanel = panel
 	a.pendingWheelView = a.view
 	a.pendingWheelDelta += delta
-	if a.pendingWheelDelta == 0 || wasActive {
+	if a.pendingWheelDelta > maxMouseWheelPerFrame {
+		a.pendingWheelDelta = maxMouseWheelPerFrame
+		needsCooldown = true
+	} else if a.pendingWheelDelta < -maxMouseWheelPerFrame {
+		a.pendingWheelDelta = -maxMouseWheelPerFrame
+		needsCooldown = true
+	}
+	if a.pendingWheelDelta == 0 {
 		return nil
 	}
-	return tea.Tick(mouseWheelFlushDelay, func(time.Time) tea.Msg { return mouseWheelFlushMsg{} })
+
+	var cmds []tea.Cmd
+	if !wasActive {
+		cmds = append(cmds, tea.Tick(mouseWheelFlushDelay, func(time.Time) tea.Msg { return mouseWheelFlushMsg{} }))
+	}
+	if needsCooldown && !a.mouseWheelCooldown {
+		a.mouseWheelCooldown = true
+		a.mouseWheelGen++
+		gen := a.mouseWheelGen
+		cmds = append(cmds, tea.Tick(mouseWheelCooldownDelay, func(time.Time) tea.Msg { return mouseWheelResumeMsg{gen: gen} }))
+	}
+	return tea.Batch(cmds...)
 }
 
 func (a *App) wheelTargetPanel(x int) (Panel, bool) {
@@ -5325,41 +5375,62 @@ func (a *App) handleEnter() tea.Cmd {
 	}
 
 	if a.focusedPanel == PanelMessages {
-		msg, ok := a.messagepane.SelectedMessage()
-		if ok {
-			// Use the message's own TS as the thread parent.
-			// If it's already a thread reply, use its ThreadTS instead.
-			threadTS := msg.TS
-			if msg.ThreadTS != "" && msg.ThreadTS != msg.TS {
-				threadTS = msg.ThreadTS
-			}
-			a.threadVisible = true
-			a.statusbar.SetInThread(true)
-			a.focusedPanel = PanelThread
-			a.threadPanel.SetThread(msg, nil, a.activeChannelID, threadTS)
-			a.threadCompose.SetChannel("thread")
-			a.applyThreadUnreadBoundary(a.activeChannelID)
-
-			if a.threadFetcher != nil {
-				fetcher := a.threadFetcher
-				chID := a.activeChannelID
-				ts := threadTS
-				var batch []tea.Cmd
-				if a.threadCacheReader != nil {
-					if cached := a.threadCacheReader(chID, ts); len(cached) > 1 {
-						replies := cached[1:] // strip parent; reducer expects replies-only
-						batch = append(batch, func() tea.Msg {
-							return ThreadRepliesLoadedMsg{ThreadTS: ts, Replies: replies}
-						})
-					}
-				}
-				batch = append(batch, func() tea.Msg { return fetcher(chID, ts) })
-				return tea.Batch(batch...)
-			}
+		if msg, ok := a.messagepane.SelectedMessage(); ok {
+			return a.openThreadForMessage(msg, true)
 		}
 	}
 
 	return nil
+}
+
+// messageHasThread reports whether the given message item participates
+// in a thread — either as a parent with replies, or as a reply itself
+// whose ThreadTS points at a different parent message.
+func messageHasThread(m messages.MessageItem) bool {
+	if m.ReplyCount > 0 {
+		return true
+	}
+	return m.ThreadTS != "" && m.ThreadTS != m.TS
+}
+
+// openThreadForMessage opens the thread anchored on the given message.
+// For a top-level message it uses TS as the parent; for a reply it uses
+// ThreadTS. Sets up the thread panel state, applies the unread boundary,
+// and returns the cmd that loads cached replies (when available) plus
+// fires the network fetch. When takeFocus is true (Enter on a message)
+// keyboard focus moves to the thread panel; mouse-driven opens pass
+// false so focus stays on the message pane the user clicked from.
+func (a *App) openThreadForMessage(msg messages.MessageItem, takeFocus bool) tea.Cmd {
+	threadTS := msg.TS
+	if msg.ThreadTS != "" && msg.ThreadTS != msg.TS {
+		threadTS = msg.ThreadTS
+	}
+	a.threadVisible = true
+	a.statusbar.SetInThread(true)
+	if takeFocus {
+		a.focusedPanel = PanelThread
+	}
+	a.threadPanel.SetThread(msg, nil, a.activeChannelID, threadTS)
+	a.threadCompose.SetChannel("thread")
+	a.applyThreadUnreadBoundary(a.activeChannelID)
+
+	if a.threadFetcher == nil {
+		return nil
+	}
+	fetcher := a.threadFetcher
+	chID := a.activeChannelID
+	ts := threadTS
+	var batch []tea.Cmd
+	if a.threadCacheReader != nil {
+		if cached := a.threadCacheReader(chID, ts); len(cached) > 1 {
+			replies := cached[1:] // strip parent; reducer expects replies-only
+			batch = append(batch, func() tea.Msg {
+				return ThreadRepliesLoadedMsg{ThreadTS: ts, Replies: replies}
+			})
+		}
+	}
+	batch = append(batch, func() tea.Msg { return fetcher(chID, ts) })
+	return tea.Batch(batch...)
 }
 
 func (a *App) SetMode(mode Mode) {
@@ -7186,14 +7257,11 @@ func (a *App) View() tea.View {
 	}
 	v := tea.NewView(finalScreen)
 	v.AltScreen = true
-	// While a wheel burst is waiting for its coalesced flush, temporarily
-	// disable terminal mouse reporting. Bubble Tea renders after every
-	// Update, even when queueMouseWheel intentionally avoids mutating the
-	// model; without this backpressure, high-resolution trackpads can keep
-	// feeding wheel messages faster than the UI loop can drain them, which
-	// makes the app appear to hang. The flush re-enables mouse mode on the
-	// next render, so normal clicks/drags are only paused for one frame.
-	if a.pendingWheelActive {
+	// Protection for extreme wheel bursts: normal scrolling gets only the short
+	// pending-flush backpressure, while saturated bursts or direction reversals
+	// briefly disable mouse reporting so the terminal stops flooding Bubble Tea's
+	// render-after-every-mouse-message loop.
+	if a.pendingWheelActive || a.mouseWheelCooldown {
 		v.MouseMode = tea.MouseModeNone
 	} else {
 		v.MouseMode = tea.MouseModeCellMotion
