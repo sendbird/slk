@@ -21,7 +21,7 @@
 | `Ctrl+b` | Any | Toggle sidebar |
 | `Ctrl+]` | Any | Toggle thread panel |
 | `Ctrl+t` / `Ctrl+p` | Any | Fuzzy channel finder |
-| `/` / `K` / `Cmd+K` | Normal | Global search — channels, people, and messages across the workspace |
+| `/` / `Cmd+K` | Normal | Global search — channels, people, and messages across the workspace |
 | `Ctrl+F` | Normal | Search messages in the current channel/DM |
 | `n` / `Cmd+N` | Normal | New conversation — picker for channels + workspace users; Enter on a channel switches to it, Enter on a user chips them, empty-query Enter submits chips (1 user → 1:1 DM, 2+ → group DM) |
 | `Ctrl+w` | Any | Workspace picker |

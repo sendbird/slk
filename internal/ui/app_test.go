@@ -137,40 +137,6 @@ func TestHandleNormalMode_BareKDoesNotOpenSearch(t *testing.T) {
 	}
 }
 
-func TestHandleNormalMode_ShiftKOpensGlobalSearch(t *testing.T) {
-	// Uppercase 'K' is an explicit no-modifier shortcut for global
-	// search (in addition to '/' and Cmd+K).
-	cases := []struct {
-		name string
-		msg  tea.KeyPressMsg
-	}{
-		{
-			name: "code uppercase",
-			msg:  tea.KeyPressMsg{Code: 'K', Text: "K"},
-		},
-		{
-			name: "code lowercase with shift modifier",
-			msg:  tea.KeyPressMsg{Code: 'k', Text: "K", Mod: tea.ModShift},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			app := NewApp()
-			app.SetMode(ModeNormal)
-
-			app.handleNormalMode(tc.msg)
-
-			if app.mode != ModeSearch {
-				t.Fatalf("expected ModeSearch, got %v (string=%q keys=%v)",
-					app.mode, tc.msg.String(), app.keys.SearchMode.Keys())
-			}
-			if !app.globalSearch.IsVisible() {
-				t.Fatal("expected global search overlay")
-			}
-		})
-	}
-}
-
 func TestHandleNormalMode_GGJumpsToTop(t *testing.T) {
 	app := NewApp()
 	app.focusedPanel = PanelMessages
@@ -5812,7 +5778,7 @@ func TestHelpOverlayIncludesSearchShortcuts(t *testing.T) {
 	entries := app.help.VisibleEntries()
 	var hasGlobalSearch, hasChannelSearch bool
 	for _, entry := range entries {
-		if entry.Key == "/, K, cmd+k" && entry.Desc == "global search" {
+		if entry.Key == "//cmd+k" && entry.Desc == "global search" {
 			hasGlobalSearch = true
 		}
 		if entry.Key == "ctrl+f" && entry.Desc == "search in channel" {
