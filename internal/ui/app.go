@@ -3661,8 +3661,22 @@ func (a *App) dropStaleStackEntries(stack *navStack, stale []int) {
 }
 
 func (a *App) matchesKey(msg tea.KeyMsg, bindings ...key.Binding) bool {
+	if hasShortcutChordModifier(msg.Key().Mod) {
+		keystroke := msg.Key().Keystroke()
+		if keystroke != "" && key.Matches(shortcutKeyMsg{KeyMsg: msg, keyString: keystroke}, bindings...) {
+			return true
+		}
+		return strings.Contains(msg.String(), "+") && key.Matches(msg, bindings...)
+	}
+
 	if key.Matches(msg, bindings...) {
 		return true
+	}
+
+	if keystroke := msg.Key().Keystroke(); keystroke != "" && keystroke != msg.String() {
+		if key.Matches(shortcutKeyMsg{KeyMsg: msg, keyString: keystroke}, bindings...) {
+			return true
+		}
 	}
 
 	for _, candidate := range koreanIMEKeyCandidates(msg.Key()) {
