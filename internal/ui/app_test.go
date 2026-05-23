@@ -15,6 +15,7 @@ import (
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/gammons/slk/internal/cache"
 	imgpkg "github.com/gammons/slk/internal/image"
 	"github.com/gammons/slk/internal/ui/compose"
@@ -5686,6 +5687,39 @@ func TestGlobalSearch_KoreanInputExposesCursor(t *testing.T) {
 	}
 	if c := app.globalSearch.Cursor(app.width, app.height); c == nil {
 		t.Fatal("global search must expose a real cursor for IME composition")
+	}
+}
+
+func TestGlobalSearch_KoreanInputRendersThroughFullTUIView(t *testing.T) {
+	app := NewApp()
+	app.width = 120
+	app.height = 40
+	app.SetMode(ModeNormal)
+	app.SetRemoteSearcher(func(ctx context.Context, q string, gen uint64) tea.Msg {
+		return SearchResultsMsg{Gen: gen, Query: q}
+	})
+
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	for _, r := range "검색어" {
+		app.handleGlobalSearchMode(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+	_, _ = app.Update(SearchResultsMsg{
+		Gen:   app.searchGen,
+		Query: app.globalSearch.Query(),
+		Messages: []globalsearch.Item{
+			{ID: "M1", Name: "한국어 검색 결과", ChannelID: "C1", MessageTS: "1.0"},
+		},
+	})
+
+	view := app.View()
+	if view.Cursor == nil {
+		t.Fatal("full TUI view must expose the search cursor for Korean IME composition")
+	}
+	plain := ansi.Strip(view.Content)
+	for _, want := range []string{"검색어", "한국어 검색 결과"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("full TUI search render lost Korean text %q; rendered plain output:\n%s", want, plain)
+		}
 	}
 }
 
