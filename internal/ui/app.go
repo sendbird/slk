@@ -4552,10 +4552,24 @@ func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 		a.pendingWheelDelta = 0
 	}
 
+	// If the user reverses direction before the previous burst has drained,
+	// discard the stale backlog instead of making the cursor keep chasing old
+	// wheel notches. This is the failure mode users see as "the cursor can't
+	// catch up, then dies" when they scroll hard upward and immediately switch
+	// downward (or vice versa). The newest direction should win.
+	if a.pendingWheelDelta != 0 && (a.pendingWheelDelta < 0) != (delta < 0) {
+		a.pendingWheelDelta = 0
+	}
+
 	a.pendingWheelActive = true
 	a.pendingWheelPanel = panel
 	a.pendingWheelView = a.view
 	a.pendingWheelDelta += delta
+	if a.pendingWheelDelta > maxMouseWheelPerFrame {
+		a.pendingWheelDelta = maxMouseWheelPerFrame
+	} else if a.pendingWheelDelta < -maxMouseWheelPerFrame {
+		a.pendingWheelDelta = -maxMouseWheelPerFrame
+	}
 	if a.pendingWheelDelta == 0 {
 		return nil
 	}

@@ -5166,19 +5166,42 @@ func TestApp_MouseWheelBurstIsCoalesced(t *testing.T) {
 		t.Fatalf("wheel events should coalesce before mutating selection; got %d want %d", got, len(items)-1)
 	}
 
-	_, cmd := a.Update(mouseWheelFlushMsg{})
+	_, _ = a.Update(mouseWheelFlushMsg{})
 	if got, want := a.messagepane.SelectedIndex(), len(items)-1-maxMouseWheelPerFrame; got != want {
 		t.Fatalf("first flush selected %d, want %d", got, want)
 	}
-	if cmd == nil {
-		t.Fatal("first flush should schedule the next bounded flush for the remaining burst")
+	if a.pendingWheelActive {
+		t.Fatal("oversized wheel burst should be capped and drained in one flush")
 	}
+}
 
-	for a.pendingWheelActive {
-		a.Update(mouseWheelFlushMsg{})
+func TestApp_MouseWheelDirectionChangeDropsStaleBacklog(t *testing.T) {
+	a := NewApp()
+	a.width = 160
+	a.height = 30
+	items := make([]messages.MessageItem, 30)
+	for i := range items {
+		items[i] = messages.MessageItem{
+			TS:        fmt.Sprintf("%d.0", i+1),
+			UserName:  "u",
+			UserID:    "U1",
+			Text:      fmt.Sprintf("message %d", i+1),
+			Timestamp: "12:00 PM",
+		}
 	}
-	if got := a.messagepane.SelectedIndex(); got != 0 {
-		t.Fatalf("full burst selected %d, want 0", got)
+	a.messagepane.SetMessages(items)
+	_ = a.View()
+
+	x := a.layoutSidebarEnd + 5
+	for i := 0; i < 50; i++ {
+		a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelUp})
+	}
+	if got := a.pendingWheelDelta; got != -maxMouseWheelPerFrame {
+		t.Fatalf("upward burst pending delta = %d, want capped %d", got, -maxMouseWheelPerFrame)
+	}
+	a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelDown})
+	if got := a.pendingWheelDelta; got != 1 {
+		t.Fatalf("direction reversal should drop stale backlog; pending delta = %d, want 1", got)
 	}
 }
 
