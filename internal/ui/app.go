@@ -454,9 +454,12 @@ type autoScrollTickMsg struct{}
 // the update/render loop and makes the TUI appear frozen.
 type mouseWheelFlushMsg struct{}
 
+type mouseWheelResumeMsg struct{ gen uint64 }
+
 const (
-	mouseWheelFlushDelay  = 16 * time.Millisecond
-	maxMouseWheelPerFrame = 12
+	mouseWheelFlushDelay    = 16 * time.Millisecond
+	mouseWheelCooldownDelay = 120 * time.Millisecond
+	maxMouseWheelPerFrame   = 12
 )
 
 // threadFetchDebounceMsg is delivered after the user's threadsview selection
@@ -808,6 +811,8 @@ type App struct {
 	pendingWheelPanel  Panel
 	pendingWheelView   View
 	pendingWheelDelta  int
+	mouseWheelCooldown bool
+	mouseWheelGen      uint64
 
 	// Per-panel render caches. Each panel exposes Version() that increments
 	// on any state change that could alter its View() output. The App caches
@@ -1309,6 +1314,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case mouseWheelFlushMsg:
 		if cmd := a.flushMouseWheel(); cmd != nil {
 			cmds = append(cmds, cmd)
+		}
+
+	case mouseWheelResumeMsg:
+		if msg.gen == a.mouseWheelGen {
+			a.mouseWheelCooldown = false
 		}
 
 	case tea.MouseClickMsg:
@@ -4547,20 +4557,49 @@ func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 	a.focusedPanel = panel
 
 	wasActive := a.pendingWheelActive
+	needsCooldown := false
 	if a.pendingWheelActive && (a.pendingWheelPanel != panel || a.pendingWheelView != a.view) {
 		// If the cursor jumps to another pane mid-burst, drop the stale
 		// accumulator rather than replaying old notches into the new target.
 		a.pendingWheelDelta = 0
 	}
 
+	// If the user reverses direction before the previous burst has drained,
+	// discard the stale backlog instead of making the cursor keep chasing old
+	// wheel notches. This is the failure mode users see as "the cursor can't
+	// catch up, then dies" when they scroll hard upward and immediately switch
+	// downward (or vice versa). The newest direction should win.
+	if a.pendingWheelDelta != 0 && (a.pendingWheelDelta < 0) != (delta < 0) {
+		a.pendingWheelDelta = 0
+		needsCooldown = true
+	}
+
 	a.pendingWheelActive = true
 	a.pendingWheelPanel = panel
 	a.pendingWheelView = a.view
 	a.pendingWheelDelta += delta
-	if a.pendingWheelDelta == 0 || wasActive {
+	if a.pendingWheelDelta > maxMouseWheelPerFrame {
+		a.pendingWheelDelta = maxMouseWheelPerFrame
+		needsCooldown = true
+	} else if a.pendingWheelDelta < -maxMouseWheelPerFrame {
+		a.pendingWheelDelta = -maxMouseWheelPerFrame
+		needsCooldown = true
+	}
+	if a.pendingWheelDelta == 0 {
 		return nil
 	}
-	return tea.Tick(mouseWheelFlushDelay, func(time.Time) tea.Msg { return mouseWheelFlushMsg{} })
+
+	var cmds []tea.Cmd
+	if !wasActive {
+		cmds = append(cmds, tea.Tick(mouseWheelFlushDelay, func(time.Time) tea.Msg { return mouseWheelFlushMsg{} }))
+	}
+	if needsCooldown && !a.mouseWheelCooldown {
+		a.mouseWheelCooldown = true
+		a.mouseWheelGen++
+		gen := a.mouseWheelGen
+		cmds = append(cmds, tea.Tick(mouseWheelCooldownDelay, func(time.Time) tea.Msg { return mouseWheelResumeMsg{gen: gen} }))
+	}
+	return tea.Batch(cmds...)
 }
 
 func (a *App) wheelTargetPanel(x int) (Panel, bool) {
@@ -6719,14 +6758,11 @@ func (a *App) View() tea.View {
 	}
 	v := tea.NewView(finalScreen)
 	v.AltScreen = true
-	// While a wheel burst is waiting for its coalesced flush, temporarily
-	// disable terminal mouse reporting. Bubble Tea renders after every
-	// Update, even when queueMouseWheel intentionally avoids mutating the
-	// model; without this backpressure, high-resolution trackpads can keep
-	// feeding wheel messages faster than the UI loop can drain them, which
-	// makes the app appear to hang. The flush re-enables mouse mode on the
-	// next render, so normal clicks/drags are only paused for one frame.
-	if a.pendingWheelActive {
+	// Protection for extreme wheel bursts: normal scrolling gets only the short
+	// pending-flush backpressure, while saturated bursts or direction reversals
+	// briefly disable mouse reporting so the terminal stops flooding Bubble Tea's
+	// render-after-every-mouse-message loop.
+	if a.pendingWheelActive || a.mouseWheelCooldown {
 		v.MouseMode = tea.MouseModeNone
 	} else {
 		v.MouseMode = tea.MouseModeCellMotion

@@ -5159,30 +5159,59 @@ func TestApp_MouseWheelBurstIsCoalesced(t *testing.T) {
 			firstCmds++
 		}
 	}
-	if firstCmds != 1 {
-		t.Fatalf("wheel burst scheduled %d flush commands, want 1", firstCmds)
+	if firstCmds != 2 {
+		t.Fatalf("wheel burst scheduled %d commands, want 2 (flush + cooldown)", firstCmds)
 	}
 	if got := a.messagepane.SelectedIndex(); got != len(items)-1 {
 		t.Fatalf("wheel events should coalesce before mutating selection; got %d want %d", got, len(items)-1)
 	}
+	if !a.mouseWheelCooldown {
+		t.Fatal("oversized burst should enter mouse-wheel cooldown")
+	}
 
-	_, cmd := a.Update(mouseWheelFlushMsg{})
+	_, _ = a.Update(mouseWheelFlushMsg{})
 	if got, want := a.messagepane.SelectedIndex(), len(items)-1-maxMouseWheelPerFrame; got != want {
 		t.Fatalf("first flush selected %d, want %d", got, want)
 	}
-	if cmd == nil {
-		t.Fatal("first flush should schedule the next bounded flush for the remaining burst")
-	}
-
-	for a.pendingWheelActive {
-		a.Update(mouseWheelFlushMsg{})
-	}
-	if got := a.messagepane.SelectedIndex(); got != 0 {
-		t.Fatalf("full burst selected %d, want 0", got)
+	if a.pendingWheelActive {
+		t.Fatal("oversized wheel burst should be capped and drained in one flush")
 	}
 }
 
-func TestApp_MouseWheelBurstTemporarilyDisablesMouseMode(t *testing.T) {
+func TestApp_MouseWheelDirectionChangeDropsStaleBacklog(t *testing.T) {
+	a := NewApp()
+	a.width = 160
+	a.height = 30
+	items := make([]messages.MessageItem, 30)
+	for i := range items {
+		items[i] = messages.MessageItem{
+			TS:        fmt.Sprintf("%d.0", i+1),
+			UserName:  "u",
+			UserID:    "U1",
+			Text:      fmt.Sprintf("message %d", i+1),
+			Timestamp: "12:00 PM",
+		}
+	}
+	a.messagepane.SetMessages(items)
+	_ = a.View()
+
+	x := a.layoutSidebarEnd + 5
+	for i := 0; i < 50; i++ {
+		a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelUp})
+	}
+	if got := a.pendingWheelDelta; got != -maxMouseWheelPerFrame {
+		t.Fatalf("upward burst pending delta = %d, want capped %d", got, -maxMouseWheelPerFrame)
+	}
+	a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelDown})
+	if got := a.pendingWheelDelta; got != 1 {
+		t.Fatalf("direction reversal should drop stale backlog; pending delta = %d, want 1", got)
+	}
+	if !a.mouseWheelCooldown {
+		t.Fatal("direction reversal should enter mouse-wheel cooldown")
+	}
+}
+
+func TestApp_NormalMouseWheelUsesOnlyFlushBackpressure(t *testing.T) {
 	a := NewApp()
 	a.width = 160
 	a.height = 30
@@ -5197,12 +5226,15 @@ func TestApp_MouseWheelBurstTemporarilyDisablesMouseMode(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("first wheel event should schedule a coalesced flush")
 	}
+	if a.mouseWheelCooldown {
+		t.Fatal("single normal wheel event must not enter long cooldown")
+	}
 	if v := a.View(); v.MouseMode != tea.MouseModeNone {
-		t.Fatalf("pending wheel burst MouseMode = %v, want MouseModeNone", v.MouseMode)
+		t.Fatalf("pending wheel flush MouseMode = %v, want MouseModeNone", v.MouseMode)
 	}
 
 	a.Update(mouseWheelFlushMsg{})
 	if v := a.View(); v.MouseMode != tea.MouseModeCellMotion {
-		t.Fatalf("after wheel flush MouseMode = %v, want MouseModeCellMotion", v.MouseMode)
+		t.Fatalf("after normal wheel flush MouseMode = %v, want MouseModeCellMotion", v.MouseMode)
 	}
 }
