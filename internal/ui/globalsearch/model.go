@@ -15,6 +15,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/gammons/slk/internal/text"
 	"github.com/gammons/slk/internal/ui/messages"
@@ -593,6 +594,49 @@ func (m Model) ViewOverlay(termWidth, termHeight int, background string) string 
 	return overlay.DimmedOverlay(termWidth, termHeight, background, box, 0.5)
 }
 
+// Cursor returns the absolute terminal position where the input
+// cursor should be drawn while the overlay is visible. macOS / Linux
+// IMEs anchor their pre-edit ("composition") rectangle to that
+// terminal cursor, so without this method Korean / CJK input was
+// either invisible (cursor pointed elsewhere on screen) or rendered
+// behind the modal. Returns nil when the overlay is hidden.
+func (m Model) Cursor(termWidth, termHeight int) *tea.Cursor {
+	if !m.visible {
+		return nil
+	}
+	box := m.renderBox(termWidth)
+	if box == "" {
+		return nil
+	}
+	modalW := lipgloss.Width(box)
+	modalH := lipgloss.Height(box)
+	startX := (termWidth - modalW) / 2
+	startY := (termHeight - modalH) / 2
+	if startX < 0 {
+		startX = 0
+	}
+	if startY < 0 {
+		startY = 0
+	}
+	// Inside the modal box, the input line layout is:
+	//   col 0  : box border
+	//   col 1  : box padding
+	//   col 2  : input's BorderLeft ("▌")
+	//   col 3  : input's PaddingLeft
+	//   col 4+ : query text begins
+	// And vertically:
+	//   row 0  : box border
+	//   row 1  : box padding
+	//   row 2  : title
+	//   row 3  : input (where we want the cursor)
+	inputColX := startX + 4
+	inputRowY := startY + 3
+	cursorX := inputColX + lipgloss.Width(m.query)
+	return &tea.Cursor{
+		Position: tea.Position{X: cursorX, Y: inputRowY},
+	}
+}
+
 func sectionLabel(cat string) string {
 	switch cat {
 	case CategorySynthetic:
@@ -634,9 +678,9 @@ func (m Model) renderBox(termWidth int) string {
 	var inputText string
 	if m.query == "" {
 		placeholder := lipgloss.NewStyle().Background(bg).Foreground(styles.TextMuted).Render("Search channels, people, messages…")
-		inputText = "█ " + placeholder
+		inputText = placeholder
 	} else {
-		inputText = m.query + "█"
+		inputText = m.query
 	}
 	input := lipgloss.NewStyle().
 		BorderStyle(lipgloss.Border{Left: "▌"}).

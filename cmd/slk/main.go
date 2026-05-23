@@ -1117,9 +1117,17 @@ func run() error {
 				return ui.ChannelSearchResultsMsg{Gen: gen, Query: query, Err: fmt.Errorf("channel search not supported for this conversation")}
 			}
 			wire := prefix + " " + query
+			debuglog.General("[search] channel scope=%s name=%q dm=%q wire=%q", scope.Type, scope.Name, scope.DMUserID, wire)
 			msgs, err := client.SearchMessages(ctx, wire, 10)
 			if err != nil {
 				return ui.ChannelSearchResultsMsg{Gen: gen, Query: query, Err: err}
+			}
+			debuglog.General("[search] channel hits=%d", len(msgs))
+			for i, h := range msgs {
+				if i >= 5 {
+					break
+				}
+				debuglog.General("[search] hit[%d] channel=%s/%q ts=%s", i, h.ChannelID, h.ChannelName, h.TS)
 			}
 			return ui.ChannelSearchResultsMsg{
 				Gen:      gen,

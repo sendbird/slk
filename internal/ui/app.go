@@ -7200,6 +7200,18 @@ func (a *App) View() tea.View {
 	}
 	if !overlayActive {
 		v.Cursor = activeCursor
+	} else if a.globalSearch.IsVisible() {
+		// Expose the input cursor of the global search overlay so the
+		// terminal-level IME pre-edit (Korean / CJK composition)
+		// anchors to the visible input position instead of staying
+		// hidden behind the modal.
+		if c := a.globalSearch.Cursor(a.width, a.height); c != nil {
+			v.Cursor = c
+		}
+	} else if a.channelSearch.IsVisible() {
+		if c := a.channelSearch.Cursor(a.width, a.height); c != nil {
+			v.Cursor = c
+		}
 	}
 	return configureTerminalInputView(v, a.mode)
 }

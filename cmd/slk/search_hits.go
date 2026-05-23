@@ -13,9 +13,15 @@ import (
 // query prefix that restricts results to the active channel or DM.
 //
 // Mappings:
-//   - channel / private  → "in:#<name>"
+//   - channel / private  → "in:<name>"
 //   - dm / app           → "with:<@U…>" when DMUserID is set; otherwise empty
 //   - group_dm           → empty (the App's open path already filters this out)
+//
+// Slack's search modifier accepts `in:<name>` without the leading `#`
+// — the web client autocompletes the hash for display, but the API
+// parses the modifier on the bare name. Adding the `#` previously
+// caused the API to fall back to an unfiltered search on some
+// workspaces.
 //
 // Returns an empty string if no prefix can be derived, in which case
 // the caller should run an unscoped search rather than block on a
@@ -24,7 +30,7 @@ func channelSearchPrefix(scope ui.ChannelSearchScope) string {
 	switch scope.Type {
 	case "channel", "private":
 		if scope.Name != "" {
-			return "in:#" + scope.Name
+			return "in:" + scope.Name
 		}
 	case "dm", "app":
 		if scope.DMUserID != "" {
