@@ -171,12 +171,12 @@ type WorkspaceContext struct {
 	// FinderItems is the merged list shown in the Ctrl+T finder. Initially
 	// contains only joined channels; the BrowseableChannelsLoadedMsg pipeline
 	// extends it with non-joined public channels in the background.
-	FinderItems   []channelfinder.Item
+	FinderItems []channelfinder.Item
 	// PickerUsers is the workspace user roster (cache.ListUsers, projected
 	// onto newconvopicker.Item) fed to the "new conversation" picker.
 	// Populated synchronously at bootstrap and refreshed when the background
 	// users.list fetch lands.
-	PickerUsers []newconvopicker.Item
+	PickerUsers   []newconvopicker.Item
 	TeamID        string
 	TeamName      string
 	UserID        string

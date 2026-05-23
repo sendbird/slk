@@ -5926,7 +5926,7 @@ func TestApp_DMOpenedMsg_PatchesUserPickerForShortCircuit(t *testing.T) {
 	// rather than re-calling conversations.open.
 	app.newConvoPicker.Open()
 	app.newConvoPicker.HandleKey("d")
-	app.newConvoPicker.HandleKey("enter") // chip
+	app.newConvoPicker.HandleKey("enter")        // chip
 	res := app.newConvoPicker.HandleKey("enter") // submit
 	if res == nil || res.Channel == nil || res.Channel.ID != "D9" {
 		t.Fatalf("expected submission to short-circuit to D9, got %+v", res)
@@ -6031,7 +6031,7 @@ func TestApp_NewConvoPicker_PatchesSidebarDMUserID(t *testing.T) {
 	app.SetMode(ModeNewConvoPicker)
 	// Type partial → chip via Enter → empty-query Enter to submit.
 	app.handleNewConvoPickerMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
-	app.handleNewConvoPickerMode(tea.KeyPressMsg{Code: tea.KeyEnter}) // chip
+	app.handleNewConvoPickerMode(tea.KeyPressMsg{Code: tea.KeyEnter})        // chip
 	cmd := app.handleNewConvoPickerMode(tea.KeyPressMsg{Code: tea.KeyEnter}) // submit (short-circuit)
 	if cmd == nil {
 		t.Fatalf("expected a tea.Cmd from short-circuit")
@@ -6068,9 +6068,41 @@ func TestApp_ConversationOpenedMsg_PatchesUserPickerDMChannelID(t *testing.T) {
 	// Submission-time short-circuit should now route to the cached D9.
 	app.newConvoPicker.Open()
 	app.newConvoPicker.HandleKey("d")
-	app.newConvoPicker.HandleKey("enter") // chip
+	app.newConvoPicker.HandleKey("enter")        // chip
 	res := app.newConvoPicker.HandleKey("enter") // submit
 	if res == nil || res.Channel == nil || res.Channel.ID != "D9" {
 		t.Fatalf("expected short-circuit to D9 after ConversationOpenedMsg, got %+v", res)
+	}
+}
+
+// TestApp_NewConvoPicker_OpensFromActivityView checks that the `n`
+// keybinding still opens the new-conversation picker when the message
+// pane is currently rendering the threads-list / activity synthetic
+// views (where there's no active channel). Regression for the upstream
+// activity + threads view code paths that landed alongside our feature.
+func TestApp_NewConvoPicker_OpensFromActivityView(t *testing.T) {
+	cases := []struct {
+		name string
+		view View
+	}{
+		{"ViewThreads", ViewThreads},
+		{"ViewActivity", ViewActivity},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app := NewApp()
+			app.activeTeamID = "T1"
+			app.view = tc.view
+			app.SetMode(ModeNormal)
+
+			cmd := app.handleNormalMode(tea.KeyPressMsg{Code: 'n', Text: "n"})
+			_ = cmd
+			if app.mode != ModeNewConvoPicker {
+				t.Fatalf("expected ModeNewConvoPicker from %v, got %v", tc.view, app.mode)
+			}
+			if !app.newConvoPicker.IsVisible() {
+				t.Fatalf("picker overlay should be visible from %v", tc.view)
+			}
+		})
 	}
 }

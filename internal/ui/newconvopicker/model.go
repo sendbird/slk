@@ -71,9 +71,9 @@ type SelectedUser struct {
 // uses it to re-upsert the sidebar row with the proper DMUserID
 // mapping in case the original bootstrap missed it.
 type Result struct {
-	Channel   *channelfinder.ChannelResult
-	DMUserID  string
-	Users     []SelectedUser
+	Channel  *channelfinder.ChannelResult
+	DMUserID string
+	Users    []SelectedUser
 }
 
 // Model holds the picker's state. Construct with New().
