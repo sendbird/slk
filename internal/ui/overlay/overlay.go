@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/gammons/slk/internal/image"
 )
@@ -16,9 +17,11 @@ import (
 var kittyPlaceholderPrefix = string(image.PlaceholderRune)
 
 // DimmedOverlay composites a modal box on top of a dimmed background.
-// The background string is rendered to a Canvas, all cell colors are
-// darkened by dimPercent (0.0-1.0), then the modal box is placed centered
-// on top by copying its cells.
+//
+// This intentionally stays in string/cell-width space instead of using
+// lipgloss.Canvas. The Canvas/Layer path in lipgloss v2.0.3 can drop or
+// corrupt Korean/CJK wide cells while parsing styled strings, which makes
+// search queries and background text appear as black blocks under modals.
 //
 // Cells whose content carries the kitty unicode-placeholder rune are
 // blanked: their FG is a 24-bit encoding of an image ID (not a visual
@@ -29,40 +32,19 @@ var kittyPlaceholderPrefix = string(image.PlaceholderRune)
 // frame re-emits the placeholder cells, re-creating the placement
 // without any image-state plumbing. Issue #18.
 func DimmedOverlay(width, height int, background string, box string, dimPercent float64) string {
-	// Step 1: Render background to canvas and dim all cells
-	canvas := lipgloss.NewCanvas(width, height)
-	canvas.Compose(lipgloss.NewLayer(background))
+	_ = dimPercent // kept for the public contract; text-safe dimming uses faint SGR.
+
+	bgLines := strings.Split(background, "\n")
+	out := make([]string, height)
+	dimStyle := lipgloss.NewStyle().Faint(true)
 	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			cell := canvas.CellAt(x, y)
-			if cell == nil {
-				continue
-			}
-			if strings.HasPrefix(cell.Content, kittyPlaceholderPrefix) {
-				// Drop the kitty placement at this cell. Clear the FG
-				// (was image-ID-as-RGB, not a real color) and let the
-				// normal dim path tint any BG so the region blends
-				// into the rest of the dimmed background.
-				cell.Content = " "
-				cell.Width = 1
-				cell.Style.Fg = nil
-			}
-			if cell.Style.Bg != nil {
-				cell.Style.Bg = lipgloss.Darken(cell.Style.Bg, dimPercent)
-			}
-			if cell.Style.Fg != nil {
-				cell.Style.Fg = lipgloss.Darken(cell.Style.Fg, dimPercent)
-			}
-			canvas.SetCell(x, y, cell)
+		line := ""
+		if y < len(bgLines) {
+			line = sanitizeBackgroundLine(bgLines[y])
 		}
+		out[y] = dimStyle.Render(fitLine(line, width))
 	}
 
-	// Step 2: Render dimmed canvas, create output canvas
-	dimmedStr := canvas.Render()
-	outCanvas := lipgloss.NewCanvas(width, height)
-	outCanvas.Compose(lipgloss.NewLayer(dimmedStr))
-
-	// Step 3: Render modal to its own canvas, compute centered position
 	modalW := lipgloss.Width(box)
 	modalH := lipgloss.Height(box)
 	startX := (width - modalW) / 2
@@ -74,18 +56,52 @@ func DimmedOverlay(width, height int, background string, box string, dimPercent 
 		startY = 0
 	}
 
-	modalCanvas := lipgloss.NewCanvas(modalW, modalH)
-	modalCanvas.Compose(lipgloss.NewLayer(box))
-
-	// Step 4: Copy modal cells onto output canvas
+	boxLines := strings.Split(box, "\n")
 	for my := 0; my < modalH; my++ {
-		for mx := 0; mx < modalW; mx++ {
-			cell := modalCanvas.CellAt(mx, my)
-			if cell != nil {
-				outCanvas.SetCell(startX+mx, startY+my, cell)
-			}
+		y := startY + my
+		if y < 0 || y >= height {
+			continue
 		}
+		boxLine := ""
+		if my < len(boxLines) {
+			boxLine = boxLines[my]
+		}
+		visibleBoxWidth := modalW
+		if startX+visibleBoxWidth > width {
+			visibleBoxWidth = width - startX
+		}
+		if visibleBoxWidth <= 0 {
+			continue
+		}
+		boxLine = fitLine(ansi.Cut(boxLine, 0, visibleBoxWidth), visibleBoxWidth)
+		left := fitLine(ansi.Cut(out[y], 0, startX), startX)
+		rightStart := startX + visibleBoxWidth
+		rightWidth := width - rightStart
+		right := ""
+		if rightWidth > 0 {
+			right = fitLine(ansi.Cut(out[y], rightStart, width), rightWidth)
+		}
+		out[y] = left + boxLine + right
 	}
 
-	return outCanvas.Render()
+	return strings.Join(out, "\n")
+}
+
+func sanitizeBackgroundLine(line string) string {
+	line = ansi.Strip(line)
+	if strings.Contains(line, kittyPlaceholderPrefix) {
+		line = strings.ReplaceAll(line, kittyPlaceholderPrefix, " ")
+	}
+	return line
+}
+
+func fitLine(line string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	line = ansi.Truncate(line, width, "")
+	if pad := width - ansi.StringWidth(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
 }

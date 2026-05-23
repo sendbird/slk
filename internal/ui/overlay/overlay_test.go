@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/gammons/slk/internal/image"
 	"github.com/gammons/slk/internal/ui/overlay"
@@ -63,5 +64,31 @@ func TestDimmedOverlayDropsKittyPlaceholders(t *testing.T) {
 	}
 	if strings.Contains(out, idFG) {
 		t.Fatalf("dim left raw image-ID FG escape %q in output:\n%q", idFG, out)
+	}
+}
+
+func TestDimmedOverlayPreservesKoreanWideCells(t *testing.T) {
+	const width, height = 48, 6
+	bg := strings.Join([]string{
+		"한글 검색 결과가 배경에 남아야 합니다" + strings.Repeat(" ", 12),
+		"korean wide cells should not become holes" + strings.Repeat(" ", 8),
+		"검색어 테스트" + strings.Repeat(" ", 30),
+		strings.Repeat(" ", width),
+		strings.Repeat(" ", width),
+		strings.Repeat(" ", width),
+	}, "\n")
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		Width(12).
+		Height(1).
+		Render("Search")
+
+	out := overlay.DimmedOverlay(width, height, bg, box, 0.5)
+	plain := ansi.Strip(out)
+
+	for _, want := range []string{"한글 검색", "검색어 테스트"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("dimmed overlay lost Korean text %q; rendered plain output:\n%s", want, plain)
+		}
 	}
 }
