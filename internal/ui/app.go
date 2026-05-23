@@ -4546,6 +4546,7 @@ func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 	a.focusedPanel = panel
 
 	wasActive := a.pendingWheelActive
+	needsCooldown := false
 	if a.pendingWheelActive && (a.pendingWheelPanel != panel || a.pendingWheelView != a.view) {
 		// If the cursor jumps to another pane mid-burst, drop the stale
 		// accumulator rather than replaying old notches into the new target.
@@ -4559,6 +4560,7 @@ func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 	// downward (or vice versa). The newest direction should win.
 	if a.pendingWheelDelta != 0 && (a.pendingWheelDelta < 0) != (delta < 0) {
 		a.pendingWheelDelta = 0
+		needsCooldown = true
 	}
 
 	a.pendingWheelActive = true
@@ -4567,8 +4569,10 @@ func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 	a.pendingWheelDelta += delta
 	if a.pendingWheelDelta > maxMouseWheelPerFrame {
 		a.pendingWheelDelta = maxMouseWheelPerFrame
+		needsCooldown = true
 	} else if a.pendingWheelDelta < -maxMouseWheelPerFrame {
 		a.pendingWheelDelta = -maxMouseWheelPerFrame
+		needsCooldown = true
 	}
 	if a.pendingWheelDelta == 0 {
 		return nil
@@ -4578,7 +4582,7 @@ func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 	if !wasActive {
 		cmds = append(cmds, tea.Tick(mouseWheelFlushDelay, func(time.Time) tea.Msg { return mouseWheelFlushMsg{} }))
 	}
-	if !a.mouseWheelCooldown {
+	if needsCooldown && !a.mouseWheelCooldown {
 		a.mouseWheelCooldown = true
 		a.mouseWheelGen++
 		gen := a.mouseWheelGen
@@ -6722,12 +6726,11 @@ func (a *App) View() tea.View {
 	}
 	v := tea.NewView(finalScreen)
 	v.AltScreen = true
-	// Protection for extreme wheel bursts: keep mouse reporting enabled for
-	// normal scrolling, but briefly disable it after the first wheel event in a
-	// burst. This gives the terminal a chance to stop flooding Bubble Tea's
-	// render-after-every-mouse-message loop while still allowing wheel scrolling
-	// to resume after a short cooldown.
-	if a.mouseWheelCooldown {
+	// Protection for extreme wheel bursts: normal scrolling gets only the short
+	// pending-flush backpressure, while saturated bursts or direction reversals
+	// briefly disable mouse reporting so the terminal stops flooding Bubble Tea's
+	// render-after-every-mouse-message loop.
+	if a.pendingWheelActive || a.mouseWheelCooldown {
 		v.MouseMode = tea.MouseModeNone
 	} else {
 		v.MouseMode = tea.MouseModeCellMotion

@@ -5159,11 +5159,14 @@ func TestApp_MouseWheelBurstIsCoalesced(t *testing.T) {
 			firstCmds++
 		}
 	}
-	if firstCmds != 1 {
-		t.Fatalf("wheel burst scheduled %d flush commands, want 1", firstCmds)
+	if firstCmds != 2 {
+		t.Fatalf("wheel burst scheduled %d commands, want 2 (flush + cooldown)", firstCmds)
 	}
 	if got := a.messagepane.SelectedIndex(); got != len(items)-1 {
 		t.Fatalf("wheel events should coalesce before mutating selection; got %d want %d", got, len(items)-1)
+	}
+	if !a.mouseWheelCooldown {
+		t.Fatal("oversized burst should enter mouse-wheel cooldown")
 	}
 
 	_, _ = a.Update(mouseWheelFlushMsg{})
@@ -5203,9 +5206,12 @@ func TestApp_MouseWheelDirectionChangeDropsStaleBacklog(t *testing.T) {
 	if got := a.pendingWheelDelta; got != 1 {
 		t.Fatalf("direction reversal should drop stale backlog; pending delta = %d, want 1", got)
 	}
+	if !a.mouseWheelCooldown {
+		t.Fatal("direction reversal should enter mouse-wheel cooldown")
+	}
 }
 
-func TestApp_MouseWheelBurstTemporarilyDisablesMouseMode(t *testing.T) {
+func TestApp_NormalMouseWheelUsesOnlyFlushBackpressure(t *testing.T) {
 	a := NewApp()
 	a.width = 160
 	a.height = 30
@@ -5218,18 +5224,17 @@ func TestApp_MouseWheelBurstTemporarilyDisablesMouseMode(t *testing.T) {
 	x := a.layoutRailWidth + 1
 	_, cmd := a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelDown})
 	if cmd == nil {
-		t.Fatal("first wheel event should schedule coalesced flush/cooldown commands")
+		t.Fatal("first wheel event should schedule a coalesced flush")
+	}
+	if a.mouseWheelCooldown {
+		t.Fatal("single normal wheel event must not enter long cooldown")
 	}
 	if v := a.View(); v.MouseMode != tea.MouseModeNone {
-		t.Fatalf("pending wheel cooldown MouseMode = %v, want MouseModeNone", v.MouseMode)
+		t.Fatalf("pending wheel flush MouseMode = %v, want MouseModeNone", v.MouseMode)
 	}
 
 	a.Update(mouseWheelFlushMsg{})
-	if v := a.View(); v.MouseMode != tea.MouseModeNone {
-		t.Fatalf("after wheel flush but before cooldown MouseMode = %v, want MouseModeNone", v.MouseMode)
-	}
-	a.Update(mouseWheelResumeMsg{gen: a.mouseWheelGen})
 	if v := a.View(); v.MouseMode != tea.MouseModeCellMotion {
-		t.Fatalf("after wheel cooldown MouseMode = %v, want MouseModeCellMotion", v.MouseMode)
+		t.Fatalf("after normal wheel flush MouseMode = %v, want MouseModeCellMotion", v.MouseMode)
 	}
 }
