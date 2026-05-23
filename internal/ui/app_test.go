@@ -18,9 +18,11 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/gammons/slk/internal/cache"
 	imgpkg "github.com/gammons/slk/internal/image"
+	"github.com/gammons/slk/internal/ui/channelfinder"
 	"github.com/gammons/slk/internal/ui/compose"
 	"github.com/gammons/slk/internal/ui/globalsearch"
 	"github.com/gammons/slk/internal/ui/messages"
+	"github.com/gammons/slk/internal/ui/newconvopicker"
 	"github.com/gammons/slk/internal/ui/sidebar"
 	"github.com/gammons/slk/internal/ui/slashpicker"
 	"github.com/gammons/slk/internal/ui/statusbar"
@@ -5747,5 +5749,328 @@ func TestHelpOverlayIncludesSearchShortcuts(t *testing.T) {
 	}
 	if !hasChannelSearch {
 		t.Fatalf("help entries must include ctrl+f channel search: %+v", entries)
+	}
+}
+
+// TestApp_NewConvoPicker_OpensOnN verifies that 'n' in normal mode
+// puts the App into ModeNewConvoPicker and shows the picker overlay.
+func TestApp_NewConvoPicker_OpensOnN(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+	app.SetMode(ModeNormal)
+
+	cmd := app.handleNormalMode(tea.KeyPressMsg{Code: 'n', Text: "n"})
+	if cmd != nil {
+		// handleNormalMode for 'n' should not return a cmd.
+		// (It just opens the picker overlay.)
+		_ = cmd
+	}
+	if app.mode != ModeNewConvoPicker {
+		t.Fatalf("expected mode=ModeNewConvoPicker, got %v", app.mode)
+	}
+	if !app.newConvoPicker.IsVisible() {
+		t.Fatalf("picker overlay should be visible after 'n'")
+	}
+}
+
+// TestApp_DMOpenedMsg_ActiveWorkspace verifies the activated branch:
+// the sidebar gets the new channel, the finder/picker get upserted,
+// and a ChannelSelectedMsg is dispatched.
+func TestApp_DMOpenedMsg_ActiveWorkspace(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+
+	msg := DMOpenedMsg{
+		TeamID:      "T1",
+		ChannelID:   "D9",
+		ChannelName: "doogie min",
+		ChannelType: "dm",
+		UserIDs:     []string{"U1"},
+		SidebarItem: sidebar.ChannelItem{ID: "D9", Name: "doogie min", Type: "dm", DMUserID: "U1"},
+		FinderItem:  channelfinder.Item{ID: "D9", Name: "doogie min", Type: "dm", Joined: true},
+	}
+	model, cmd := app.Update(msg)
+	app = model.(*App)
+
+	// Sidebar should now contain the DM row.
+	found := false
+	for _, it := range app.sidebar.Items() {
+		if it.ID == "D9" && it.DMUserID == "U1" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected sidebar to contain D9 with DMUserID=U1, got %+v", app.sidebar.Items())
+	}
+
+	// A ChannelSelectedMsg should be dispatched.
+	if cmd == nil {
+		t.Fatalf("expected a tea.Cmd from DMOpenedMsg")
+	}
+	sawSelect := false
+	for _, sub := range collectAllMsgs(cmd) {
+		if cs, ok := sub.(ChannelSelectedMsg); ok && cs.ID == "D9" {
+			sawSelect = true
+		}
+	}
+	if !sawSelect {
+		t.Fatalf("expected ChannelSelectedMsg for D9 in cmd output")
+	}
+}
+
+// TestApp_DMOpenedMsg_InactiveWorkspace verifies the workspace-race
+// gate: when TeamID does not match the active workspace, the active
+// sidebar must not be mutated and no channel switch is dispatched.
+func TestApp_DMOpenedMsg_InactiveWorkspace(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+	// Seed sidebar with an unrelated channel so we can compare.
+	app.SetChannels([]sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}})
+	originalCount := len(app.sidebar.Items())
+
+	msg := DMOpenedMsg{
+		TeamID:      "T2", // a different workspace
+		ChannelID:   "D9",
+		ChannelName: "doogie min",
+		ChannelType: "dm",
+		SidebarItem: sidebar.ChannelItem{ID: "D9", Name: "doogie min", Type: "dm"},
+		FinderItem:  channelfinder.Item{ID: "D9", Name: "doogie min", Type: "dm", Joined: true},
+	}
+	_, cmd := app.Update(msg)
+
+	if len(app.sidebar.Items()) != originalCount {
+		t.Fatalf("inactive-workspace DMOpened should not mutate sidebar (got %d items, want %d)",
+			len(app.sidebar.Items()), originalCount)
+	}
+	// cmd should not dispatch ChannelSelectedMsg either.
+	if cmd != nil {
+		for _, sub := range collectAllMsgs(cmd) {
+			if _, ok := sub.(ChannelSelectedMsg); ok {
+				t.Fatalf("inactive-workspace DMOpened should not produce ChannelSelectedMsg")
+			}
+		}
+	}
+}
+
+// TestApp_DMOpenFailedMsg_ToastDispatch verifies that a failed DM
+// open on the active workspace produces a ToastMsg via the existing
+// status-bar toast infrastructure.
+func TestApp_DMOpenFailedMsg_ToastDispatch(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+
+	msg := DMOpenFailedMsg{TeamID: "T1", UserIDs: []string{"U1"}, Err: errors.New("boom")}
+	_, cmd := app.Update(msg)
+	if cmd == nil {
+		t.Fatalf("expected a tea.Cmd for DMOpenFailedMsg")
+	}
+	sawToast := false
+	for _, sub := range collectAllMsgs(cmd) {
+		if tm, ok := sub.(ToastMsg); ok && tm.Text != "" {
+			sawToast = true
+		}
+	}
+	if !sawToast {
+		t.Fatalf("expected ToastMsg in cmd output")
+	}
+}
+
+// collectAllMsgs flattens a tea.Cmd's terminal messages, including
+// those nested under tea.BatchMsg. Used by the DMOpened* assertions
+// to find the dispatched ChannelSelectedMsg / ToastMsg without
+// asserting on Cmd internal shape.
+func collectAllMsgs(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	switch m := msg.(type) {
+	case tea.BatchMsg:
+		var out []tea.Msg
+		for _, c := range m {
+			out = append(out, collectAllMsgs(c)...)
+		}
+		return out
+	default:
+		return []tea.Msg{msg}
+	}
+}
+
+// TestApp_DMOpenedMsg_PatchesUserPickerForShortCircuit checks that
+// after a DMOpenedMsg lands for a 1:1 DM, the new-conversation picker
+// learns the user→channel mapping. This is what makes "open Doogie's
+// DM, then open the picker again and pick Doogie" route through the
+// existing channel rather than re-calling conversations.open.
+func TestApp_DMOpenedMsg_PatchesUserPickerForShortCircuit(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+	// Seed the picker with the user, no DMChannelID yet.
+	app.newConvoPicker.SetUsers([]newconvopicker.Item{
+		{ID: "U1", Kind: newconvopicker.KindUser, Name: "doogie min", Username: "doogie"},
+	})
+
+	msg := DMOpenedMsg{
+		TeamID:      "T1",
+		ChannelID:   "D9",
+		ChannelName: "doogie min",
+		ChannelType: "dm",
+		UserIDs:     []string{"U1"},
+		SidebarItem: sidebar.ChannelItem{ID: "D9", Name: "doogie min", Type: "dm", DMUserID: "U1"},
+		FinderItem:  channelfinder.Item{ID: "D9", Name: "doogie min", Type: "dm", Joined: true},
+	}
+	_, _ = app.Update(msg)
+
+	// Open the picker, chip the user, then submit on empty query.
+	// The submission short-circuit should route to the cached D9
+	// rather than re-calling conversations.open.
+	app.newConvoPicker.Open()
+	app.newConvoPicker.HandleKey("d")
+	app.newConvoPicker.HandleKey("enter") // chip
+	res := app.newConvoPicker.HandleKey("enter") // submit
+	if res == nil || res.Channel == nil || res.Channel.ID != "D9" {
+		t.Fatalf("expected submission to short-circuit to D9, got %+v", res)
+	}
+}
+
+// TestApp_ChannelJoinedMsg_UpsertsNewConvoPicker verifies that joining
+// a public channel via the channel finder also makes that channel
+// searchable in the new-conversation picker.
+func TestApp_ChannelJoinedMsg_UpsertsNewConvoPicker(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+
+	_, _ = app.Update(ChannelJoinedMsg{ID: "C5", Name: "newjoin"})
+
+	app.newConvoPicker.Open()
+	app.newConvoPicker.HandleKey("n")
+	res := app.newConvoPicker.HandleKey("enter")
+	if res == nil || res.Channel == nil || res.Channel.ID != "C5" {
+		t.Fatalf("expected newconvopicker to know C5 after ChannelJoinedMsg, got %+v", res)
+	}
+}
+
+// TestApp_BrowseableChannelsLoadedMsg_UpsertsNewConvoPicker verifies
+// that browseable (non-joined) public channels also flow into the
+// new-conversation picker.
+func TestApp_BrowseableChannelsLoadedMsg_UpsertsNewConvoPicker(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+
+	_, _ = app.Update(BrowseableChannelsLoadedMsg{
+		TeamID: "T1",
+		Items: []channelfinder.Item{
+			{ID: "C8", Name: "browseable", Type: "channel", Joined: false},
+		},
+	})
+
+	app.newConvoPicker.Open()
+	app.newConvoPicker.HandleKey("b")
+	res := app.newConvoPicker.HandleKey("enter")
+	if res == nil || res.Channel == nil || res.Channel.ID != "C8" {
+		t.Fatalf("expected newconvopicker to know C8 after BrowseableChannelsLoadedMsg, got %+v", res)
+	}
+	if res.Channel.Joined {
+		t.Errorf("browseable channel should keep Joined=false (so router knows to join)")
+	}
+}
+
+// TestApp_NewConvoPicker_OpenerReceivesTeamIDFromSubmitTime verifies
+// the workspace-race fix: the picker captures activeTeamID at submit
+// time and forwards it to OpenDMFunc. If the active workspace changes
+// before the cmd runs, the callback should still see the originating
+// teamID — not whatever is active later.
+func TestApp_NewConvoPicker_OpenerReceivesTeamIDFromSubmitTime(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+	app.newConvoPicker.SetUsers([]newconvopicker.Item{
+		{ID: "U1", Kind: newconvopicker.KindUser, Name: "doogie", Username: "doogie"},
+	})
+
+	gotTeam := ""
+	app.SetDMOpener(func(teamID string, _ []string) tea.Msg {
+		gotTeam = teamID
+		return DMOpenedMsg{TeamID: teamID}
+	})
+
+	app.newConvoPicker.Open()
+	app.SetMode(ModeNewConvoPicker)
+	// Type to chip the user.
+	app.handleNewConvoPickerMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	app.handleNewConvoPickerMode(tea.KeyPressMsg{Code: tea.KeyEnter})
+	// Empty-query Enter to submit.
+	cmd := app.handleNewConvoPickerMode(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("expected a tea.Cmd from picker submission")
+	}
+	// Simulate workspace switch before the cmd runs.
+	app.activeTeamID = "T2"
+	cmd()
+	if gotTeam != "T1" {
+		t.Fatalf("OpenDMFunc should have received T1 (submit-time teamID), got %q", gotTeam)
+	}
+}
+
+// TestApp_NewConvoPicker_PatchesSidebarDMUserID verifies that
+// submitting a single-chip user with an existing 1:1 DM (the picker's
+// submission-time short-circuit) re-upserts the matching sidebar row
+// with the user's ID. Guards against a stale sidebar entry that was
+// bootstrapped without DMUserID set, so downstream dedup keyed on
+// DMUserID keeps working.
+func TestApp_NewConvoPicker_PatchesSidebarDMUserID(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+	// Seed sidebar with a dm row missing DMUserID.
+	app.SetChannels([]sidebar.ChannelItem{{ID: "D9", Name: "doogie min", Type: "dm"}})
+	// Seed picker user with DMChannelID pointing at the same dm row.
+	app.newConvoPicker.SetUsers([]newconvopicker.Item{
+		{ID: "U1", Kind: newconvopicker.KindUser, Name: "doogie min", Username: "doogie", DMChannelID: "D9"},
+	})
+
+	app.newConvoPicker.Open()
+	app.SetMode(ModeNewConvoPicker)
+	// Type partial → chip via Enter → empty-query Enter to submit.
+	app.handleNewConvoPickerMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	app.handleNewConvoPickerMode(tea.KeyPressMsg{Code: tea.KeyEnter}) // chip
+	cmd := app.handleNewConvoPickerMode(tea.KeyPressMsg{Code: tea.KeyEnter}) // submit (short-circuit)
+	if cmd == nil {
+		t.Fatalf("expected a tea.Cmd from short-circuit")
+	}
+
+	for _, it := range app.sidebar.Items() {
+		if it.ID == "D9" {
+			if it.DMUserID != "U1" {
+				t.Fatalf("expected DMUserID=U1 after short-circuit, got %q", it.DMUserID)
+			}
+			return
+		}
+	}
+	t.Fatalf("D9 row should still be in sidebar")
+}
+
+// TestApp_ConversationOpenedMsg_PatchesUserPickerDMChannelID exercises
+// the WS-event path: when a fresh DM lands via Slack push (not our
+// own conversations.open), the picker user row's DMChannelID must
+// also get wired so subsequent picker submissions short-circuit.
+func TestApp_ConversationOpenedMsg_PatchesUserPickerDMChannelID(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+	app.newConvoPicker.SetUsers([]newconvopicker.Item{
+		{ID: "U1", Kind: newconvopicker.KindUser, Name: "doogie min", Username: "doogie"},
+	})
+
+	_, _ = app.Update(ConversationOpenedMsg{
+		TeamID: "T1",
+		Item:   sidebar.ChannelItem{ID: "D9", Name: "doogie min", Type: "dm", DMUserID: "U1"},
+	})
+
+	// Open picker → chip the user → empty-query Enter to submit.
+	// Submission-time short-circuit should now route to the cached D9.
+	app.newConvoPicker.Open()
+	app.newConvoPicker.HandleKey("d")
+	app.newConvoPicker.HandleKey("enter") // chip
+	res := app.newConvoPicker.HandleKey("enter") // submit
+	if res == nil || res.Channel == nil || res.Channel.ID != "D9" {
+		t.Fatalf("expected short-circuit to D9 after ConversationOpenedMsg, got %+v", res)
 	}
 }

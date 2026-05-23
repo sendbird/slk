@@ -21,6 +21,7 @@
 | `Ctrl+b` | Any | Toggle sidebar |
 | `Ctrl+]` | Any | Toggle thread panel |
 | `Ctrl+t` / `Ctrl+p` | Any | Fuzzy channel finder |
+| `n` | Normal | New conversation — picker for channels + workspace users; Enter on a channel switches to it, Enter on a user chips them, empty-query Enter submits chips (1 user → 1:1 DM, 2+ → group DM) |
 | `Ctrl+w` | Any | Workspace picker |
 | `1`–`9` | Normal | Jump to workspace N |
 | `r` | Normal (message) | Open reaction picker |

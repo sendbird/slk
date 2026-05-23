@@ -36,6 +36,7 @@ import (
 	"github.com/gammons/slk/internal/ui/imgrender"
 	"github.com/gammons/slk/internal/ui/mentionpicker"
 	"github.com/gammons/slk/internal/ui/messages"
+	"github.com/gammons/slk/internal/ui/newconvopicker"
 	"github.com/gammons/slk/internal/ui/presencemenu"
 	"github.com/gammons/slk/internal/ui/reactionpicker"
 	"github.com/gammons/slk/internal/ui/sidebar"
@@ -271,6 +272,11 @@ type (
 		Theme       string // resolved theme name (per-workspace or global default)
 		Channels    []sidebar.ChannelItem
 		FinderItems []channelfinder.Item
+		// PickerUsers feeds the new-conversation picker with the full
+		// workspace user list (sourced from cache.ListUsers, so members
+		// who have never appeared in a message are included). Empty for
+		// workspaces where main.go hasn't built the list yet.
+		PickerUsers []newconvopicker.Item
 		UserNames   map[string]string
 		// ExternalUsers maps userID -> true for users this workspace
 		// considers Slack Connect / shared-channel guests. Hydrated from
@@ -335,6 +341,11 @@ type (
 		Theme       string // resolved theme name (per-workspace or global default)
 		Channels    []sidebar.ChannelItem
 		FinderItems []channelfinder.Item
+		// PickerUsers feeds the new-conversation picker with the full
+		// workspace user list (sourced from cache.ListUsers, so members
+		// who have never appeared in a message are included). Empty for
+		// workspaces where main.go hasn't built the list yet.
+		PickerUsers []newconvopicker.Item
 		UserNames   map[string]string
 		// ExternalUsers maps userID -> true for users this workspace
 		// considers Slack Connect / shared-channel guests. Hydrated from
@@ -804,6 +815,16 @@ type TypingSendFunc func(channelID string)
 // describing the result (typically ChannelJoinedMsg or ChannelJoinFailedMsg).
 type JoinChannelFunc func(channelID, channelName string) tea.Msg
 
+// OpenDMFunc is called to open (or fetch) a DM / multiparty DM channel
+// for the given user IDs on the given workspace. One user ID → 1:1 DM,
+// two or more → mpim. Returns a tea.Msg (typically DMOpenedMsg or
+// DMOpenFailedMsg).
+//
+// teamID is captured at submit time (when the user pressed Enter in the
+// picker) so the callback can route to the correct workspace even if
+// the user switches workspaces while conversations.open is in flight.
+type OpenDMFunc func(teamID string, userIDs []string) tea.Msg
+
 // ChannelVisitRecorder is invoked from case ChannelSelectedMsg to let
 // main.go persist the visit (SQLite write + in-memory map update on
 // the WorkspaceContext). Always called regardless of FromHistory.
@@ -832,6 +853,34 @@ type ChannelJoinFailedMsg struct {
 	Err  error
 }
 
+// DMOpenedMsg is sent after conversations.open succeeds for a DM/mpim
+// initiated from the new-conversation picker. The App's handler gates
+// on TeamID (workspace-switch race), upserts the new channel into the
+// sidebar + finders using the pre-built items from main.go's
+// buildChannelItem, and switches the view.
+//
+// SidebarItem and FinderItem are constructed up in main.go (where the
+// WorkspaceContext lives, with the bot/external/section maps needed to
+// shape them correctly) and shipped down here so the App doesn't need
+// to reach back into per-workspace state.
+type DMOpenedMsg struct {
+	TeamID      string
+	ChannelID   string
+	ChannelName string
+	ChannelType string // "dm" or "group_dm"
+	UserIDs     []string
+	SidebarItem sidebar.ChannelItem
+	FinderItem  channelfinder.Item
+}
+
+// DMOpenFailedMsg is sent when conversations.open fails. The App emits
+// a transient toast.
+type DMOpenFailedMsg struct {
+	TeamID  string
+	UserIDs []string
+	Err     error
+}
+
 // clipboardReader abstracts clipboard.Read so tests can inject fake
 // clipboard contents. Production code uses the real clipboard.Read.
 type clipboardReader func(format clipboard.Format) []byte
@@ -850,6 +899,7 @@ type App struct {
 	channelFinder   channelfinder.Model
 	globalSearch    globalsearch.Model
 	channelSearch   globalsearch.Model
+	newConvoPicker  newconvopicker.Model
 	workspaceFinder workspacefinder.Model
 	filePicker      filepicker.Model
 	themeSwitcher   themeswitcher.Model
@@ -989,6 +1039,7 @@ type App struct {
 	threadMarker        ThreadMarkFunc
 	threadReplySender   ThreadReplySendFunc
 	channelJoiner       JoinChannelFunc
+	openDMFn            OpenDMFunc
 	threadsListFetcher  ThreadsListFetchFunc
 	activityListFetcher ActivityListFetchFunc
 	// channelLastReadFetcher returns the parent channel's last_read_ts
@@ -1218,6 +1269,7 @@ func NewApp() *App {
 		channelFinder:         channelfinder.New(),
 		globalSearch:          globalsearch.New(),
 		channelSearch:         globalsearch.New(),
+		newConvoPicker:        newconvopicker.New(),
 		workspaceFinder:       workspacefinder.New(),
 		filePicker:            filepicker.New(),
 		themeSwitcher:         themeswitcher.New(),
@@ -2735,6 +2787,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		a.messagepane.PatchUserName(msg.UserID, msg.DisplayName)
 		a.threadPanel.PatchUserName(msg.UserID, msg.DisplayName)
+		a.newConvoPicker.PatchUserName(msg.UserID, msg.DisplayName)
 		// IsBot affects DM channel-type classification, but that's
 		// orchestrated by DMNameResolvedMsg; this handler is only the
 		// in-history name patch. IsBot is carried for forward
@@ -2804,6 +2857,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.SetChannels(msg.Channels)
 		a.channelFinder.SetItems(msg.FinderItems)
 		a.globalSearch.SetItems(globalSearchItemsFromFinder(msg.FinderItems))
+		a.newConvoPicker.SetChannels(finderItemsToPickerItems(msg.FinderItems))
+		a.newConvoPicker.SetUsers(msg.PickerUsers)
 		// SetExternalUsers re-pushes user-names; calling SetUserNames
 		// last is the canonical state.
 		a.SetExternalUsers(msg.ExternalUsers)
@@ -2885,6 +2940,26 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.sidebar.UpsertItem(msg.Item)
 			if cmd := a.finishPendingInitialReadyWithChannels([]sidebar.ChannelItem{msg.Item}, false); cmd != nil {
 				cmds = append(cmds, cmd)
+			}
+			// Keep both pickers in sync so a freshly-pushed DM/mpim
+			// is searchable without waiting for the next bootstrap.
+			a.channelFinder.UpsertItem(channelfinder.Item{
+				ID:       msg.Item.ID,
+				Name:     msg.Item.Name,
+				Type:     msg.Item.Type,
+				Presence: msg.Item.Presence,
+				Joined:   true,
+			})
+			a.newConvoPicker.UpsertChannel(newconvopicker.Item{
+				ID:       msg.Item.ID,
+				Kind:     newconvopicker.KindChannel,
+				Name:     msg.Item.Name,
+				Type:     msg.Item.Type,
+				Presence: msg.Item.Presence,
+				Joined:   true,
+			})
+			if msg.Item.Type == "dm" && msg.Item.DMUserID != "" {
+				a.newConvoPicker.PatchUserDMChannelID(msg.Item.DMUserID, msg.Item.ID)
 			}
 		}
 		// Inactive-workspace events update WorkspaceContext.Channels
@@ -2988,6 +3063,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			a.channelFinder.SetItems(msg.FinderItems)
 			a.globalSearch.SetItems(globalSearchItemsFromFinder(msg.FinderItems))
+			a.newConvoPicker.SetChannels(finderItemsToPickerItems(msg.FinderItems))
+			a.newConvoPicker.SetUsers(msg.PickerUsers)
 			// SetExternalUsers re-pushes user-names; calling SetUserNames
 			// last is the canonical state.
 			a.SetExternalUsers(msg.ExternalUsers)
@@ -3079,6 +3156,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		a.channelFinder.MarkJoined(msg.ID)
 		a.globalSearch.MarkJoined(msg.ID)
+		a.newConvoPicker.UpsertChannel(newconvopicker.Item{
+			ID:     msg.ID,
+			Kind:   newconvopicker.KindChannel,
+			Name:   msg.Name,
+			Type:   "channel",
+			Joined: true,
+		})
 		a.sidebar.SelectByID(msg.ID)
 		cmds = append(cmds, func() tea.Msg {
 			// ChannelJoinedMsg only fires for public channels via the
@@ -3090,6 +3174,44 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Nothing fancy yet -- could surface a status-bar toast in future.
 		log.Printf("warning: failed to join channel %s: %v", msg.Name, msg.Err)
 
+	case DMOpenedMsg:
+		// Gate on active workspace — conversations.open is async and a
+		// workspace switch may have happened while it was in flight.
+		// Non-active workspace's WorkspaceContext is updated by main.go
+		// from the WS event path; here we only mutate the live UI.
+		if msg.TeamID != a.activeTeamID {
+			break
+		}
+		// Idempotent upserts: ConversationOpenedMsg from a Slack WS
+		// event may also land for the same channel; UpsertItem handles
+		// double-add safely.
+		a.sidebar.UpsertItem(msg.SidebarItem)
+		a.channelFinder.UpsertItem(msg.FinderItem)
+		a.newConvoPicker.UpsertChannel(newconvopicker.Item{
+			ID:       msg.FinderItem.ID,
+			Kind:     newconvopicker.KindChannel,
+			Name:     msg.FinderItem.Name,
+			Type:     msg.FinderItem.Type,
+			Presence: msg.FinderItem.Presence,
+			Joined:   true,
+		})
+		// For 1:1 DMs, wire the user row's DMChannelID so subsequent
+		// picker Enters on that user short-circuit to a channel switch
+		// rather than re-calling conversations.open.
+		if msg.ChannelType == "dm" && len(msg.UserIDs) == 1 {
+			a.newConvoPicker.PatchUserDMChannelID(msg.UserIDs[0], msg.ChannelID)
+		}
+		a.sidebar.SelectByID(msg.ChannelID)
+		cmds = append(cmds, func() tea.Msg {
+			return ChannelSelectedMsg{ID: msg.ChannelID, Name: msg.ChannelName, Type: msg.ChannelType}
+		})
+
+	case DMOpenFailedMsg:
+		log.Printf("warning: failed to open DM with %v: %v", msg.UserIDs, msg.Err)
+		if msg.TeamID == a.activeTeamID {
+			cmds = append(cmds, func() tea.Msg { return ToastMsg{Text: "Could not start conversation"} })
+		}
+
 	case BrowseableChannelsLoadedMsg:
 		// Only apply to the channel finder if this matches the workspace
 		// whose items are currently loaded. Per-workspace browseable items
@@ -3097,6 +3219,16 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.TeamID == a.activeTeamID {
 			a.channelFinder.SetBrowseable(msg.Items)
 			a.globalSearch.SetBrowseable(globalSearchItemsFromFinder(msg.Items))
+			for _, it := range msg.Items {
+				a.newConvoPicker.UpsertChannel(newconvopicker.Item{
+					ID:       it.ID,
+					Kind:     newconvopicker.KindChannel,
+					Name:     it.Name,
+					Type:     it.Type,
+					Presence: it.Presence,
+					Joined:   false,
+				})
+			}
 		}
 
 	case WorkspaceFailedMsg:
@@ -3383,6 +3515,8 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return a.handleGlobalSearchMode(msg)
 	case ModeChannelSearch:
 		return a.handleChannelSearchMode(msg)
+	case ModeNewConvoPicker:
+		return a.handleNewConvoPickerMode(msg)
 	case ModeReactionPicker:
 		return a.handleReactionPickerMode(msg)
 	case ModeConfirm:
@@ -3758,6 +3892,10 @@ func (a *App) handleNormalMode(msg tea.KeyMsg) tea.Cmd {
 			a.SetMode(ModeChannelSearch)
 		}
 
+	case a.matchesKey(msg, a.keys.NewConversation):
+		a.newConvoPicker.Open()
+		a.SetMode(ModeNewConvoPicker)
+
 	case a.matchesKey(msg, a.keys.Reaction):
 		if a.focusedPanel == PanelMessages {
 			return a.openPickerFromMessage()
@@ -4123,22 +4261,7 @@ func (a *App) handleChannelFinderMode(msg tea.KeyMsg) tea.Cmd {
 		if result.Type == "activity" {
 			return func() tea.Msg { return ActivityViewActivatedMsg{} }
 		}
-		// Already-joined: switch immediately. Not joined: kick off a join
-		// command; ChannelJoinedMsg will fold the channel into the sidebar
-		// and switch to it.
-		if result.Joined {
-			a.sidebar.SelectByID(result.ID)
-			return func() tea.Msg {
-				return ChannelSelectedMsg{ID: result.ID, Name: result.Name, Type: result.Type}
-			}
-		}
-		if a.channelJoiner != nil {
-			joiner := a.channelJoiner
-			id, name := result.ID, result.Name
-			return func() tea.Msg {
-				return joiner(id, name)
-			}
-		}
+		return a.routeChannelResult(result)
 	}
 
 	// Check if finder closed itself (Esc)
@@ -4253,15 +4376,30 @@ func (a *App) handleGlobalSearchMode(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-// activeChannelSearchScope returns the scope for a Ctrl+F search rooted
-// at the currently active channel/DM. Returns ok=false when there is
-// no active channel, when the sidebar has not seen it yet, when the
-// channel type is one the scoped-search closure can't filter for
-// (group_dm — Slack's `with:` filter doesn't take a multi-user list),
-// or when the necessary metadata to build a server-side filter is
-// missing (e.g., a DM row without DMUserID). Refusing here is
-// deliberate: silently falling back to an unscoped search would lie
-// to the user about what overlay they're looking at.
+// routeChannelResult is the shared channel-row branch used by both the
+// channelfinder (ctrl+t) and the newconvopicker (n) flows. Switches
+// immediately when joined; otherwise dispatches the join callback so
+// ChannelJoinedMsg will fold the channel into the sidebar and switch.
+func (a *App) routeChannelResult(result *channelfinder.ChannelResult) tea.Cmd {
+	if result.Joined {
+		a.sidebar.SelectByID(result.ID)
+		return func() tea.Msg {
+			return ChannelSelectedMsg{ID: result.ID, Name: result.Name, Type: result.Type}
+		}
+	}
+	if a.channelJoiner != nil {
+		joiner := a.channelJoiner
+		id, name := result.ID, result.Name
+		return func() tea.Msg {
+			return joiner(id, name)
+		}
+	}
+	return nil
+}
+
+// channelMetaByID returns the sidebar's known name/type for a channel
+// ID. Used by the search and picker flows to fill in metadata when the
+// search result row only carries a channel ID.
 func (a *App) channelMetaByID(channelID string) (name, channelType string, ok bool) {
 	for _, item := range a.sidebar.Items() {
 		if item.ID == channelID {
@@ -4285,6 +4423,15 @@ func channelSearchScopeLabel(scope ChannelSearchScope) string {
 	return ""
 }
 
+// activeChannelSearchScope returns the scope for a Ctrl+F search rooted
+// at the currently active channel/DM. Returns ok=false when there is
+// no active channel, when the sidebar has not seen it yet, when the
+// channel type is one the scoped-search closure can't filter for
+// (group_dm — Slack's `with:` filter doesn't take a multi-user list),
+// or when the necessary metadata to build a server-side filter is
+// missing (e.g., a DM row without DMUserID). Refusing here is
+// deliberate: silently falling back to an unscoped search would lie
+// to the user about what overlay they're looking at.
 func (a *App) activeChannelSearchScope() (ChannelSearchScope, bool) {
 	if a.activeChannelID == "" {
 		return ChannelSearchScope{}, false
@@ -4381,6 +4528,71 @@ func (a *App) handleChannelSearchMode(msg tea.KeyMsg) tea.Cmd {
 		return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
 			return ChannelSearchDebounceMsg{TeamID: a.activeTeamID, Gen: gen}
 		})
+	}
+	return nil
+}
+
+// handleNewConvoPickerMode dispatches key events to the "new
+// conversation" overlay (triggered by `n` in normal mode). On a
+// committed Result the picker is closed and either ChannelSelectedMsg
+// or the DM-open callback fires.
+func (a *App) handleNewConvoPickerMode(msg tea.KeyMsg) tea.Cmd {
+	keyStr := msg.String()
+	switch msg.Key().Code {
+	case tea.KeyEnter:
+		// Preserve ctrl+enter as its own key string when modifiers
+		// are present (some terminals emit it as ctrl+m, but
+		// bubbletea v2 normalizes to "ctrl+enter" in String()).
+		if !strings.Contains(keyStr, "ctrl") {
+			keyStr = "enter"
+		}
+	case tea.KeyEscape:
+		keyStr = "esc"
+	case tea.KeyUp:
+		keyStr = "up"
+	case tea.KeyDown:
+		keyStr = "down"
+	case tea.KeyBackspace:
+		keyStr = "backspace"
+	}
+
+	result := a.newConvoPicker.HandleKey(keyStr)
+	if result != nil {
+		a.newConvoPicker.Close()
+		a.SetMode(ModeNormal)
+		if result.Channel != nil {
+			// If the picker short-circuited a user-row to an existing
+			// 1:1 DM, defensively re-upsert the sidebar item with the
+			// user's ID so dedup / userID-keyed lookups elsewhere are
+			// guaranteed to find the mapping (covers the case where the
+			// initial bootstrap built a dm row without DMUserID).
+			if result.DMUserID != "" && result.Channel.Type == "dm" {
+				for _, it := range a.sidebar.Items() {
+					if it.ID == result.Channel.ID {
+						if it.DMUserID == "" {
+							it.DMUserID = result.DMUserID
+							a.sidebar.UpsertItem(it)
+						}
+						break
+					}
+				}
+			}
+			return a.routeChannelResult(result.Channel)
+		}
+		if len(result.Users) > 0 && a.openDMFn != nil {
+			fn := a.openDMFn
+			team := a.activeTeamID
+			ids := make([]string, len(result.Users))
+			for i, u := range result.Users {
+				ids[i] = u.ID
+			}
+			return func() tea.Msg { return fn(team, ids) }
+		}
+		return nil
+	}
+
+	if !a.newConvoPicker.IsVisible() {
+		a.SetMode(ModeNormal)
 	}
 	return nil
 }
@@ -6393,6 +6605,33 @@ func (a *App) SetUserNames(names map[string]string) {
 	}
 	a.compose.SetUsers(users)
 	a.threadCompose.SetUsers(users)
+
+	// Late user-name resolutions should be reflected in the new-conversation
+	// picker too. main.go populates the authoritative user list via
+	// WorkspaceReadyMsg.PickerUsers; this only patches names that the picker
+	// already knows about.
+	for id, displayName := range names {
+		a.newConvoPicker.PatchUserName(id, displayName)
+	}
+}
+
+// finderItemsToPickerItems projects channelfinder.Item rows into the
+// newconvopicker's Item shape (channel rows only — the picker's user
+// rows come separately from main.go's cache.ListUsers projection).
+func finderItemsToPickerItems(in []channelfinder.Item) []newconvopicker.Item {
+	out := make([]newconvopicker.Item, 0, len(in))
+	for _, it := range in {
+		out = append(out, newconvopicker.Item{
+			ID:          it.ID,
+			Kind:        newconvopicker.KindChannel,
+			Name:        it.Name,
+			Type:        it.Type,
+			Presence:    it.Presence,
+			Joined:      it.Joined,
+			LastVisited: it.LastVisited,
+		})
+	}
+	return out
 }
 
 // SetExternalUsers replaces the set of user IDs known to be Slack
@@ -6594,6 +6833,13 @@ func (a *App) SetTypingSender(fn TypingSendFunc) {
 // SetChannelJoiner sets the callback for joining a channel via the Slack API.
 func (a *App) SetChannelJoiner(fn JoinChannelFunc) {
 	a.channelJoiner = fn
+}
+
+// SetDMOpener sets the callback for opening (or fetching) a DM / mpim
+// channel via the Slack API. Used by the new-conversation picker on
+// submission.
+func (a *App) SetDMOpener(fn OpenDMFunc) {
+	a.openDMFn = fn
 }
 
 // shouldSendTyping returns true if enough time has passed since the last typing send.
@@ -7246,6 +7492,10 @@ func (a *App) View() tea.View {
 		screen = a.channelSearch.ViewOverlay(a.width, a.height, screen)
 	}
 
+	if a.newConvoPicker.IsVisible() {
+		screen = a.newConvoPicker.ViewOverlay(a.width, a.height, screen)
+	}
+
 	if a.reactionPicker.IsVisible() {
 		screen = a.reactionPicker.ViewOverlay(a.width, a.height, screen)
 	}
@@ -7294,6 +7544,7 @@ func (a *App) View() tea.View {
 	overlayActive := a.channelFinder.IsVisible() ||
 		a.globalSearch.IsVisible() ||
 		a.channelSearch.IsVisible() ||
+		a.newConvoPicker.IsVisible() ||
 		a.reactionPicker.IsVisible() ||
 		a.confirmPrompt.IsVisible() ||
 		a.workspaceFinder.IsVisible() ||
