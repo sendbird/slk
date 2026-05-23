@@ -5688,3 +5688,30 @@ func TestGlobalSearch_KoreanInputExposesCursor(t *testing.T) {
 		t.Fatal("global search must expose a real cursor for IME composition")
 	}
 }
+
+func TestHelpOverlayIncludesSearchShortcuts(t *testing.T) {
+	app := NewApp()
+	app.width = 120
+	app.height = 40
+
+	_ = app.handleKey(tea.KeyPressMsg{Code: '?', Text: "?"})
+	if !app.help.IsVisible() {
+		t.Fatal("help overlay must open on ?")
+	}
+	entries := app.help.VisibleEntries()
+	var hasGlobalSearch, hasChannelSearch bool
+	for _, entry := range entries {
+		if entry.Key == "/" && entry.Desc == "global search" {
+			hasGlobalSearch = true
+		}
+		if entry.Key == "ctrl+f" && entry.Desc == "search in channel" {
+			hasChannelSearch = true
+		}
+	}
+	if !hasGlobalSearch {
+		t.Fatalf("help entries must include / global search: %+v", entries)
+	}
+	if !hasChannelSearch {
+		t.Fatalf("help entries must include ctrl+f channel search: %+v", entries)
+	}
+}

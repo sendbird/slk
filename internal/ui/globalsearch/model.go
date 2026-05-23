@@ -10,6 +10,8 @@
 package globalsearch
 
 import (
+	"fmt"
+	"image/color"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -157,9 +159,36 @@ func New() Model {
 	input.Prompt = ""
 	input.SetWidth(40)
 	input.SetVirtualCursor(false)
+	input.Placeholder = "Search channels, people, messages…"
 
-	bg := lipgloss.NewStyle().Background(styles.Background).Foreground(styles.TextPrimary)
-	s := input.Styles()
+	m := Model{
+		input:       input,
+		title:       "Search",
+		placeholder: "Search channels, people, messages…",
+	}
+	m.RefreshStyles()
+	return m
+}
+
+func ansiAttrs(bg, fg color.Color) string {
+	br, bgc, bb, _ := bg.RGBA()
+	fr, fgc, fb, _ := fg.RGBA()
+	return fmt.Sprintf("\x1b[48;2;%d;%d;%dm\x1b[38;2;%d;%d;%dm", br>>8, bgc>>8, bb>>8, fr>>8, fgc>>8, fb>>8)
+}
+
+func inputBackground() color.Color {
+	if styles.ComposeInsertBG != nil {
+		return styles.ComposeInsertBG
+	}
+	if styles.SurfaceDark != nil {
+		return styles.SurfaceDark
+	}
+	return styles.Background
+}
+
+func (m *Model) applyInputStyles() {
+	bg := lipgloss.NewStyle().Background(inputBackground()).Foreground(styles.TextPrimary)
+	s := m.input.Styles()
 	s.Focused.Base = bg
 	s.Focused.Text = bg
 	s.Focused.CursorLine = bg
@@ -172,14 +201,14 @@ func New() Model {
 	s.Blurred.Prompt = bg
 	s.Focused.Placeholder = bg.Foreground(styles.TextMuted)
 	s.Blurred.Placeholder = bg.Foreground(styles.TextMuted)
-	input.SetStyles(s)
-	input.Placeholder = "Search channels, people, messages…"
+	m.input.SetStyles(s)
+}
 
-	return Model{
-		input:       input,
-		title:       "Search",
-		placeholder: "Search channels, people, messages…",
-	}
+// RefreshStyles reapplies theme-derived textarea styles for the focused
+// search input. Call after styles.Apply so IME preedit and typed text
+// stay aligned with the active theme.
+func (m *Model) RefreshStyles() {
+	m.applyInputStyles()
 }
 
 // Configure updates the overlay chrome without altering results or visibility.
@@ -363,6 +392,7 @@ func (m *Model) extractRemote() []Item {
 func (m *Model) Open() {
 	m.visible = true
 	m.query = ""
+	m.RefreshStyles()
 	m.input.SetValue("")
 	m.input.Placeholder = m.placeholder
 	m.input.Focus()
@@ -778,6 +808,7 @@ func (m *Model) renderBox(termWidth int) string {
 	m.input.SetWidth(inputContentWidth)
 
 	bg := styles.Background
+	inputBG := inputBackground()
 
 	title := lipgloss.NewStyle().
 		Bold(true).
@@ -795,18 +826,20 @@ func (m *Model) renderBox(termWidth int) string {
 			Render(m.scopeLabel)
 		header = append(header, chip)
 	}
+	inputAttrs := ansiAttrs(inputBG, styles.TextPrimary)
+	inputView := messages.ReapplyBgAfterResets(m.input.View(), inputAttrs)
 	inputBody := lipgloss.NewStyle().
-		Background(bg).
+		Background(inputBG).
 		Foreground(styles.TextPrimary).
 		Width(inputContentWidth).
-		Render(m.input.View())
+		Render(inputView)
 	input := lipgloss.NewStyle().
 		BorderStyle(lipgloss.Border{Left: "▌"}).
 		BorderLeft(true).
 		BorderForeground(styles.Primary).
-		BorderBackground(bg).
+		BorderBackground(inputBG).
 		PaddingLeft(1).
-		Background(bg).
+		Background(inputBG).
 		Foreground(styles.TextPrimary).
 		Width(inputRenderWidth).
 		Render(inputBody)

@@ -2827,6 +2827,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.sidebar.InvalidateCache()
 			a.compose.RefreshStyles()
 			a.threadCompose.RefreshStyles()
+			a.globalSearch.RefreshStyles()
+			a.channelSearch.RefreshStyles()
 		}
 		a.workspaceRail.SelectByID(msg.TeamID)
 		// Synthetic last-viewed IDs encode a view restore (Threads /
@@ -2967,6 +2969,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.sidebar.InvalidateCache()
 				a.compose.RefreshStyles()
 				a.threadCompose.RefreshStyles()
+				a.globalSearch.RefreshStyles()
+				a.channelSearch.RefreshStyles()
 			}
 			a.sidebar.SetSectionsProvider(msg.SectionsProvider)
 			a.sidebar.ApplyPersistedCollapse(msg.CollapsedSections)
