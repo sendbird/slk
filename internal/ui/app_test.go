@@ -5195,14 +5195,18 @@ func TestApp_MouseWheelBurstTemporarilyDisablesMouseMode(t *testing.T) {
 	x := a.layoutRailWidth + 1
 	_, cmd := a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelDown})
 	if cmd == nil {
-		t.Fatal("first wheel event should schedule a coalesced flush")
+		t.Fatal("first wheel event should schedule coalesced flush/cooldown commands")
 	}
 	if v := a.View(); v.MouseMode != tea.MouseModeNone {
-		t.Fatalf("pending wheel burst MouseMode = %v, want MouseModeNone", v.MouseMode)
+		t.Fatalf("pending wheel cooldown MouseMode = %v, want MouseModeNone", v.MouseMode)
 	}
 
 	a.Update(mouseWheelFlushMsg{})
+	if v := a.View(); v.MouseMode != tea.MouseModeNone {
+		t.Fatalf("after wheel flush but before cooldown MouseMode = %v, want MouseModeNone", v.MouseMode)
+	}
+	a.Update(mouseWheelResumeMsg{gen: a.mouseWheelGen})
 	if v := a.View(); v.MouseMode != tea.MouseModeCellMotion {
-		t.Fatalf("after wheel flush MouseMode = %v, want MouseModeCellMotion", v.MouseMode)
+		t.Fatalf("after wheel cooldown MouseMode = %v, want MouseModeCellMotion", v.MouseMode)
 	}
 }
