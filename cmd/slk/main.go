@@ -56,6 +56,22 @@ var (
 	date    = "unknown"
 )
 
+// mostRecentlyVisitedChannelID returns the newest visited conversation ID.
+func mostRecentlyVisitedChannelID(visits map[string]int64) string {
+	var bestID string
+	var bestTS int64
+	for id, ts := range visits {
+		if id == "" {
+			continue
+		}
+		if bestID == "" || ts > bestTS || (ts == bestTS && id < bestID) {
+			bestID = id
+			bestTS = ts
+		}
+	}
+	return bestID
+}
+
 // UnresolvedDM tracks a DM channel whose user name wasn't in the initial user list.
 type UnresolvedDM struct {
 	ChannelID string
@@ -173,6 +189,10 @@ type WorkspaceContext struct {
 	// updated on every ChannelSelectedMsg via the visit recorder.
 	// Used to populate channelfinder.Item.LastVisited for sort.
 	LastVisitedByChannel map[string]int64
+	// LastViewedChannelID is the most recently visited conversation loaded
+	// from persistent channel_visits at workspace connect time. It is used
+	// to restore the initial channel/DM after an app restart.
+	LastViewedChannelID string
 	// UserResolver dispatches background users.info lookups for
 	// unknown message authors. Set in connectWorkspace once the
 	// in-memory UserNames map and the *tea.Program are both available.
@@ -912,11 +932,32 @@ func run() error {
 			if wctx == nil {
 				return
 			}
-			wctx.LastVisitedByChannel[channelID] = time.Now().Unix()
+			// Capture the visit timestamp synchronously so the async DB
+			// write below can't reorder visits that arrive close in time
+			// (e.g. user navigates A then B; without the snapshot, B's
+			// goroutine could schedule after A's and stamp A as newer,
+			// causing the next restart to restore A instead of B).
+			ts := time.Now().UnixMilli()
+			wctx.LastVisitedByChannel[channelID] = ts
+			wctx.LastViewedChannelID = channelID
 			teamID := wctx.TeamID
 			go func() {
-				if err := db.RecordChannelVisit(teamID, channelID); err != nil {
+				if err := db.RecordChannelVisit(teamID, channelID, ts); err != nil {
 					log.Printf("warning: recording channel visit %s/%s: %v", teamID, channelID, err)
+				}
+			}()
+		})
+
+		app.SetSidebarCollapsePersister(func(sectionKey string, collapsed bool) {
+			wctx := router.Active()
+			if wctx == nil {
+				return
+			}
+			teamID := wctx.TeamID
+			go func() {
+				if err := db.SetSidebarSectionCollapsed(teamID, sectionKey, collapsed); err != nil {
+					log.Printf("warning: persisting sidebar collapse %s/%s=%v: %v",
+						teamID, sectionKey, collapsed, err)
 				}
 			}()
 		})
@@ -1377,18 +1418,24 @@ func run() error {
 			}
 		}
 
+		collapsed, err := db.GetSidebarSectionCollapsed(wctx.TeamID)
+		if err != nil {
+			log.Printf("warning: loading sidebar collapse state for %s: %v", wctx.TeamID, err)
+		}
 		return ui.WorkspaceSwitchedMsg{
-			TeamID:           wctx.TeamID,
-			TeamName:         wctx.TeamName,
-			Theme:            cfg.ResolveTheme(teamID),
-			Channels:         wctx.Channels,
-			FinderItems:      wctx.FinderItems,
-			UserNames:        wctx.UserNames,
-			ExternalUsers:    external,
-			UserID:           wctx.UserID,
-			CustomEmoji:      wctx.CustomEmoji,
-			SlashCommands:    wctx.SlashCommands,
-			SectionsProvider: sectionsProviderAdapter{store: wctx.SectionStore},
+			TeamID:              wctx.TeamID,
+			TeamName:            wctx.TeamName,
+			Theme:               cfg.ResolveTheme(teamID),
+			Channels:            wctx.Channels,
+			FinderItems:         wctx.FinderItems,
+			UserNames:           wctx.UserNames,
+			ExternalUsers:       external,
+			UserID:              wctx.UserID,
+			CustomEmoji:         wctx.CustomEmoji,
+			SlashCommands:       wctx.SlashCommands,
+			SectionsProvider:    sectionsProviderAdapter{store: wctx.SectionStore},
+			LastViewedChannelID: wctx.LastViewedChannelID,
+			CollapsedSections:   collapsed,
 		}
 	})
 
@@ -1522,19 +1569,25 @@ func run() error {
 				}
 			}
 
+			collapsed, err := db.GetSidebarSectionCollapsed(wctx.TeamID)
+			if err != nil {
+				log.Printf("warning: loading sidebar collapse state for %s: %v", wctx.TeamID, err)
+			}
 			p.Send(ui.WorkspaceReadyMsg{
-				TeamID:           wctx.TeamID,
-				TeamName:         wctx.TeamName,
-				Theme:            cfg.ResolveTheme(wctx.TeamID),
-				Channels:         wctx.Channels,
-				FinderItems:      wctx.FinderItems,
-				UserNames:        wctx.UserNames,
-				ExternalUsers:    external,
-				UserID:           wctx.UserID,
-				CustomEmoji:      wctx.CustomEmoji, // empty at this point; filled by the goroutine below
-				SlashCommands:    wctx.SlashCommands,
-				SectionsProvider: sectionsProviderAdapter{store: wctx.SectionStore},
-				InitialActive:    isInitial,
+				TeamID:              wctx.TeamID,
+				TeamName:            wctx.TeamName,
+				Theme:               cfg.ResolveTheme(wctx.TeamID),
+				Channels:            wctx.Channels,
+				FinderItems:         wctx.FinderItems,
+				UserNames:           wctx.UserNames,
+				ExternalUsers:       external,
+				UserID:              wctx.UserID,
+				CustomEmoji:         wctx.CustomEmoji, // empty at this point; filled by the goroutine below
+				SlashCommands:       wctx.SlashCommands,
+				SectionsProvider:    sectionsProviderAdapter{store: wctx.SectionStore},
+				LastViewedChannelID: wctx.LastViewedChannelID,
+				InitialActive:       isInitial,
+				CollapsedSections:   collapsed,
 			})
 
 			// Fetch workspace custom emojis in the background. When done,
@@ -1761,6 +1814,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		log.Printf("warning: loading channel visits for %s: %v", token.TeamName, err)
 	} else {
 		wctx.LastVisitedByChannel = visits
+		wctx.LastViewedChannelID = mostRecentlyVisitedChannelID(visits)
 	}
 	if commands, err := client.ListSlashCommands(ctx); err == nil {
 		if pickerCommands := buildSlashPickerCommands(commands); len(pickerCommands) > 0 {
@@ -1895,9 +1949,10 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		updates := make([]cache.ChannelReadStateUpdate, 0, len(unreadCounts))
 		for _, u := range unreadCounts {
 			updates = append(updates, cache.ChannelReadStateUpdate{
-				ChannelID:  u.ChannelID,
-				LastReadTS: u.LastRead, // may be ""; BatchUpdate preserves existing in that case
-				HasUnread:  u.HasUnread,
+				ChannelID:    u.ChannelID,
+				LastReadTS:   u.LastRead, // may be ""; BatchUpdate preserves existing in that case
+				HasUnread:    u.HasUnread,
+				MentionCount: u.MentionCount,
 			})
 		}
 		if err := db.BatchUpdateChannelReadState(updates); err != nil {
@@ -2078,6 +2133,20 @@ func pickAttachmentURL(f slack.File, kind string) string {
 		return f.Permalink
 	}
 	return f.URLPrivate
+}
+
+// containsSelfMention reports whether text contains a Slack-style
+// angle-bracketed mention of selfUserID, e.g. "<@U12345>". This is the
+// exact form the realtime message handler sees on the wire, so a
+// substring check is sufficient. Both arguments must be non-empty for
+// the answer to be true; callers pass an empty selfUserID before the
+// bootstrap resolves the workspace's own user, and we treat that as
+// "no mentions detectable yet" rather than matching everything.
+func containsSelfMention(text, selfUserID string) bool {
+	if text == "" || selfUserID == "" {
+		return false
+	}
+	return strings.Contains(text, "<@"+selfUserID+">")
 }
 
 // resolveUserCached returns the display name for userID using only
@@ -2918,6 +2987,40 @@ func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subty
 	if h.db != nil && shouldMarkChannel && activeChIDForRead != channelID {
 		if err := h.db.UpdateChannelReadState(channelID, "", true); err != nil {
 			log.Printf("Warning: failed to set has_unread for %s: %v", channelID, err)
+		}
+		// Bump mention_count when this message @-mentions the current
+		// user. Restricted to top-level channel messages (the same gate
+		// as has_unread, since channel_marked is the only mechanism
+		// that clears the count back to 0). Exclusions:
+		//
+		//   - Edits (edited=true / subtype="message_changed") are not
+		//     new mentions; they would double-count a still-unread
+		//     message and could fabricate a mention badge on an
+		//     already-read message that the sender edited to add a
+		//     mention after the user had moved on.
+		//   - Messages authored by the current user (e.g., from another
+		//     Slack client) — Slack never counts your own messages as
+		//     mentions of yourself.
+		//   - Non-channel types: only public/private channels surface
+		//     the mention badge in the sidebar (sidebar.isChannelType
+		//     and the bootstrap path keep "channel" + "private" as
+		//     the read side). Anything else (1:1 DMs, group DMs, apps)
+		//     must not write to mention_count, otherwise the column
+		//     accumulates values that nothing renders — silent storage
+		//     drift and a foot-gun for the next person to touch the
+		//     read path. 1:1 DMs additionally lack mention_count on
+		//     the wire (client.counts.Ims), so any value we'd write
+		//     would also diverge from Slack's authoritative state.
+		chType := h.channelTypes[channelID]
+		isChannelKind := chType == "channel" || chType == "private"
+		if h.currentUserID != "" &&
+			userID != h.currentUserID &&
+			!edited &&
+			isChannelKind &&
+			containsSelfMention(text, h.currentUserID) {
+			if _, err := h.db.IncrementChannelMentionCountIfUnread(channelID); err != nil {
+				log.Printf("Warning: failed to bump mention_count for %s: %v", channelID, err)
+			}
 		}
 	}
 

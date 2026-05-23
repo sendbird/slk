@@ -12,10 +12,11 @@ func TestRecordAndGetChannelVisit(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.RecordChannelVisit("T1", "C1"); err != nil {
+	now := time.Now().UnixMilli()
+	if err := db.RecordChannelVisit("T1", "C1", now); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	if err := db.RecordChannelVisit("T1", "C2"); err != nil {
+	if err := db.RecordChannelVisit("T1", "C2", now+1); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 
@@ -31,28 +32,52 @@ func TestRecordAndGetChannelVisit(t *testing.T) {
 	}
 }
 
-func TestRecordChannelVisitLastWriteWins(t *testing.T) {
+// TestRecordChannelVisitPreservesCallerOrder verifies that consecutive
+// visits within the same millisecond keep the caller-supplied ordering
+// when distinct timestamps are passed. This is the property the restore
+// path relies on so the last viewed channel is unambiguous even when
+// async DB writes complete out of order.
+func TestRecordChannelVisitPreservesCallerOrder(t *testing.T) {
 	db, err := New(":memory:")
 	if err != nil {
 		t.Fatalf("opening db: %v", err)
 	}
 	defer db.Close()
 
-	if err := db.RecordChannelVisit("T1", "C1"); err != nil {
+	if err := db.RecordChannelVisit("T1", "C1", 100); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	first, _ := db.GetChannelVisits("T1")
-	firstTS := first["C1"]
-
-	// Sleep just over a second so the unix-second timestamp definitely advances.
-	time.Sleep(1100 * time.Millisecond)
-
-	if err := db.RecordChannelVisit("T1", "C1"); err != nil {
+	if err := db.RecordChannelVisit("T1", "C1", 200); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	second, _ := db.GetChannelVisits("T1")
-	if second["C1"] <= firstTS {
-		t.Fatalf("expected later timestamp on second visit; first=%d second=%d", firstTS, second["C1"])
+	visits, _ := db.GetChannelVisits("T1")
+	if visits["C1"] != 200 {
+		t.Fatalf("expected later caller timestamp to win; got %d", visits["C1"])
+	}
+}
+
+// TestRecordChannelVisitIsMonotonic verifies that an older timestamp
+// landing after a newer one cannot roll the stored value back. Without
+// this guarantee, two goroutines racing into SQLite for the same channel
+// can leave the row stamped with the earlier visit even though the user
+// actually selected it later -- breaking both finder recency and
+// restart restoration.
+func TestRecordChannelVisitIsMonotonic(t *testing.T) {
+	db, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("opening db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.RecordChannelVisit("T1", "C1", 200); err != nil {
+		t.Fatalf("record newer: %v", err)
+	}
+	if err := db.RecordChannelVisit("T1", "C1", 100); err != nil {
+		t.Fatalf("record older: %v", err)
+	}
+	visits, _ := db.GetChannelVisits("T1")
+	if visits["C1"] != 200 {
+		t.Fatalf("expected stored timestamp to stay at the newer value 200; got %d", visits["C1"])
 	}
 }
 
@@ -63,10 +88,11 @@ func TestGetChannelVisitsIsolatesWorkspaces(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.RecordChannelVisit("T1", "C1"); err != nil {
+	now := time.Now().UnixMilli()
+	if err := db.RecordChannelVisit("T1", "C1", now); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	if err := db.RecordChannelVisit("T2", "C2"); err != nil {
+	if err := db.RecordChannelVisit("T2", "C2", now); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 
