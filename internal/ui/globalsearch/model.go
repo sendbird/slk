@@ -12,9 +12,9 @@ package globalsearch
 import (
 	"sort"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
+	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/gammons/slk/internal/text"
@@ -87,6 +87,7 @@ type Item struct {
 	// correct channel / file. Empty for local items.
 	ChannelID   string
 	ChannelName string
+	ChannelType string
 	MessageTS   string
 	Permalink   string
 }
@@ -123,15 +124,20 @@ type Result struct {
 	// (PR3) or open a file URL.
 	ChannelID   string
 	ChannelName string
+	ChannelType string
 	MessageTS   string
 	Permalink   string
 }
 
 // Model is the overlay state.
 type Model struct {
-	items   []Item
-	query   string
-	visible bool
+	items       []Item
+	query       string
+	visible     bool
+	input       textarea.Model
+	title       string
+	placeholder string
+	scopeLabel  string
 
 	// filter() output:
 	sectionItems map[string][]int // category -> indexes into items
@@ -142,14 +148,61 @@ type Model struct {
 
 // New returns an empty overlay (hidden).
 func New() Model {
-	return Model{}
+	input := textarea.New()
+	input.CharLimit = 2000
+	input.MaxHeight = 8
+	input.MinHeight = 1
+	input.SetHeight(1)
+	input.ShowLineNumbers = false
+	input.Prompt = ""
+	input.SetWidth(40)
+	input.SetVirtualCursor(false)
+
+	bg := lipgloss.NewStyle().Background(styles.Background).Foreground(styles.TextPrimary)
+	s := input.Styles()
+	s.Focused.Base = bg
+	s.Focused.Text = bg
+	s.Focused.CursorLine = bg
+	s.Focused.EndOfBuffer = bg
+	s.Focused.Prompt = bg
+	s.Blurred.Base = bg
+	s.Blurred.Text = bg
+	s.Blurred.CursorLine = bg
+	s.Blurred.EndOfBuffer = bg
+	s.Blurred.Prompt = bg
+	s.Focused.Placeholder = bg.Foreground(styles.TextMuted)
+	s.Blurred.Placeholder = bg.Foreground(styles.TextMuted)
+	input.SetStyles(s)
+	input.Placeholder = "Search channels, people, messages…"
+
+	return Model{
+		input:       input,
+		title:       "Search",
+		placeholder: "Search channels, people, messages…",
+	}
+}
+
+// Configure updates the overlay chrome without altering results or visibility.
+func (m *Model) Configure(title, placeholder, scopeLabel string) {
+	if strings.TrimSpace(title) == "" {
+		title = "Search"
+	}
+	if strings.TrimSpace(placeholder) == "" {
+		placeholder = "Search…"
+	}
+	m.title = title
+	m.placeholder = placeholder
+	m.scopeLabel = strings.TrimSpace(scopeLabel)
+	m.input.Placeholder = placeholder
 }
 
 // SetItems replaces the non-synthetic items, preserving any previously
 // registered synthetic rows.
 func (m *Model) SetItems(items []Item) {
 	synth := m.extractSynthetic()
+	remote := m.extractRemote()
 	m.items = append(synth, items...)
+	m.items = append(m.items, remote...)
 	if m.visible {
 		m.filter()
 	}
@@ -296,10 +349,23 @@ func (m *Model) extractSynthetic() []Item {
 	return synth
 }
 
+func (m *Model) extractRemote() []Item {
+	var remote []Item
+	for _, it := range m.items {
+		if c := it.Category(); c == CategoryMessage || c == CategoryFile {
+			remote = append(remote, it)
+		}
+	}
+	return remote
+}
+
 // Open shows the overlay and resets state.
 func (m *Model) Open() {
 	m.visible = true
 	m.query = ""
+	m.input.SetValue("")
+	m.input.Placeholder = m.placeholder
+	m.input.Focus()
 	m.selected = 0
 	m.clearRemote()
 	m.filter()
@@ -308,6 +374,7 @@ func (m *Model) Open() {
 // Close hides the overlay.
 func (m *Model) Close() {
 	m.visible = false
+	m.input.Blur()
 	// Drop remote results so a debounced Cmd that lands after the
 	// overlay closed can't seed stale rows into the next Open().
 	m.clearRemote()
@@ -324,11 +391,11 @@ func (m Model) Query() string { return m.query }
 // results landed in the right bucket without poking at internals.
 func (m Model) SectionLen(cat string) int { return len(m.sectionItems[cat]) }
 
-// HandleKey is the input entrypoint. Returns a Result when the user
-// confirms a selection, otherwise nil.
-func (m *Model) HandleKey(keyStr string) *Result {
-	switch keyStr {
-	case "enter":
+// HandleKeyMsg is the input entrypoint for real Bubble Tea key events.
+// Returns a Result when the user confirms a selection, otherwise nil.
+func (m *Model) HandleKeyMsg(msg tea.KeyMsg) (*Result, tea.Cmd) {
+	switch msg.Key().Code {
+	case tea.KeyEnter:
 		if len(m.flat) > 0 && m.selected >= 0 && m.selected < len(m.flat) {
 			idx := m.flat[m.selected]
 			it := m.items[idx]
@@ -339,47 +406,90 @@ func (m *Model) HandleKey(keyStr string) *Result {
 				Joined:      it.Joined,
 				ChannelID:   it.ChannelID,
 				ChannelName: it.ChannelName,
+				ChannelType: it.ChannelType,
 				MessageTS:   it.MessageTS,
 				Permalink:   it.Permalink,
-			}
+			}, nil
 		}
-		return nil
-	case "esc":
+		return nil, nil
+	case tea.KeyEscape:
 		m.Close()
-		return nil
-	case "down", "ctrl+n":
+		return nil, nil
+	case tea.KeyDown:
 		if m.selected < len(m.flat)-1 {
 			m.selected++
 		}
-		return nil
-	case "up", "ctrl+p":
+		return nil, nil
+	case tea.KeyUp:
 		if m.selected > 0 {
 			m.selected--
 		}
-		return nil
-	case "backspace":
-		if n := len(m.query); n > 0 {
-			// Trim one rune, not one byte — `len(query)-1` mangles
-			// trailing multi-byte runes like Korean syllables.
-			_, sz := utf8.DecodeLastRuneInString(m.query)
-			m.query = m.query[:n-sz]
-			m.selected = 0
-			m.clearRemote()
-			m.filter()
+		return nil, nil
+	}
+	if msg.Key().Mod == tea.ModCtrl {
+		switch msg.Key().Code {
+		case 'n':
+			if m.selected < len(m.flat)-1 {
+				m.selected++
+			}
+			return nil, nil
+		case 'p':
+			if m.selected > 0 {
+				m.selected--
+			}
+			return nil, nil
 		}
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	m.syncQueryFromInput()
+	return nil, cmd
+}
+
+// HandleKey is a small test-friendly wrapper around HandleKeyMsg.
+func (m *Model) HandleKey(keyStr string) *Result {
+	switch keyStr {
+	case "enter":
+		res, _ := m.HandleKeyMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
+		return res
+	case "esc":
+		res, _ := m.HandleKeyMsg(tea.KeyPressMsg{Code: tea.KeyEscape})
+		return res
+	case "down":
+		res, _ := m.HandleKeyMsg(tea.KeyPressMsg{Code: tea.KeyDown})
+		return res
+	case "up":
+		res, _ := m.HandleKeyMsg(tea.KeyPressMsg{Code: tea.KeyUp})
+		return res
+	case "backspace":
+		res, _ := m.HandleKeyMsg(tea.KeyPressMsg{Code: tea.KeyBackspace})
+		return res
+	case "ctrl+n":
+		res, _ := m.HandleKeyMsg(tea.KeyPressMsg{Code: 'n', Mod: tea.ModCtrl, Text: "n"})
+		return res
+	case "ctrl+p":
+		res, _ := m.HandleKeyMsg(tea.KeyPressMsg{Code: 'p', Mod: tea.ModCtrl, Text: "p"})
+		return res
+	}
+	if strings.Contains(keyStr, "+") {
 		return nil
 	}
-	// Accept any single printable rune as input. The previous
-	// ASCII-only guard silently dropped Korean / CJK / accented input,
-	// so users couldn't search channels or people whose names are not
-	// pure ASCII.
-	if r, sz := utf8.DecodeRuneInString(keyStr); sz == len(keyStr) && r != utf8.RuneError && !unicode.IsControl(r) {
-		m.query += keyStr
-		m.selected = 0
-		m.clearRemote()
-		m.filter()
+	if r, sz := utf8.DecodeRuneInString(keyStr); sz == len(keyStr) && r != utf8.RuneError {
+		res, _ := m.HandleKeyMsg(tea.KeyPressMsg{Code: r, Text: keyStr})
+		return res
 	}
 	return nil
+}
+
+func (m *Model) syncQueryFromInput() {
+	q := m.input.Value()
+	if q == m.query {
+		return
+	}
+	m.query = q
+	m.selected = 0
+	m.clearRemote()
+	m.filter()
 }
 
 type match struct {
@@ -578,12 +688,12 @@ func isSeparator(r rune) bool {
 }
 
 // View returns the overlay box only.
-func (m Model) View(termWidth int) string {
+func (m *Model) View(termWidth int) string {
 	return m.renderBox(termWidth)
 }
 
 // ViewOverlay composites the centered modal over a dimmed backdrop.
-func (m Model) ViewOverlay(termWidth, termHeight int, background string) string {
+func (m *Model) ViewOverlay(termWidth, termHeight int, background string) string {
 	if !m.visible {
 		return background
 	}
@@ -600,12 +710,16 @@ func (m Model) ViewOverlay(termWidth, termHeight int, background string) string 
 // terminal cursor, so without this method Korean / CJK input was
 // either invisible (cursor pointed elsewhere on screen) or rendered
 // behind the modal. Returns nil when the overlay is hidden.
-func (m Model) Cursor(termWidth, termHeight int) *tea.Cursor {
+func (m *Model) Cursor(termWidth, termHeight int) *tea.Cursor {
 	if !m.visible {
 		return nil
 	}
 	box := m.renderBox(termWidth)
 	if box == "" {
+		return nil
+	}
+	c := m.input.Cursor()
+	if c == nil {
 		return nil
 	}
 	modalW := lipgloss.Width(box)
@@ -618,23 +732,13 @@ func (m Model) Cursor(termWidth, termHeight int) *tea.Cursor {
 	if startY < 0 {
 		startY = 0
 	}
-	// Inside the modal box, the input line layout is:
-	//   col 0  : box border
-	//   col 1  : box padding
-	//   col 2  : input's BorderLeft ("▌")
-	//   col 3  : input's PaddingLeft
-	//   col 4+ : query text begins
-	// And vertically:
-	//   row 0  : box border
-	//   row 1  : box padding
-	//   row 2  : title
-	//   row 3  : input (where we want the cursor)
-	inputColX := startX + 4
-	inputRowY := startY + 3
-	cursorX := inputColX + lipgloss.Width(m.query)
-	return &tea.Cursor{
-		Position: tea.Position{X: cursorX, Y: inputRowY},
+	inputRow := 1
+	if m.scopeLabel != "" {
+		inputRow++
 	}
+	c.Position.X += startX + 4
+	c.Position.Y += startY + 2 + inputRow
+	return c
 }
 
 func sectionLabel(cat string) string {
@@ -653,7 +757,7 @@ func sectionLabel(cat string) string {
 	return cat
 }
 
-func (m Model) renderBox(termWidth int) string {
+func (m *Model) renderBox(termWidth int) string {
 	if !m.visible {
 		return ""
 	}
@@ -666,6 +770,12 @@ func (m Model) renderBox(termWidth int) string {
 		overlayWidth = 90
 	}
 	innerWidth := overlayWidth - 4
+	inputRenderWidth := innerWidth - 1
+	inputContentWidth := inputRenderWidth - 1
+	if inputContentWidth < 8 {
+		inputContentWidth = 8
+	}
+	m.input.SetWidth(inputContentWidth)
 
 	bg := styles.Background
 
@@ -673,15 +783,23 @@ func (m Model) renderBox(termWidth int) string {
 		Bold(true).
 		Background(bg).
 		Foreground(styles.Primary).
-		Render("Search")
+		Render(m.title)
 
-	var inputText string
-	if m.query == "" {
-		placeholder := lipgloss.NewStyle().Background(bg).Foreground(styles.TextMuted).Render("Search channels, people, messages…")
-		inputText = placeholder
-	} else {
-		inputText = m.query
+	var header []string
+	header = append(header, title)
+	if m.scopeLabel != "" {
+		chip := lipgloss.NewStyle().
+			Background(styles.SurfaceDark).
+			Foreground(styles.TextMuted).
+			Padding(0, 1).
+			Render(m.scopeLabel)
+		header = append(header, chip)
 	}
+	inputBody := lipgloss.NewStyle().
+		Background(bg).
+		Foreground(styles.TextPrimary).
+		Width(inputContentWidth).
+		Render(m.input.View())
 	input := lipgloss.NewStyle().
 		BorderStyle(lipgloss.Border{Left: "▌"}).
 		BorderLeft(true).
@@ -690,7 +808,9 @@ func (m Model) renderBox(termWidth int) string {
 		PaddingLeft(1).
 		Background(bg).
 		Foreground(styles.TextPrimary).
-		Render(inputText)
+		Width(inputRenderWidth).
+		Render(inputBody)
+	header = append(header, input)
 
 	contentWidth := innerWidth - 1 // leading indicator column
 
@@ -763,7 +883,7 @@ func (m Model) renderBox(termWidth int) string {
 			Render(label))
 	}
 
-	content := title + "\n" + input + "\n\n" + strings.Join(rows, "\n")
+	content := strings.Join(header, "\n") + "\n\n" + strings.Join(rows, "\n")
 	content = messages.ReapplyBgAfterResets(content, messages.BgANSI()+messages.FgANSI())
 
 	return lipgloss.NewStyle().

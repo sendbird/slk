@@ -474,3 +474,29 @@ func TestEnterOnMessageResultCarriesChannelMetadata(t *testing.T) {
 		t.Fatalf("Result.Type: got %q want \"message\"", res.Type)
 	}
 }
+
+func TestScopeLabelRenderedSeparateFromQuery(t *testing.T) {
+	mv := New()
+	m := &mv
+	m.Configure("Search", "Search messages in this conversation…", "in #eng-deploy")
+	m.Open()
+
+	rendered := m.View(80)
+	if !strings.Contains(rendered, "in #eng-deploy") {
+		t.Fatalf("scope label must be rendered in the overlay:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "in:eng-deploy") {
+		t.Fatalf("wire syntax must stay hidden from the UI:\n%s", rendered)
+	}
+}
+
+func TestCursorAvailableForKoreanFocusedInput(t *testing.T) {
+	mv := New()
+	m := &mv
+	m.Open()
+	m.HandleKey("한")
+
+	if c := m.Cursor(80, 24); c == nil {
+		t.Fatal("focused search overlay must expose a real terminal cursor for IME composition")
+	}
+}

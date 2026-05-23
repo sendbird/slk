@@ -24,8 +24,8 @@ import (
 // workspaces.
 //
 // Returns an empty string if no prefix can be derived, in which case
-// the caller should run an unscoped search rather than block on a
-// scope mismatch.
+// the caller must fail closed rather than silently falling back to a
+// misleadingly unscoped search.
 func channelSearchPrefix(scope ui.ChannelSearchScope) string {
 	switch scope.Type {
 	case "channel", "private":
@@ -64,8 +64,9 @@ func messageHitsToItems(hits []slackclient.MessageSearchHit, userNames map[strin
 		// on one terminal line.
 		preview := strings.ReplaceAll(h.Text, "\n", " ")
 		preview = strings.TrimSpace(preview)
-		if len(preview) > 80 {
-			preview = preview[:80] + "…"
+		previewRunes := []rune(preview)
+		if len(previewRunes) > 80 {
+			preview = string(previewRunes[:80]) + "…"
 		}
 		label := fmt.Sprintf("%s — %s", name, preview)
 		out = append(out, globalsearch.Item{
@@ -75,6 +76,7 @@ func messageHitsToItems(hits []slackclient.MessageSearchHit, userNames map[strin
 			Type:        "message",
 			ChannelID:   h.ChannelID,
 			ChannelName: h.ChannelName,
+			ChannelType: h.ChannelType,
 			MessageTS:   h.TS,
 			Permalink:   h.Permalink,
 		})

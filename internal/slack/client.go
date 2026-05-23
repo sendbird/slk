@@ -660,11 +660,25 @@ func (c *Client) SendMessage(ctx context.Context, channelID, text string) (strin
 type MessageSearchHit struct {
 	ChannelID   string
 	ChannelName string
+	ChannelType string
 	UserID      string
 	Username    string
 	Text        string
 	TS          string
 	Permalink   string
+}
+
+func searchMessageChannelType(ch slack.CtxChannel) string {
+	switch {
+	case strings.HasPrefix(ch.ID, "D"):
+		return "dm"
+	case ch.IsMPIM:
+		return "group_dm"
+	case ch.IsPrivate:
+		return "private"
+	default:
+		return "channel"
+	}
 }
 
 // FileSearchHit is a normalized file-search result.
@@ -697,6 +711,7 @@ func (c *Client) SearchMessages(ctx context.Context, query string, count int) ([
 		hits = append(hits, MessageSearchHit{
 			ChannelID:   m.Channel.ID,
 			ChannelName: m.Channel.Name,
+			ChannelType: searchMessageChannelType(m.Channel),
 			UserID:      m.User,
 			Username:    m.Username,
 			Text:        m.Text,

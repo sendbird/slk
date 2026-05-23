@@ -27,11 +27,11 @@ import (
 	"github.com/gammons/slk/internal/slack/mrkdwn"
 	"github.com/gammons/slk/internal/ui/activityview"
 	"github.com/gammons/slk/internal/ui/channelfinder"
-	"github.com/gammons/slk/internal/ui/globalsearch"
 	"github.com/gammons/slk/internal/ui/channelpicker"
 	"github.com/gammons/slk/internal/ui/compose"
 	"github.com/gammons/slk/internal/ui/confirmprompt"
 	"github.com/gammons/slk/internal/ui/filepicker"
+	"github.com/gammons/slk/internal/ui/globalsearch"
 	"github.com/gammons/slk/internal/ui/help"
 	"github.com/gammons/slk/internal/ui/imgrender"
 	"github.com/gammons/slk/internal/ui/mentionpicker"
@@ -418,13 +418,15 @@ type (
 	// drops the message if Gen != app.searchGen at fire time (newer
 	// keystrokes already invalidated this tick).
 	SearchDebounceMsg struct {
-		Gen uint64
+		TeamID string
+		Gen    uint64
 	}
 	// SearchResultsMsg carries remote search results back from a
 	// SearchFunc dispatched by SearchDebounceMsg. The handler drops the
 	// message if Gen / Query no longer match (a newer query already
 	// superseded this fetch).
 	SearchResultsMsg struct {
+		TeamID   string
 		Gen      uint64
 		Query    string
 		Messages []globalsearch.Item
@@ -435,18 +437,36 @@ type (
 	// ChannelSearchDebounceMsg is the Ctrl+F counterpart to
 	// SearchDebounceMsg, scoped to a single channel/DM.
 	ChannelSearchDebounceMsg struct {
-		Gen uint64
+		TeamID string
+		Gen    uint64
 	}
 
 	// ChannelSearchResultsMsg carries channel-scoped server search
 	// results. Same stale-state guards as SearchResultsMsg apply.
 	ChannelSearchResultsMsg struct {
+		TeamID   string
 		Gen      uint64
 		Query    string
 		Messages []globalsearch.Item
 		Err      error
 	}
 )
+
+type searchContextKey string
+
+const searchTeamIDContextKey searchContextKey = "search_team_id"
+
+func WithSearchTeamID(ctx context.Context, teamID string) context.Context {
+	if strings.TrimSpace(teamID) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, searchTeamIDContextKey, teamID)
+}
+
+func SearchTeamIDFromContext(ctx context.Context) string {
+	teamID, _ := ctx.Value(searchTeamIDContextKey).(string)
+	return teamID
+}
 
 type loadingEntry struct {
 	TeamName string
@@ -3157,6 +3177,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Drop stale ticks: only the most recent generation should
 		// trigger a network call. Also drop if the overlay closed or
 		// the query reset to empty in the interim.
+		if msg.TeamID != "" && msg.TeamID != a.activeTeamID {
+			break
+		}
 		if msg.Gen != a.searchGen {
 			break
 		}
@@ -3171,19 +3194,19 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		gen := a.searchGen
+		teamID := a.activeTeamID
 		searcher := a.remoteSearcher
 		cmds = append(cmds, func() tea.Msg {
-			// Use a background context bounded by SearchFunc; the
-			// 193082a deadlock-fix lesson is: do not call p.Send
-			// from this goroutine. SearchFunc returns the SearchResultsMsg
-			// directly via tea.Cmd.
-			return searcher(context.Background(), q, gen)
+			return searcher(WithSearchTeamID(context.Background(), teamID), q, gen)
 		})
 
 	case SearchResultsMsg:
 		// Stale-result guards mirror the debounce path: drop if the
 		// user has typed further (gen mismatch), if the query no
 		// longer matches, or if the overlay closed in the meantime.
+		if msg.TeamID != "" && msg.TeamID != a.activeTeamID {
+			break
+		}
 		if msg.Gen != a.searchGen {
 			break
 		}
@@ -3194,9 +3217,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		if msg.Err != nil {
-			// Remote search failed (rate limited, network, scope, …).
-			// Surface a toast and keep the local results visible so
-			// channels/people search still works.
 			cmds = append(cmds, func() tea.Msg {
 				return ToastMsg{Text: "Search failed: " + msg.Err.Error()}
 			})
@@ -3206,6 +3226,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.globalSearch.SetFileResults(msg.Query, msg.Files)
 
 	case ChannelSearchDebounceMsg:
+		if msg.TeamID != "" && msg.TeamID != a.activeTeamID {
+			break
+		}
 		if msg.Gen != a.channelSearchGen {
 			break
 		}
@@ -3220,13 +3243,17 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		gen := a.channelSearchGen
+		teamID := a.activeTeamID
 		scope := a.channelSearchScope
 		searcher := a.channelRemoteSearcher
 		cmds = append(cmds, func() tea.Msg {
-			return searcher(context.Background(), scope, q, gen)
+			return searcher(WithSearchTeamID(context.Background(), teamID), scope, q, gen)
 		})
 
 	case ChannelSearchResultsMsg:
+		if msg.TeamID != "" && msg.TeamID != a.activeTeamID {
+			break
+		}
 		if msg.Gen != a.channelSearchGen {
 			break
 		}
@@ -3713,12 +3740,15 @@ func (a *App) handleNormalMode(msg tea.KeyMsg) tea.Cmd {
 		a.SetMode(ModeChannelFinder)
 
 	case a.matchesKey(msg, a.keys.SearchMode):
+		a.globalSearch.Configure("Search", "Search channels, people, messages…", "")
 		a.globalSearch.Open()
+		a.searchLastQuery = ""
 		a.SetMode(ModeSearch)
 
 	case a.matchesKey(msg, a.keys.ChannelSearch):
 		if scope, ok := a.activeChannelSearchScope(); ok {
 			a.channelSearchScope = scope
+			a.channelSearch.Configure("Search", "Search messages in this conversation…", channelSearchScopeLabel(scope))
 			a.channelSearch.Open()
 			a.channelSearchLastQuery = ""
 			a.SetMode(ModeChannelSearch)
@@ -4062,7 +4092,6 @@ func (a *App) handleCommandMode(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (a *App) handleChannelFinderMode(msg tea.KeyMsg) tea.Cmd {
-	// Map tea.KeyMsg to string for the finder
 	keyStr := msg.String()
 	switch msg.Key().Code {
 	case tea.KeyEnter:
@@ -4123,21 +4152,10 @@ func (a *App) handleChannelFinderMode(msg tea.KeyMsg) tea.Cmd {
 // switch, join, view activation) so behavior stays consistent with
 // Ctrl+T.
 func (a *App) handleGlobalSearchMode(msg tea.KeyMsg) tea.Cmd {
-	keyStr := msg.String()
-	switch msg.Key().Code {
-	case tea.KeyEnter:
-		keyStr = "enter"
-	case tea.KeyEscape:
-		keyStr = "esc"
-	case tea.KeyUp:
-		keyStr = "up"
-	case tea.KeyDown:
-		keyStr = "down"
-	case tea.KeyBackspace:
-		keyStr = "backspace"
+	result, inputCmd := a.globalSearch.HandleKeyMsg(msg)
+	if inputCmd != nil {
+		return inputCmd
 	}
-
-	result := a.globalSearch.HandleKey(keyStr)
 	if result != nil {
 		a.globalSearch.Close()
 		a.SetMode(ModeNormal)
@@ -4152,9 +4170,20 @@ func (a *App) handleGlobalSearchMode(msg tea.KeyMsg) tea.Cmd {
 		// approximation: opening the message's channel surfaces the
 		// thread without a precise scroll.
 		if result.Type == "message" && result.ChannelID != "" {
-			channelID, channelName := result.ChannelID, result.ChannelName
+			channelID, channelName, channelType := result.ChannelID, result.ChannelName, result.ChannelType
+			if metaName, metaType, ok := a.channelMetaByID(channelID); ok {
+				if channelName == "" {
+					channelName = metaName
+				}
+				if channelType == "" {
+					channelType = metaType
+				}
+			}
 			if channelName == "" {
-				channelName = result.Name
+				channelName = channelID
+			}
+			if channelType == "" {
+				channelType = "channel"
 			}
 			// Stash the target ts so MessagesLoadedMsg can scroll the
 			// messagepane to that row once the channel finishes
@@ -4165,7 +4194,7 @@ func (a *App) handleGlobalSearchMode(msg tea.KeyMsg) tea.Cmd {
 			a.pendingJumpTS = result.MessageTS
 			a.sidebar.SelectByID(channelID)
 			return func() tea.Msg {
-				return ChannelSelectedMsg{ID: channelID, Name: channelName, Type: "channel"}
+				return ChannelSelectedMsg{ID: channelID, Name: channelName, Type: channelType}
 			}
 		}
 		if result.Type == "file" {
@@ -4214,7 +4243,7 @@ func (a *App) handleGlobalSearchMode(msg tea.KeyMsg) tea.Cmd {
 		}
 		gen := a.searchGen
 		return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
-			return SearchDebounceMsg{Gen: gen}
+			return SearchDebounceMsg{TeamID: a.activeTeamID, Gen: gen}
 		})
 	}
 	return nil
@@ -4229,6 +4258,29 @@ func (a *App) handleGlobalSearchMode(msg tea.KeyMsg) tea.Cmd {
 // missing (e.g., a DM row without DMUserID). Refusing here is
 // deliberate: silently falling back to an unscoped search would lie
 // to the user about what overlay they're looking at.
+func (a *App) channelMetaByID(channelID string) (name, channelType string, ok bool) {
+	for _, item := range a.sidebar.Items() {
+		if item.ID == channelID {
+			return item.Name, item.Type, true
+		}
+	}
+	return "", "", false
+}
+
+func channelSearchScopeLabel(scope ChannelSearchScope) string {
+	switch scope.Type {
+	case "channel", "private":
+		if scope.Name != "" {
+			return "in #" + scope.Name
+		}
+	case "dm", "app":
+		if scope.Name != "" {
+			return "in @" + scope.Name
+		}
+	}
+	return ""
+}
+
 func (a *App) activeChannelSearchScope() (ChannelSearchScope, bool) {
 	if a.activeChannelID == "" {
 		return ChannelSearchScope{}, false
@@ -4263,21 +4315,10 @@ func (a *App) activeChannelSearchScope() (ChannelSearchScope, bool) {
 // handleGlobalSearchMode but only feeds the Messages section and
 // hooks the channel-scoped searcher.
 func (a *App) handleChannelSearchMode(msg tea.KeyMsg) tea.Cmd {
-	keyStr := msg.String()
-	switch msg.Key().Code {
-	case tea.KeyEnter:
-		keyStr = "enter"
-	case tea.KeyEscape:
-		keyStr = "esc"
-	case tea.KeyUp:
-		keyStr = "up"
-	case tea.KeyDown:
-		keyStr = "down"
-	case tea.KeyBackspace:
-		keyStr = "backspace"
+	result, inputCmd := a.channelSearch.HandleKeyMsg(msg)
+	if inputCmd != nil {
+		return inputCmd
 	}
-
-	result := a.channelSearch.HandleKey(keyStr)
 	if result != nil {
 		a.channelSearch.Close()
 		a.SetMode(ModeNormal)
@@ -4300,17 +4341,27 @@ func (a *App) handleChannelSearchMode(msg tea.KeyMsg) tea.Cmd {
 			a.pendingJumpChannelID = result.ChannelID
 			a.pendingJumpTS = result.MessageTS
 			a.sidebar.SelectByID(result.ChannelID)
-			channelName := result.ChannelName
+			channelName, channelType := result.ChannelName, result.ChannelType
+			if metaName, metaType, ok := a.channelMetaByID(result.ChannelID); ok {
+				if channelName == "" {
+					channelName = metaName
+				}
+				if channelType == "" {
+					channelType = metaType
+				}
+			}
 			if channelName == "" {
 				channelName = a.channelSearchScope.Name
 			}
+			if channelType == "" {
+				channelType = a.channelSearchScope.Type
+			}
 			return func() tea.Msg {
-				return ChannelSelectedMsg{ID: result.ChannelID, Name: channelName, Type: "channel"}
+				return ChannelSelectedMsg{ID: result.ChannelID, Name: channelName, Type: channelType}
 			}
 		}
 		return nil
 	}
-
 	if !a.channelSearch.IsVisible() {
 		a.SetMode(ModeNormal)
 		return nil
@@ -4324,7 +4375,7 @@ func (a *App) handleChannelSearchMode(msg tea.KeyMsg) tea.Cmd {
 		}
 		gen := a.channelSearchGen
 		return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
-			return ChannelSearchDebounceMsg{Gen: gen}
+			return ChannelSearchDebounceMsg{TeamID: a.activeTeamID, Gen: gen}
 		})
 	}
 	return nil

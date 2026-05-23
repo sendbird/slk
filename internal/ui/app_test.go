@@ -5655,3 +5655,36 @@ func TestApp_NormalMouseWheelUsesOnlyFlushBackpressure(t *testing.T) {
 		t.Fatalf("after normal wheel flush MouseMode = %v, want MouseModeCellMotion", v.MouseMode)
 	}
 }
+
+func TestChannelSearch_ViewShowsScopeLabelNotWireSyntax(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	app.activeChannelID = "C42"
+	app.SetChannels([]sidebar.ChannelItem{{ID: "C42", Name: "eng-deploy", Type: "channel"}})
+
+	_ = app.handleKey(tea.KeyPressMsg{Code: 'f', Mod: tea.ModCtrl})
+	rendered := app.channelSearch.View(80)
+	if !strings.Contains(rendered, "in #eng-deploy") {
+		t.Fatalf("Ctrl+F overlay must show visible scope label:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "in:eng-deploy") {
+		t.Fatalf("Ctrl+F overlay must not expose wire search syntax:\n%s", rendered)
+	}
+}
+
+func TestGlobalSearch_KoreanInputExposesCursor(t *testing.T) {
+	app := NewApp()
+	app.width = 120
+	app.height = 40
+	app.globalSearch.Configure("Search", "Search channels, people, messages…", "")
+	app.globalSearch.Open()
+	app.SetMode(ModeSearch)
+
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: '한', Text: "한"})
+	if got := app.globalSearch.Query(); got != "한" {
+		t.Fatalf("global search must accept Korean input, got %q", got)
+	}
+	if c := app.globalSearch.Cursor(app.width, app.height); c == nil {
+		t.Fatal("global search must expose a real cursor for IME composition")
+	}
+}

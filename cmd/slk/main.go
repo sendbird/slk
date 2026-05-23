@@ -1071,9 +1071,13 @@ func run() error {
 		})
 
 		app.SetRemoteSearcher(func(ctx context.Context, query string, gen uint64) tea.Msg {
-			wctx := router.Active()
+			teamID := ui.SearchTeamIDFromContext(ctx)
+			wctx := router.ByID(teamID)
 			if wctx == nil {
-				return ui.SearchResultsMsg{Gen: gen, Query: query, Err: fmt.Errorf("no active workspace")}
+				wctx = router.Active()
+			}
+			if wctx == nil {
+				return ui.SearchResultsMsg{TeamID: teamID, Gen: gen, Query: query, Err: fmt.Errorf("no active workspace")}
 			}
 			client := wctx.Client
 			// 8s upper bound — Slack search occasionally takes a few
@@ -1085,9 +1089,9 @@ func run() error {
 			msgs, mErr := client.SearchMessages(ctx, query, 5)
 			files, fErr := client.SearchFiles(ctx, query, 5)
 			if mErr != nil && fErr != nil {
-				return ui.SearchResultsMsg{Gen: gen, Query: query, Err: mErr}
+				return ui.SearchResultsMsg{TeamID: teamID, Gen: gen, Query: query, Err: mErr}
 			}
-			result := ui.SearchResultsMsg{Gen: gen, Query: query}
+			result := ui.SearchResultsMsg{TeamID: teamID, Gen: gen, Query: query}
 			if mErr == nil {
 				result.Messages = messageHitsToItems(msgs, wctx.UserNames)
 			}
@@ -1098,9 +1102,13 @@ func run() error {
 		})
 
 		app.SetChannelRemoteSearcher(func(ctx context.Context, scope ui.ChannelSearchScope, query string, gen uint64) tea.Msg {
-			wctx := router.Active()
+			teamID := ui.SearchTeamIDFromContext(ctx)
+			wctx := router.ByID(teamID)
 			if wctx == nil {
-				return ui.ChannelSearchResultsMsg{Gen: gen, Query: query, Err: fmt.Errorf("no active workspace")}
+				wctx = router.Active()
+			}
+			if wctx == nil {
+				return ui.ChannelSearchResultsMsg{TeamID: teamID, Gen: gen, Query: query, Err: fmt.Errorf("no active workspace")}
 			}
 			client := wctx.Client
 			ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
@@ -1114,13 +1122,13 @@ func run() error {
 				// than user input. Fail closed instead of running an
 				// unscoped search and pretending the result is
 				// channel-restricted.
-				return ui.ChannelSearchResultsMsg{Gen: gen, Query: query, Err: fmt.Errorf("channel search not supported for this conversation")}
+				return ui.ChannelSearchResultsMsg{TeamID: teamID, Gen: gen, Query: query, Err: fmt.Errorf("channel search not supported for this conversation")}
 			}
 			wire := prefix + " " + query
 			debuglog.General("[search] channel scope=%s name=%q dm=%q wire=%q", scope.Type, scope.Name, scope.DMUserID, wire)
 			msgs, err := client.SearchMessages(ctx, wire, 10)
 			if err != nil {
-				return ui.ChannelSearchResultsMsg{Gen: gen, Query: query, Err: err}
+				return ui.ChannelSearchResultsMsg{TeamID: teamID, Gen: gen, Query: query, Err: err}
 			}
 			debuglog.General("[search] channel hits=%d", len(msgs))
 			for i, h := range msgs {
@@ -1129,10 +1137,17 @@ func run() error {
 				}
 				debuglog.General("[search] hit[%d] channel=%s/%q ts=%s", i, h.ChannelID, h.ChannelName, h.TS)
 			}
+			filtered := msgs[:0]
+			for _, hit := range msgs {
+				if hit.ChannelID == scope.ChannelID {
+					filtered = append(filtered, hit)
+				}
+			}
 			return ui.ChannelSearchResultsMsg{
+				TeamID:   teamID,
 				Gen:      gen,
 				Query:    query,
-				Messages: messageHitsToItems(msgs, wctx.UserNames),
+				Messages: messageHitsToItems(filtered, wctx.UserNames),
 			}
 		})
 
