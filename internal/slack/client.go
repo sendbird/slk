@@ -48,6 +48,8 @@ type SlackAPI interface {
 	GetUploadURLExternalContext(ctx context.Context, params slack.GetUploadURLExternalParameters) (*slack.GetUploadURLExternalResponse, error)
 	UploadToURL(ctx context.Context, params slack.UploadToURLParameters) error
 	CompleteUploadExternalContext(ctx context.Context, params slack.CompleteUploadExternalParameters) (*slack.CompleteUploadExternalResponse, error)
+	SearchMessagesContext(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchMessages, error)
+	SearchFilesContext(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchFiles, error)
 }
 
 // defaultAPIBaseURL is the canonical Slack Web API root used as a fallback
@@ -650,6 +652,85 @@ func (c *Client) SendMessage(ctx context.Context, channelID, text string) (strin
 		return "", "", fmt.Errorf("sending message: %w", err)
 	}
 	return ts, mr, nil
+}
+
+// MessageSearchHit is a normalized message-search result. We expose a
+// repo-local type so the rest of the codebase does not need to import
+// slack-go types.
+type MessageSearchHit struct {
+	ChannelID   string
+	ChannelName string
+	UserID      string
+	Username    string
+	Text        string
+	TS          string
+	Permalink   string
+}
+
+// FileSearchHit is a normalized file-search result.
+type FileSearchHit struct {
+	ID         string
+	Name       string
+	Title      string
+	Mimetype   string
+	Permalink  string
+	URLPrivate string
+	Created    int64
+	UserID     string
+}
+
+// SearchMessages calls Slack's search.messages with the current xoxc
+// token + d cookie. `count` is clamped to a sane default when <= 0.
+// Errors propagate from the SDK; callers should degrade gracefully
+// (local channel/people results still work without remote search).
+func (c *Client) SearchMessages(ctx context.Context, query string, count int) ([]MessageSearchHit, error) {
+	params := slack.NewSearchParameters()
+	if count > 0 {
+		params.Count = count
+	}
+	resp, err := c.api.SearchMessagesContext(ctx, query, params)
+	if err != nil {
+		return nil, fmt.Errorf("search.messages: %w", err)
+	}
+	hits := make([]MessageSearchHit, 0, len(resp.Matches))
+	for _, m := range resp.Matches {
+		hits = append(hits, MessageSearchHit{
+			ChannelID:   m.Channel.ID,
+			ChannelName: m.Channel.Name,
+			UserID:      m.User,
+			Username:    m.Username,
+			Text:        m.Text,
+			TS:          m.Timestamp,
+			Permalink:   m.Permalink,
+		})
+	}
+	return hits, nil
+}
+
+// SearchFiles calls Slack's search.files. See SearchMessages.
+func (c *Client) SearchFiles(ctx context.Context, query string, count int) ([]FileSearchHit, error) {
+	params := slack.NewSearchParameters()
+	if count > 0 {
+		params.Count = count
+	}
+	resp, err := c.api.SearchFilesContext(ctx, query, params)
+	if err != nil {
+		return nil, fmt.Errorf("search.files: %w", err)
+	}
+	hits := make([]FileSearchHit, 0, len(resp.Matches))
+	for _, f := range resp.Matches {
+		hits = append(hits, FileSearchHit{
+			ID:         f.ID,
+			Name:       f.Name,
+			Title:      f.Title,
+			Mimetype:   f.Mimetype,
+			Permalink:  f.Permalink,
+			URLPrivate: f.URLPrivate,
+			Created:    int64(f.Created),
+			UserID:     f.User,
+		})
+	}
+	return hits, nil
 }
 
 func (c *Client) ExecuteSlashCommand(ctx context.Context, channelID, text string) error {

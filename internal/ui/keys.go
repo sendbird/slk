@@ -62,7 +62,7 @@ func DefaultKeyMap() KeyMap {
 		Escape:              key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back")),
 		InsertMode:          key.NewBinding(key.WithKeys("i", "f2"), key.WithHelp("i/F2", "insert mode")),
 		CommandMode:         key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "command mode")),
-		SearchMode:          key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
+		SearchMode:          key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "global search")),
 		Tab:                 key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next panel")),
 		ShiftTab:            key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev panel")),
 		ToggleSidebar:       key.NewBinding(key.WithKeys("ctrl+b"), key.WithHelp("ctrl+b", "toggle sidebar")),

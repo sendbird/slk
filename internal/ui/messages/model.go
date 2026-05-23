@@ -772,6 +772,27 @@ func (m *Model) SelectByIndex(i int) {
 	}
 }
 
+// SelectByTS scans the current channel's messages for the given Slack
+// timestamp and, if found, focuses that row and forces the next
+// render to re-snap the viewport (hasSnapped=false) so the selected
+// row scrolls into view. Returns true on a hit. Used by the global
+// search overlay to jump from a remote message hit to the matching
+// row after the target channel has loaded.
+func (m *Model) SelectByTS(ts string) bool {
+	if ts == "" {
+		return false
+	}
+	for i, msg := range m.messages {
+		if msg.TS == ts {
+			m.selected = i
+			m.hasSnapped = false
+			m.dirty()
+			return true
+		}
+	}
+	return false
+}
+
 // ChromeHeight returns the number of rows at the top of the messages
 // pane consumed by the channel header / separator chrome. Set during
 // View() (so callers must invoke View at least once for a meaningful

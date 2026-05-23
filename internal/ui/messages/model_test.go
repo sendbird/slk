@@ -1145,3 +1145,24 @@ func TestHitTestReaction_NoHitsWithoutReactions(t *testing.T) {
 		t.Error("HitTestReaction with no reactions should always return ok=false")
 	}
 }
+
+func TestSelectByTS_HitFocusesRow(t *testing.T) {
+	m := New([]MessageItem{
+		{TS: "1.0", UserID: "U1", Text: "first"},
+		{TS: "2.0", UserID: "U2", Text: "second"},
+		{TS: "3.0", UserID: "U3", Text: "third"},
+	}, "general")
+	if !m.SelectByTS("2.0") {
+		t.Fatalf("SelectByTS should return true for matching ts")
+	}
+	if got := m.SelectedIndex(); got != 1 {
+		t.Fatalf("selected index: got %d want 1", got)
+	}
+}
+
+func TestSelectByTS_MissReturnsFalse(t *testing.T) {
+	m := New([]MessageItem{{TS: "1.0", UserID: "U1"}}, "general")
+	if m.SelectByTS("99.0") {
+		t.Fatalf("SelectByTS should return false for unknown ts")
+	}
+}

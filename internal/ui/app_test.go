@@ -18,6 +18,7 @@ import (
 	"github.com/gammons/slk/internal/cache"
 	imgpkg "github.com/gammons/slk/internal/image"
 	"github.com/gammons/slk/internal/ui/compose"
+	"github.com/gammons/slk/internal/ui/globalsearch"
 	"github.com/gammons/slk/internal/ui/messages"
 	"github.com/gammons/slk/internal/ui/sidebar"
 	"github.com/gammons/slk/internal/ui/slashpicker"
@@ -310,6 +311,23 @@ func TestHandleInsertMode_ShiftEnterInsertsNewline(t *testing.T) {
 	if !strings.HasPrefix(val, "hello") {
 		t.Fatalf("expected original text preserved, got %q", val)
 	}
+}
+
+func queuedChannelSelectedMsg(cmd tea.Cmd) (ChannelSelectedMsg, bool) {
+	if cmd == nil {
+		return ChannelSelectedMsg{}, false
+	}
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, child := range batch {
+			if selected, ok := queuedChannelSelectedMsg(child); ok {
+				return selected, true
+			}
+		}
+		return ChannelSelectedMsg{}, false
+	}
+	selected, ok := msg.(ChannelSelectedMsg)
+	return selected, ok
 }
 
 func TestHandleInsertMode_BackslashEnterInsertsNewline(t *testing.T) {
@@ -4003,23 +4021,6 @@ func TestChannelSelectedFallsBackToSpinnerOnCacheMiss(t *testing.T) {
 	}
 }
 
-func queuedChannelSelectedMsg(cmd tea.Cmd) (ChannelSelectedMsg, bool) {
-	if cmd == nil {
-		return ChannelSelectedMsg{}, false
-	}
-	msg := cmd()
-	if batch, ok := msg.(tea.BatchMsg); ok {
-		for _, child := range batch {
-			if selected, ok := queuedChannelSelectedMsg(child); ok {
-				return selected, true
-			}
-		}
-		return ChannelSelectedMsg{}, false
-	}
-	selected, ok := msg.(ChannelSelectedMsg)
-	return selected, ok
-}
-
 // TestWorkspaceSwitchedQueuesChannelSelected verifies that the
 // WorkspaceSwitchedMsg handler queues a ChannelSelectedMsg for the
 // restored (or first) channel rather than wiping the pane itself. The
@@ -4060,164 +4061,6 @@ func TestWorkspaceSwitchedQueuesChannelSelected(t *testing.T) {
 	walk(cmd)
 	if !found {
 		t.Fatalf("expected WorkspaceSwitchedMsg to queue ChannelSelectedMsg{ID:C9}, got none")
-	}
-}
-
-func TestWorkspaceReadyRestoresLastViewedChannel(t *testing.T) {
-	app := NewApp()
-
-	_, cmd := app.Update(WorkspaceReadyMsg{
-		TeamID:              "T1",
-		TeamName:            "Acme",
-		Channels:            []sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}, {ID: "D1", Name: "alice", Type: "dm"}},
-		InitialActive:       true,
-		LastViewedChannelID: "D1",
-	})
-
-	selected, ok := queuedChannelSelectedMsg(cmd)
-	if !ok {
-		t.Fatal("expected WorkspaceReadyMsg to queue ChannelSelectedMsg")
-	}
-	if selected.ID != "D1" || selected.Type != "dm" {
-		t.Fatalf("selected = %+v, want D1 dm", selected)
-	}
-}
-
-func TestWorkspaceReadyFallsBackWhenLastViewedMissing(t *testing.T) {
-	app := NewApp()
-
-	_, cmd := app.Update(WorkspaceReadyMsg{
-		TeamID:              "T1",
-		TeamName:            "Acme",
-		Channels:            []sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}, {ID: "C2", Name: "ops", Type: "channel"}},
-		InitialActive:       true,
-		LastViewedChannelID: "C-missing",
-	})
-
-	selected, ok := queuedChannelSelectedMsg(cmd)
-	if !ok {
-		t.Fatal("expected WorkspaceReadyMsg to queue ChannelSelectedMsg")
-	}
-	if selected.ID != "C1" {
-		t.Fatalf("selected ID = %q, want fallback C1", selected.ID)
-	}
-}
-
-// queuedSyntheticActivationMsg walks the batched tea.Cmd tree looking
-// for either ThreadsViewActivatedMsg or ActivityViewActivatedMsg. Used
-// by the synthetic last-viewed restore tests.
-func queuedSyntheticActivationMsg(cmd tea.Cmd) (string, bool) {
-	if cmd == nil {
-		return "", false
-	}
-	msg := cmd()
-	if batch, ok := msg.(tea.BatchMsg); ok {
-		for _, child := range batch {
-			if kind, ok := queuedSyntheticActivationMsg(child); ok {
-				return kind, true
-			}
-		}
-		return "", false
-	}
-	switch msg.(type) {
-	case ThreadsViewActivatedMsg:
-		return "threads", true
-	case ActivityViewActivatedMsg:
-		return "activity", true
-	}
-	return "", false
-}
-
-func TestWorkspaceReadyRestoresThreadsView(t *testing.T) {
-	// LastViewedChannelID set to the synthetic Threads sentinel must
-	// dispatch ThreadsViewActivatedMsg and NOT queue a
-	// ChannelSelectedMsg for a phantom channel.
-	app := NewApp()
-
-	_, cmd := app.Update(WorkspaceReadyMsg{
-		TeamID:              "T1",
-		TeamName:            "Acme",
-		Channels:            []sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}},
-		InitialActive:       true,
-		LastViewedChannelID: LastViewedKindThreads,
-	})
-
-	kind, ok := queuedSyntheticActivationMsg(cmd)
-	if !ok {
-		t.Fatal("expected WorkspaceReadyMsg to queue ThreadsViewActivatedMsg")
-	}
-	if kind != "threads" {
-		t.Fatalf("queued activation kind = %q, want threads", kind)
-	}
-	if sel, ok := queuedChannelSelectedMsg(cmd); ok {
-		t.Fatalf("synthetic restore must not queue ChannelSelectedMsg, got %+v", sel)
-	}
-}
-
-func TestWorkspaceReadyRestoresActivityView(t *testing.T) {
-	app := NewApp()
-
-	_, cmd := app.Update(WorkspaceReadyMsg{
-		TeamID:              "T1",
-		TeamName:            "Acme",
-		Channels:            []sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}},
-		InitialActive:       true,
-		LastViewedChannelID: LastViewedKindActivity,
-	})
-
-	kind, ok := queuedSyntheticActivationMsg(cmd)
-	if !ok {
-		t.Fatal("expected WorkspaceReadyMsg to queue ActivityViewActivatedMsg")
-	}
-	if kind != "activity" {
-		t.Fatalf("queued activation kind = %q, want activity", kind)
-	}
-}
-
-func TestThreadsViewActivationRecordsSyntheticVisit(t *testing.T) {
-	// Activating Threads view records a visit against the synthetic
-	// Threads ID so the next launch restores it.
-	app := NewApp()
-	var got string
-	app.SetChannelVisitRecorder(func(id string) { got = id })
-
-	app.Update(ThreadsViewActivatedMsg{})
-
-	if got != LastViewedKindThreads {
-		t.Errorf("ThreadsViewActivatedMsg recorded id=%q, want %q", got, LastViewedKindThreads)
-	}
-}
-
-func TestActivityViewActivationRecordsSyntheticVisit(t *testing.T) {
-	app := NewApp()
-	var got string
-	app.SetChannelVisitRecorder(func(id string) { got = id })
-
-	app.Update(ActivityViewActivatedMsg{})
-
-	if got != LastViewedKindActivity {
-		t.Errorf("ActivityViewActivatedMsg recorded id=%q, want %q", got, LastViewedKindActivity)
-	}
-}
-
-func TestWorkspaceSwitchedPrefersSessionChannelOverPersisted(t *testing.T) {
-	app := NewApp()
-	app.activeTeamID = "T1"
-	app.activeChannelID = "Cold"
-	app.lastChannelByTeam["T2"] = "Csession"
-
-	_, cmd := app.Update(WorkspaceSwitchedMsg{
-		TeamID:              "T2",
-		Channels:            []sidebar.ChannelItem{{ID: "Cpersist", Name: "persisted", Type: "channel"}, {ID: "Csession", Name: "session", Type: "channel"}},
-		LastViewedChannelID: "Cpersist",
-	})
-
-	selected, ok := queuedChannelSelectedMsg(cmd)
-	if !ok {
-		t.Fatal("expected WorkspaceSwitchedMsg to queue ChannelSelectedMsg")
-	}
-	if selected.ID != "Csession" {
-		t.Fatalf("selected ID = %q, want session channel", selected.ID)
 	}
 }
 
@@ -4264,153 +4107,6 @@ func TestWorkspaceReadyFirstChannelSetsLoading(t *testing.T) {
 
 	if !app.messagepane.IsLoading() {
 		t.Fatalf("expected messagepane loading=true on first-channel auto-select, got false")
-	}
-}
-
-func TestWorkspaceReadyEmptyRestoreTargetKeepsLoading(t *testing.T) {
-	app := NewApp()
-	app.SetLoadingWorkspaces([]string{"Acme"})
-
-	app.Update(WorkspaceReadyMsg{
-		TeamID:              "T1",
-		TeamName:            "Acme",
-		Channels:            nil,
-		InitialActive:       true,
-		LastViewedChannelID: "D1",
-	})
-
-	if !app.loading {
-		t.Fatal("expected global loading overlay to remain while restored channel list hydrates")
-	}
-	if !app.messagepane.IsLoading() {
-		t.Fatal("expected messagepane loading=true while waiting for restored channel list")
-	}
-	if app.pendingInitialReadyTeamName != "Acme" {
-		t.Fatalf("pendingInitialReadyTeamName = %q, want Acme", app.pendingInitialReadyTeamName)
-	}
-	if app.pendingInitialRestoreChannelID != "D1" {
-		t.Fatalf("pendingInitialRestoreChannelID = %q, want D1", app.pendingInitialRestoreChannelID)
-	}
-}
-
-func TestSectionsRefreshedClearsDeferredInitialLoading(t *testing.T) {
-	app := NewApp()
-	app.SetLoadingWorkspaces([]string{"Acme"})
-	app.Update(WorkspaceReadyMsg{
-		TeamID:              "T1",
-		TeamName:            "Acme",
-		Channels:            nil,
-		InitialActive:       true,
-		LastViewedChannelID: "D1",
-	})
-
-	_, cmd := app.Update(SectionsRefreshedMsg{
-		TeamID:   "T1",
-		Channels: []sidebar.ChannelItem{{ID: "D1", Name: "alice", Type: "dm"}},
-	})
-	selected, ok := queuedChannelSelectedMsg(cmd)
-	if !ok {
-		t.Fatal("expected deferred restore to queue ChannelSelectedMsg")
-	}
-	if selected.ID != "D1" || selected.Type != "dm" {
-		t.Fatalf("selected = %+v, want D1 dm", selected)
-	}
-
-	if app.loading {
-		t.Fatal("expected loading overlay to clear once channels hydrate")
-	}
-	if app.pendingInitialReadyTeamName != "" {
-		t.Fatalf("pendingInitialReadyTeamName = %q, want empty", app.pendingInitialReadyTeamName)
-	}
-	if app.pendingInitialRestoreChannelID != "" {
-		t.Fatalf("pendingInitialRestoreChannelID = %q, want empty", app.pendingInitialRestoreChannelID)
-	}
-}
-
-func TestDeferredInitialRestoreDoesNotFallbackBeforeExactTarget(t *testing.T) {
-	app := NewApp()
-	app.SetLoadingWorkspaces([]string{"Acme"})
-	app.Update(WorkspaceReadyMsg{
-		TeamID:              "T1",
-		TeamName:            "Acme",
-		Channels:            nil,
-		InitialActive:       true,
-		LastViewedChannelID: "D1",
-	})
-
-	_, cmd := app.Update(SectionsRefreshedMsg{
-		TeamID:   "T1",
-		Channels: []sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}},
-	})
-	if selected, ok := queuedChannelSelectedMsg(cmd); ok {
-		t.Fatalf("unexpected fallback selection before restored DM appears: %+v", selected)
-	}
-	if !app.loading {
-		t.Fatal("expected loading overlay to remain while waiting for exact restored DM")
-	}
-	if app.pendingInitialRestoreChannelID != "D1" {
-		t.Fatalf("pendingInitialRestoreChannelID = %q, want D1", app.pendingInitialRestoreChannelID)
-	}
-}
-
-func TestDeferredInitialRestoreSelectsLateDMAfterLoadingTimeout(t *testing.T) {
-	app := NewApp()
-	app.SetLoadingWorkspaces([]string{"Acme"})
-	app.Update(WorkspaceReadyMsg{
-		TeamID:              "T1",
-		TeamName:            "Acme",
-		Channels:            nil,
-		InitialActive:       true,
-		LastViewedChannelID: "D1",
-	})
-
-	app.Update(LoadingTimeoutMsg{})
-	if app.loading {
-		t.Fatal("expected loading overlay to clear on timeout")
-	}
-	if app.pendingInitialRestoreChannelID != "D1" {
-		t.Fatalf("pendingInitialRestoreChannelID = %q, want D1 after timeout", app.pendingInitialRestoreChannelID)
-	}
-
-	_, cmd := app.Update(ConversationOpenedMsg{
-		TeamID: "T1",
-		Item:   sidebar.ChannelItem{ID: "D1", Name: "alice", Type: "dm"},
-	})
-	selected, ok := queuedChannelSelectedMsg(cmd)
-	if !ok {
-		t.Fatal("expected late restored DM to queue ChannelSelectedMsg")
-	}
-	if selected.ID != "D1" || selected.Type != "dm" {
-		t.Fatalf("selected = %+v, want D1 dm", selected)
-	}
-}
-
-func TestDeferredInitialRestoreDoesNotStealFocusAfterManualSelection(t *testing.T) {
-	app := NewApp()
-	app.SetLoadingWorkspaces([]string{"Acme"})
-	app.Update(WorkspaceReadyMsg{
-		TeamID:              "T1",
-		TeamName:            "Acme",
-		Channels:            nil,
-		InitialActive:       true,
-		LastViewedChannelID: "D1",
-	})
-
-	app.Update(LoadingTimeoutMsg{})
-	app.Update(ChannelSelectedMsg{ID: "C1", Name: "general", Type: "channel"})
-	if app.pendingInitialRestoreChannelID != "" {
-		t.Fatalf("pendingInitialRestoreChannelID = %q, want cleared after manual selection", app.pendingInitialRestoreChannelID)
-	}
-
-	_, cmd := app.Update(ConversationOpenedMsg{
-		TeamID: "T1",
-		Item:   sidebar.ChannelItem{ID: "D1", Name: "alice", Type: "dm"},
-	})
-	if selected, ok := queuedChannelSelectedMsg(cmd); ok {
-		t.Fatalf("late restored DM stole focus after manual selection: %+v", selected)
-	}
-	if app.activeChannelID != "C1" {
-		t.Fatalf("activeChannelID = %q, want C1", app.activeChannelID)
 	}
 }
 
@@ -5134,107 +4830,232 @@ func TestChannelSelectedReturnsPromptlyEvenIfFetcherBlocks(t *testing.T) {
 	}
 }
 
-func TestApp_MouseWheelBurstIsCoalesced(t *testing.T) {
-	a := NewApp()
-	a.width = 160
-	a.height = 30
-	items := make([]messages.MessageItem, 30)
-	for i := range items {
-		items[i] = messages.MessageItem{
-			TS:        fmt.Sprintf("%d.0", i+1),
-			UserName:  "u",
-			UserID:    "U1",
-			Text:      fmt.Sprintf("message %d", i+1),
-			Timestamp: "12:00 PM",
-		}
+func TestGlobalSearch_SlashOpensOverlayInNormalMode(t *testing.T) {
+	app := NewApp()
+	if app.mode != ModeNormal {
+		app.SetMode(ModeNormal)
 	}
-	a.messagepane.SetMessages(items)
-	_ = a.View() // populate mouse hit-test layout
-
-	x := a.layoutSidebarEnd + 5
-	firstCmds := 0
-	for i := 0; i < 100; i++ {
-		_, cmd := a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelUp})
-		if cmd != nil {
-			firstCmds++
-		}
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	if !app.globalSearch.IsVisible() {
+		t.Fatalf("'/' must open the global search overlay")
 	}
-	if firstCmds != 2 {
-		t.Fatalf("wheel burst scheduled %d commands, want 2 (flush + cooldown)", firstCmds)
-	}
-	if got := a.messagepane.SelectedIndex(); got != len(items)-1 {
-		t.Fatalf("wheel events should coalesce before mutating selection; got %d want %d", got, len(items)-1)
-	}
-	if !a.mouseWheelCooldown {
-		t.Fatal("oversized burst should enter mouse-wheel cooldown")
-	}
-
-	_, _ = a.Update(mouseWheelFlushMsg{})
-	if got, want := a.messagepane.SelectedIndex(), len(items)-1-maxMouseWheelPerFrame; got != want {
-		t.Fatalf("first flush selected %d, want %d", got, want)
-	}
-	if a.pendingWheelActive {
-		t.Fatal("oversized wheel burst should be capped and drained in one flush")
+	if app.mode != ModeSearch {
+		t.Fatalf("'/' must put the app in ModeSearch, got %v", app.mode)
 	}
 }
 
-func TestApp_MouseWheelDirectionChangeDropsStaleBacklog(t *testing.T) {
-	a := NewApp()
-	a.width = 160
-	a.height = 30
-	items := make([]messages.MessageItem, 30)
-	for i := range items {
-		items[i] = messages.MessageItem{
-			TS:        fmt.Sprintf("%d.0", i+1),
-			UserName:  "u",
-			UserID:    "U1",
-			Text:      fmt.Sprintf("message %d", i+1),
-			Timestamp: "12:00 PM",
-		}
-	}
-	a.messagepane.SetMessages(items)
-	_ = a.View()
-
-	x := a.layoutSidebarEnd + 5
-	for i := 0; i < 50; i++ {
-		a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelUp})
-	}
-	if got := a.pendingWheelDelta; got != -maxMouseWheelPerFrame {
-		t.Fatalf("upward burst pending delta = %d, want capped %d", got, -maxMouseWheelPerFrame)
-	}
-	a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelDown})
-	if got := a.pendingWheelDelta; got != 1 {
-		t.Fatalf("direction reversal should drop stale backlog; pending delta = %d, want 1", got)
-	}
-	if !a.mouseWheelCooldown {
-		t.Fatal("direction reversal should enter mouse-wheel cooldown")
-	}
-}
-
-func TestApp_NormalMouseWheelUsesOnlyFlushBackpressure(t *testing.T) {
-	a := NewApp()
-	a.width = 160
-	a.height = 30
-	a.sidebar.SetItems([]sidebar.ChannelItem{
-		{ID: "C1", Name: "general", Type: "channel"},
-		{ID: "C2", Name: "random", Type: "channel"},
+func TestGlobalSearch_EmptyQueryDoesNotKickRemote(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	called := false
+	app.SetRemoteSearcher(func(ctx context.Context, q string, gen uint64) tea.Msg {
+		called = true
+		return SearchResultsMsg{Gen: gen, Query: q}
 	})
-	_ = a.View() // populate sidebar hit-test layout
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	cmd := app.handleGlobalSearchMode(tea.KeyPressMsg{Code: tea.KeyBackspace})
+	if cmd != nil {
+		t.Fatalf("backspace with empty query must not schedule a debounce tick")
+	}
+	if called {
+		t.Fatalf("remote searcher must not run for an empty query")
+	}
+}
 
-	x := a.layoutRailWidth + 1
-	_, cmd := a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelDown})
+func TestGlobalSearch_TypingSchedulesDebounceTick(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	app.SetRemoteSearcher(func(ctx context.Context, q string, gen uint64) tea.Msg {
+		return SearchResultsMsg{Gen: gen, Query: q}
+	})
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+
+	cmd := app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
 	if cmd == nil {
-		t.Fatal("first wheel event should schedule a coalesced flush")
+		t.Fatalf("typing a printable rune must schedule a debounce tick")
 	}
-	if a.mouseWheelCooldown {
-		t.Fatal("single normal wheel event must not enter long cooldown")
+	if app.searchGen == 0 {
+		t.Fatalf("searchGen must increment on first keystroke")
 	}
-	if v := a.View(); v.MouseMode != tea.MouseModeNone {
-		t.Fatalf("pending wheel flush MouseMode = %v, want MouseModeNone", v.MouseMode)
+	if got := app.globalSearch.Query(); got != "d" {
+		t.Fatalf("query: got %q", got)
+	}
+}
+
+func TestGlobalSearch_StaleDebounceDropped(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	called := 0
+	app.SetRemoteSearcher(func(ctx context.Context, q string, gen uint64) tea.Msg {
+		called++
+		return SearchResultsMsg{Gen: gen, Query: q}
+	})
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	staleGen := app.searchGen
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'e', Text: "e"})
+
+	// Replay the older tick. It must be dropped without invoking the
+	// searcher.
+	_, _ = app.Update(SearchDebounceMsg{Gen: staleGen})
+	if called != 0 {
+		t.Fatalf("stale debounce tick must not invoke the searcher (called=%d)", called)
+	}
+}
+
+func TestGlobalSearch_StaleResultsDropped(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	staleQuery := app.globalSearch.Query()
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'e', Text: "e"})
+
+	_, _ = app.Update(SearchResultsMsg{
+		Gen:   app.searchGen,
+		Query: staleQuery,
+		Messages: []globalsearch.Item{
+			{ID: "T1", Name: "stale-hit", ChannelID: "C1"},
+		},
+	})
+	if got := app.globalSearch.SectionLen(globalsearch.CategoryMessage); got != 0 {
+		t.Fatalf("stale results must be dropped (got %d)", got)
+	}
+}
+
+func TestGlobalSearch_ResultsArrivePopulateMessageSection(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+
+	_, _ = app.Update(SearchResultsMsg{
+		Gen:   app.searchGen,
+		Query: app.globalSearch.Query(),
+		Messages: []globalsearch.Item{
+			{ID: "T1", Name: "jinku — deploy", ChannelID: "C1", MessageTS: "1.0"},
+		},
+	})
+	if got := app.globalSearch.SectionLen(globalsearch.CategoryMessage); got != 1 {
+		t.Fatalf("expected 1 message hit, got %d", got)
+	}
+}
+
+func TestGlobalSearch_RemoteFailureSurfacesToast(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+
+	_, cmd := app.Update(SearchResultsMsg{
+		Gen:   app.searchGen,
+		Query: app.globalSearch.Query(),
+		Err:   errors.New("rate limited"),
+	})
+	if cmd == nil {
+		t.Fatalf("err result must surface a toast cmd")
+	}
+	produced := cmd()
+	toast, ok := produced.(ToastMsg)
+	if !ok {
+		t.Fatalf("expected ToastMsg, got %T", produced)
+	}
+	if !strings.Contains(toast.Text, "rate limited") {
+		t.Fatalf("toast must include error: got %q", toast.Text)
+	}
+}
+
+func TestGlobalSearch_DebouncePathIsAsync(t *testing.T) {
+	// Searcher blocks until released; the Update goroutine must not
+	// wait on it (193082a deadlock-fix lesson).
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	release := make(chan struct{})
+	app.SetRemoteSearcher(func(ctx context.Context, q string, gen uint64) tea.Msg {
+		<-release
+		return SearchResultsMsg{Gen: gen, Query: q}
+	})
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+
+	done := make(chan struct{})
+	go func() {
+		_, cmd := app.Update(SearchDebounceMsg{Gen: app.searchGen})
+		if cmd != nil {
+			// Resolve the cmd off the Update goroutine.
+			go func() {
+				_ = cmd()
+			}()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+		// Update returned promptly even though the searcher is blocked.
+	case <-time.After(100 * time.Millisecond):
+		close(release)
+		t.Fatalf("Update did not return within 100ms; remote searcher is being called synchronously on the Update goroutine — risks bubbletea Send-from-Update deadlock")
+	}
+	close(release)
+}
+
+func TestGlobalSearch_MessageHitSchedulesPendingJump(t *testing.T) {
+	app := NewApp()
+	app.SetMode(ModeNormal)
+	_ = app.handleKey(tea.KeyPressMsg{Code: '/', Text: "/"})
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: 'd', Text: "d"})
+
+	_, _ = app.Update(SearchResultsMsg{
+		Gen:   app.searchGen,
+		Query: app.globalSearch.Query(),
+		Messages: []globalsearch.Item{
+			{ID: "9.99", Name: "jinku — deploy", ChannelID: "C42", ChannelName: "eng-deploy", MessageTS: "9.99"},
+		},
+	})
+	if got := app.globalSearch.SectionLen(globalsearch.CategoryMessage); got != 1 {
+		t.Fatalf("setup precondition: expected 1 message hit, got %d", got)
 	}
 
-	a.Update(mouseWheelFlushMsg{})
-	if v := a.View(); v.MouseMode != tea.MouseModeCellMotion {
-		t.Fatalf("after normal wheel flush MouseMode = %v, want MouseModeCellMotion", v.MouseMode)
+	// Synthetic Threads/Activity rank above the Messages section
+	// under a "d" query; the message hit is in the second flat slot.
+	// Navigate down once before confirming so we pick the remote row.
+	app.handleGlobalSearchMode(tea.KeyPressMsg{Code: tea.KeyDown})
+
+	cmd := app.handleGlobalSearchMode(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("enter on message hit must return a ChannelSelected cmd")
+	}
+	if app.pendingJumpChannelID != "C42" || app.pendingJumpTS != "9.99" {
+		t.Fatalf("pending jump must be set: channel=%q ts=%q", app.pendingJumpChannelID, app.pendingJumpTS)
+	}
+	picked := cmd()
+	sel, ok := picked.(ChannelSelectedMsg)
+	if !ok {
+		t.Fatalf("cmd produced %T, want ChannelSelectedMsg", picked)
+	}
+	if sel.ID != "C42" {
+		t.Fatalf("ChannelSelectedMsg.ID: got %q", sel.ID)
+	}
+}
+
+func TestGlobalSearch_MessagesLoadedConsumesPendingJump(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C42"
+	app.pendingJumpChannelID = "C42"
+	app.pendingJumpTS = "2.0"
+
+	_, _ = app.Update(MessagesLoadedMsg{
+		ChannelID: "C42",
+		Messages: []messages.MessageItem{
+			{TS: "1.0", UserID: "U1", Text: "first"},
+			{TS: "2.0", UserID: "U2", Text: "target"},
+			{TS: "3.0", UserID: "U3", Text: "third"},
+		},
+	})
+	if got := app.messagepane.SelectedIndex(); got != 1 {
+		t.Fatalf("messagepane must focus the target ts: got selected=%d", got)
+	}
+	if app.pendingJumpChannelID != "" || app.pendingJumpTS != "" {
+		t.Fatalf("pending jump must be cleared after consume: %q/%q", app.pendingJumpChannelID, app.pendingJumpTS)
 	}
 }

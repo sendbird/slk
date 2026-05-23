@@ -1070,6 +1070,33 @@ func run() error {
 			}
 		})
 
+		app.SetRemoteSearcher(func(ctx context.Context, query string, gen uint64) tea.Msg {
+			wctx := router.Active()
+			if wctx == nil {
+				return ui.SearchResultsMsg{Gen: gen, Query: query, Err: fmt.Errorf("no active workspace")}
+			}
+			client := wctx.Client
+			// 8s upper bound — Slack search occasionally takes a few
+			// seconds on large workspaces. Past that we'd rather show
+			// a toast than block further keystrokes.
+			ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			defer cancel()
+
+			msgs, mErr := client.SearchMessages(ctx, query, 5)
+			files, fErr := client.SearchFiles(ctx, query, 5)
+			if mErr != nil && fErr != nil {
+				return ui.SearchResultsMsg{Gen: gen, Query: query, Err: mErr}
+			}
+			result := ui.SearchResultsMsg{Gen: gen, Query: query}
+			if mErr == nil {
+				result.Messages = messageHitsToItems(msgs, wctx.UserNames)
+			}
+			if fErr == nil {
+				result.Files = fileHitsToItems(files, wctx.UserNames)
+			}
+			return result
+		})
+
 		app.SetSlashCommandRunner(func(channelID, text string) tea.Msg {
 			wctx := router.Active()
 			if wctx == nil {
