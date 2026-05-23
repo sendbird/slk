@@ -64,7 +64,7 @@ func DefaultKeyMap() KeyMap {
 		Escape:              key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back")),
 		InsertMode:          key.NewBinding(key.WithKeys("i", "f2"), key.WithHelp("i/F2", "insert mode")),
 		CommandMode:         key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "command mode")),
-		SearchMode:          key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "global search")),
+		SearchMode:          key.NewBinding(key.WithKeys("/", "super+k"), key.WithHelp("//cmd+k", "global search")),
 		ChannelSearch:       key.NewBinding(key.WithKeys("ctrl+f"), key.WithHelp("ctrl+f", "search in channel")),
 		Tab:                 key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next panel")),
 		ShiftTab:            key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev panel")),
@@ -96,7 +96,7 @@ func DefaultKeyMap() KeyMap {
 		NavBack:             key.NewBinding(key.WithKeys("ctrl+h"), key.WithHelp("ctrl+h", "navigate back")),
 		NavForward:          key.NewBinding(key.WithKeys("ctrl+k"), key.WithHelp("ctrl+k", "navigate forward")),
 		Help:                key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "show keybindings")),
-		NewConversation:     key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new conversation")),
+		NewConversation:     key.NewBinding(key.WithKeys("n", "super+n"), key.WithHelp("n/cmd+n", "new conversation")),
 	}
 }
 
@@ -140,13 +140,7 @@ func koreanShortcutRune(text string) (rune, bool) {
 }
 
 func shortcutStringWithModifiers(r rune, mod tea.KeyMod) string {
-	withChordModifier := mod.Contains(tea.ModCtrl) ||
-		mod.Contains(tea.ModAlt) ||
-		mod.Contains(tea.ModMeta) ||
-		mod.Contains(tea.ModHyper) ||
-		mod.Contains(tea.ModSuper)
-
-	if !withChordModifier {
+	if !hasShortcutChordModifier(mod) {
 		if mod.Contains(tea.ModShift) && isASCIIAlpha(r) {
 			r = unicode.ToUpper(r)
 		}
@@ -174,6 +168,14 @@ func shortcutStringWithModifiers(r rune, mod tea.KeyMod) string {
 	}
 	b.WriteRune(unicode.ToLower(r))
 	return b.String()
+}
+
+func hasShortcutChordModifier(mod tea.KeyMod) bool {
+	return mod.Contains(tea.ModCtrl) ||
+		mod.Contains(tea.ModAlt) ||
+		mod.Contains(tea.ModMeta) ||
+		mod.Contains(tea.ModHyper) ||
+		mod.Contains(tea.ModSuper)
 }
 
 func isASCIIAlpha(r rune) bool {
