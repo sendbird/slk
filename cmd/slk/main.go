@@ -1305,8 +1305,9 @@ func run() error {
 			}
 			replies := fetchThreadReplies(wctx.Client, channelID, threadTS, db, wctx.UserNames, tsFormat, avatarCache, router)
 			return ui.ThreadRepliesLoadedMsg{
-				ThreadTS: threadTS,
-				Replies:  replies,
+				ChannelID: channelID,
+				ThreadTS:  threadTS,
+				Replies:   replies,
 			}
 		})
 
@@ -1565,7 +1566,7 @@ func run() error {
 	var firstReady sync.Once
 
 	// Start the TUI immediately (shows loading overlay)
-	p = tea.NewProgram(app)
+	p = tea.NewProgram(app, tea.WithFilter(ui.MouseWheelFilter))
 
 	// Now that `p` exists, re-install the ImageContext with a real
 	// SendMsg callback so the prefetcher can dispatch ImageReadyMsg

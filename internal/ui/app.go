@@ -151,8 +151,9 @@ type (
 		ParentMsg messages.MessageItem
 	}
 	ThreadRepliesLoadedMsg struct {
-		ThreadTS string
-		Replies  []messages.MessageItem
+		ChannelID string
+		ThreadTS  string
+		Replies   []messages.MessageItem
 	}
 	SendThreadReplyMsg struct {
 		ChannelID string
@@ -2480,32 +2481,22 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case threadFetchDebounceMsg:
 		// Drop stale debounce ticks: a later j/k has scheduled a fresh
-		// fetch and bumped the generation past this one.
+		// open and bumped the generation past this one.
 		if msg.gen != a.pendingThreadFetchGen {
 			return a, nil
 		}
-		// Also drop if the user has navigated away (e.g. switched to a
-		// different thread or closed the threads view) since scheduling.
-		if msg.channelID != a.lastOpenedChannelID || msg.threadTS != a.lastOpenedThreadTS {
+		// During rapid threads-list navigation, do not re-render the right
+		// thread pane for every row. Wait until the cursor has settled, then
+		// open only the still-selected row. If the user left ViewThreads or
+		// moved again since this tick was scheduled, this tick is stale.
+		if a.view != ViewThreads {
 			return a, nil
 		}
-		if a.threadFetcher == nil {
+		selected, ok := a.threadsView.SelectedSummary()
+		if !ok || selected.ChannelID != msg.channelID || selected.ThreadTS != msg.threadTS {
 			return a, nil
 		}
-		fetcher := a.threadFetcher
-		chID, threadTS := msg.channelID, msg.threadTS
-		var batch []tea.Cmd
-		if a.threadCacheReader != nil {
-			if cached := a.threadCacheReader(chID, threadTS); len(cached) > 1 {
-				replies := cached[1:] // strip parent; reducer expects replies-only
-				ts := threadTS
-				batch = append(batch, func() tea.Msg {
-					return ThreadRepliesLoadedMsg{ThreadTS: ts, Replies: replies}
-				})
-			}
-		}
-		batch = append(batch, func() tea.Msg { return fetcher(chID, threadTS) })
-		return a, tea.Batch(batch...)
+		return a, a.openSelectedThreadCmd(false)
 
 	case ThreadOpenedMsg:
 		a.threadVisible = true
@@ -2523,7 +2514,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if cached := a.threadCacheReader(chID, ts); len(cached) > 1 {
 					replies := cached[1:]
 					batch = append(batch, func() tea.Msg {
-						return ThreadRepliesLoadedMsg{ThreadTS: ts, Replies: replies}
+						return ThreadRepliesLoadedMsg{ChannelID: chID, ThreadTS: ts, Replies: replies}
 					})
 				}
 			}
@@ -2532,7 +2523,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case ThreadRepliesLoadedMsg:
-		if a.threadVisible && msg.ThreadTS == a.threadPanel.ThreadTS() {
+		if a.threadVisible && msg.ThreadTS == a.threadPanel.ThreadTS() && (msg.ChannelID == "" || msg.ChannelID == a.threadPanel.ChannelID()) {
 			channelID := a.threadPanel.ChannelID()
 			// nil Replies signals network failure (the fetcher logs the error
 			// and returns nil); empty []MessageItem{} signals "no replies yet".
@@ -5248,7 +5239,7 @@ func (a *App) handleGoToBottom() tea.Cmd {
 // current burst. It intentionally does not mutate panel models immediately:
 // terminals can emit wheel messages much faster than the TUI can render, and
 // rendering after every notch starves the event loop.
-func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
+func (a *App) absorbMouseWheel(msg tea.MouseWheelMsg) bool {
 	delta := 0
 	switch msg.Button {
 	case tea.MouseWheelUp:
@@ -5256,37 +5247,20 @@ func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 	case tea.MouseWheelDown:
 		delta = 1
 	default:
-		return nil
+		return false
 	}
 
 	panel, ok := a.wheelTargetPanel(msg.X)
 	if !ok {
-		return nil
+		return false
 	}
 
-	// Shift keyboard focus to the pane being scrolled. The actual
-	// cursor movement is coalesced through flushMouseWheel, but focus
-	// follow-through is cheap and must happen on the *first* notch so
-	// the highlight bar (and any subsequent j/k/Enter) is already on
-	// the right pane by the time the user finishes the burst.
 	a.focusedPanel = panel
-
-	wasActive := a.pendingWheelActive
-	needsCooldown := false
 	if a.pendingWheelActive && (a.pendingWheelPanel != panel || a.pendingWheelView != a.view) {
-		// If the cursor jumps to another pane mid-burst, drop the stale
-		// accumulator rather than replaying old notches into the new target.
 		a.pendingWheelDelta = 0
 	}
-
-	// If the user reverses direction before the previous burst has drained,
-	// discard the stale backlog instead of making the cursor keep chasing old
-	// wheel notches. This is the failure mode users see as "the cursor can't
-	// catch up, then dies" when they scroll hard upward and immediately switch
-	// downward (or vice versa). The newest direction should win.
 	if a.pendingWheelDelta != 0 && (a.pendingWheelDelta < 0) != (delta < 0) {
 		a.pendingWheelDelta = 0
-		needsCooldown = true
 	}
 
 	a.pendingWheelActive = true
@@ -5295,26 +5269,41 @@ func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 	a.pendingWheelDelta += delta
 	if a.pendingWheelDelta > maxMouseWheelPerFrame {
 		a.pendingWheelDelta = maxMouseWheelPerFrame
-		needsCooldown = true
 	} else if a.pendingWheelDelta < -maxMouseWheelPerFrame {
 		a.pendingWheelDelta = -maxMouseWheelPerFrame
-		needsCooldown = true
 	}
-	if a.pendingWheelDelta == 0 {
+	return a.pendingWheelDelta != 0
+}
+
+// MouseWheelFilter drops additional wheel messages while a coalesced wheel
+// flush is already pending. Bubble Tea renders after every non-nil message;
+// without this filter, a fast/random wheel burst still forces one full View()
+// per raw terminal event even though flushMouseWheel coalesces the state change.
+// Returning nil here absorbs the event into App's pending accumulator without
+// triggering Update or render; the already-scheduled mouseWheelFlushMsg will
+// apply the latest accumulated direction/delta.
+func MouseWheelFilter(model tea.Model, msg tea.Msg) tea.Msg {
+	wheel, ok := msg.(tea.MouseWheelMsg)
+	if !ok {
+		return msg
+	}
+	app, ok := model.(*App)
+	if !ok || app == nil || app.loading || !app.pendingWheelActive {
+		return msg
+	}
+	app.absorbMouseWheel(wheel)
+	return nil
+}
+
+func (a *App) queueMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
+	wasActive := a.pendingWheelActive
+	if !a.absorbMouseWheel(msg) {
 		return nil
 	}
-
-	var cmds []tea.Cmd
-	if !wasActive {
-		cmds = append(cmds, tea.Tick(mouseWheelFlushDelay, func(time.Time) tea.Msg { return mouseWheelFlushMsg{} }))
+	if wasActive {
+		return nil
 	}
-	if needsCooldown && !a.mouseWheelCooldown {
-		a.mouseWheelCooldown = true
-		a.mouseWheelGen++
-		gen := a.mouseWheelGen
-		cmds = append(cmds, tea.Tick(mouseWheelCooldownDelay, func(time.Time) tea.Msg { return mouseWheelResumeMsg{gen: gen} }))
-	}
-	return tea.Batch(cmds...)
+	return tea.Tick(mouseWheelFlushDelay, func(time.Time) tea.Msg { return mouseWheelFlushMsg{} })
 }
 
 func (a *App) wheelTargetPanel(x int) (Panel, bool) {
@@ -5692,7 +5681,7 @@ func (a *App) openThreadForMessage(msg messages.MessageItem, takeFocus bool) tea
 		if cached := a.threadCacheReader(chID, ts); len(cached) > 1 {
 			replies := cached[1:] // strip parent; reducer expects replies-only
 			batch = append(batch, func() tea.Msg {
-				return ThreadRepliesLoadedMsg{ThreadTS: ts, Replies: replies}
+				return ThreadRepliesLoadedMsg{ChannelID: chID, ThreadTS: ts, Replies: replies}
 			})
 		}
 	}
@@ -5819,24 +5808,30 @@ func (a *App) CloseThread() {
 	}
 }
 
-// openSelectedThreadCmd updates UI state for whichever row the threadsview
-// has highlighted (so the right thread panel shows the parent immediately),
-// then schedules the network fetch.
+// openSelectedThreadCmd opens whichever row the threadsview has highlighted.
 //
-// When debounce is true (j/k key handlers), the fetch is delayed by
-// openThreadDebounceDelay and coalesced via pendingThreadFetchGen so a
-// held-j burst produces exactly one HTTP call. When debounce is false
-// (activation, list reload, G jump), the fetch fires immediately so
-// thread content lands without artificial latency.
+// When debounce is true (j/k and mouse-wheel navigation), the entire right-pane
+// open is delayed and coalesced. This intentionally leaves the previous thread
+// visible while the cursor is moving so rapid navigation cannot queue expensive
+// thread-panel re-renders for every traversed row. When debounce is false
+// (activation, list reload, click, Enter, G jump, or the settled debounce tick),
+// the selected thread opens immediately and then schedules the replies fetch.
 //
-// No-op if the list is empty, no thread fetcher is wired, OR the selected
-// thread is already the one open in the right panel (dedup: avoids
-// hammering the Slack API and clobbering an in-progress read on every j/k
-// press or list reload).
+// No-op if the list is empty OR the selected thread is already the one open in
+// the right panel (dedup: avoids hammering Slack and clobbering an in-progress
+// read on repeat events).
 func (a *App) openSelectedThreadCmd(debounce bool) tea.Cmd {
 	sum, ok := a.threadsView.SelectedSummary()
 	if !ok {
 		return nil
+	}
+	if debounce {
+		a.pendingThreadFetchGen++
+		gen := a.pendingThreadFetchGen
+		chID, threadTS := sum.ChannelID, sum.ThreadTS
+		return tea.Tick(openThreadDebounceDelay, func(time.Time) tea.Msg {
+			return threadFetchDebounceMsg{channelID: chID, threadTS: threadTS, gen: gen}
+		})
 	}
 	if sum.ChannelID == a.lastOpenedChannelID && sum.ThreadTS == a.lastOpenedThreadTS {
 		return nil
@@ -5871,24 +5866,17 @@ func (a *App) openSelectedThreadCmd(debounce bool) tea.Cmd {
 	}
 	fetcher := a.threadFetcher
 	chID, threadTS := sum.ChannelID, sum.ThreadTS
-	if !debounce {
-		var batch []tea.Cmd
-		if a.threadCacheReader != nil {
-			if cached := a.threadCacheReader(chID, threadTS); len(cached) > 1 {
-				replies := cached[1:] // strip parent; reducer expects replies-only
-				batch = append(batch, func() tea.Msg {
-					return ThreadRepliesLoadedMsg{ThreadTS: threadTS, Replies: replies}
-				})
-			}
+	var batch []tea.Cmd
+	if a.threadCacheReader != nil {
+		if cached := a.threadCacheReader(chID, threadTS); len(cached) > 1 {
+			replies := cached[1:] // strip parent; reducer expects replies-only
+			batch = append(batch, func() tea.Msg {
+				return ThreadRepliesLoadedMsg{ChannelID: chID, ThreadTS: threadTS, Replies: replies}
+			})
 		}
-		batch = append(batch, func() tea.Msg { return fetcher(chID, threadTS) })
-		return tea.Batch(batch...)
 	}
-	a.pendingThreadFetchGen++
-	gen := a.pendingThreadFetchGen
-	return tea.Tick(openThreadDebounceDelay, func(time.Time) tea.Msg {
-		return threadFetchDebounceMsg{channelID: chID, threadTS: threadTS, gen: gen}
-	})
+	batch = append(batch, func() tea.Msg { return fetcher(chID, threadTS) })
+	return tea.Batch(batch...)
 }
 
 // applyThreadUnreadBoundary tells the thread panel where the unread
@@ -7563,15 +7551,11 @@ func (a *App) View() tea.View {
 	}
 	v := tea.NewView(finalScreen)
 	v.AltScreen = true
-	// Protection for extreme wheel bursts: normal scrolling gets only the short
-	// pending-flush backpressure, while saturated bursts or direction reversals
-	// briefly disable mouse reporting so the terminal stops flooding Bubble Tea's
-	// render-after-every-mouse-message loop.
-	if a.pendingWheelActive || a.mouseWheelCooldown {
-		v.MouseMode = tea.MouseModeNone
-	} else {
-		v.MouseMode = tea.MouseModeCellMotion
-	}
+	// Keep mouse reporting enabled even while a wheel burst is being coalesced.
+	// Disabling it here makes some terminals stop delivering mouse input after a
+	// single scroll notch, which presents as the mouse "dying" immediately. The
+	// event-rate protection lives in queueMouseWheel/flushMouseWheel instead.
+	v.MouseMode = tea.MouseModeCellMotion
 	if !overlayActive {
 		v.Cursor = activeCursor
 	} else if a.globalSearch.IsVisible() {

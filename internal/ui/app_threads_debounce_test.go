@@ -6,6 +6,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/gammons/slk/internal/cache"
+	"github.com/gammons/slk/internal/ui/messages"
 )
 
 // newTestAppWithThreadsView is the threads-view analogue of
@@ -51,12 +52,16 @@ func TestThreadsViewDebouncesNetworkFetchOnRapidJK(t *testing.T) {
 		cmd := a.openSelectedThreadCmd(true)
 		if cmd != nil {
 			// We can't directly observe the tick's payload (it's behind
-			// tea.Tick), so we synthesize one matching the App's current
-			// (lastOpened*, pendingThreadFetchGen) tuple — the exact
-			// payload openSelectedThreadCmd would have scheduled.
+			// tea.Tick), so we synthesize one matching the currently
+			// selected row and App generation — the exact payload
+			// openSelectedThreadCmd scheduled.
+			sum, ok := a.threadsView.SelectedSummary()
+			if !ok {
+				t.Fatalf("expected selected summary")
+			}
 			emitted = append(emitted, threadFetchDebounceMsg{
-				channelID: a.lastOpenedChannelID,
-				threadTS:  a.lastOpenedThreadTS,
+				channelID: sum.ChannelID,
+				threadTS:  sum.ThreadTS,
 				gen:       a.pendingThreadFetchGen,
 			})
 		}
@@ -110,5 +115,67 @@ func TestOpenSelectedThread_NonDebouncedPathFiresImmediately(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&fetched); got != 1 {
 		t.Errorf("non-debounced path should fire 1 fetch immediately; got %d", got)
+	}
+}
+
+func TestOpenSelectedThread_DebouncedPathDoesNotRerenderWhileMoving(t *testing.T) {
+	a := newTestAppWithThreadsView(t, []cache.ThreadSummary{
+		{ChannelID: "C1", ThreadTS: "1.0", ParentText: "p1", ChannelName: "g1"},
+		{ChannelID: "C2", ThreadTS: "2.0", ParentText: "p2", ChannelName: "g2"},
+	})
+	a.threadFetcher = func(channelID, threadTS string) tea.Msg {
+		return ThreadRepliesLoadedMsg{ChannelID: channelID, ThreadTS: threadTS, Replies: []messages.MessageItem{}}
+	}
+
+	cmd := a.openSelectedThreadCmd(false)
+	if cmd == nil {
+		t.Fatalf("initial open should fetch")
+	}
+	for _, m := range drainBatch(cmd) {
+		_, _ = a.Update(m)
+	}
+	if got := a.threadPanel.ThreadTS(); got != "1.0" {
+		t.Fatalf("initial open ThreadTS = %q, want 1.0", got)
+	}
+
+	a.threadsView.MoveDown()
+	cmd = a.openSelectedThreadCmd(true)
+	if cmd == nil {
+		t.Fatalf("debounced open should schedule a tick")
+	}
+	if got := a.threadPanel.ThreadTS(); got != "1.0" {
+		t.Fatalf("debounced navigation rerendered right pane immediately: got %q, want 1.0", got)
+	}
+
+	_, cmd = a.Update(threadFetchDebounceMsg{channelID: "C2", threadTS: "2.0", gen: a.pendingThreadFetchGen})
+	if cmd == nil {
+		t.Fatalf("settled debounce tick should open selected thread")
+	}
+	if got := a.threadPanel.ThreadTS(); got != "2.0" {
+		t.Fatalf("settled debounce ThreadTS = %q, want 2.0", got)
+	}
+}
+
+func TestThreadRepliesLoadedIgnoresStaleChannelForSameThreadTS(t *testing.T) {
+	a := NewApp()
+	a.threadVisible = true
+	a.threadPanel.SetThread(messages.MessageItem{TS: "1.0", Text: "parent"}, nil, "C2", "1.0")
+
+	_, _ = a.Update(ThreadRepliesLoadedMsg{
+		ChannelID: "C1",
+		ThreadTS:  "1.0",
+		Replies:   []messages.MessageItem{{TS: "1.1", Text: "stale"}},
+	})
+	if reply := a.threadPanel.SelectedReply(); reply != nil && reply.Text == "stale" {
+		t.Fatalf("stale reply from another channel was applied to current thread")
+	}
+
+	_, _ = a.Update(ThreadRepliesLoadedMsg{
+		ChannelID: "C2",
+		ThreadTS:  "1.0",
+		Replies:   []messages.MessageItem{{TS: "1.2", Text: "current"}},
+	})
+	if reply := a.threadPanel.SelectedReply(); reply == nil || reply.Text != "current" {
+		t.Fatalf("current reply was not applied, got %#v", reply)
 	}
 }
