@@ -191,6 +191,14 @@ func (db *DB) migrate() error {
 
 	CREATE INDEX IF NOT EXISTS idx_channel_members_channel
 		ON channel_members(workspace_id, channel_id);
+
+	CREATE TABLE IF NOT EXISTS sidebar_section_collapsed (
+		workspace_id TEXT NOT NULL,
+		section_key  TEXT NOT NULL,
+		collapsed    INTEGER NOT NULL,
+		updated_at   INTEGER NOT NULL,
+		PRIMARY KEY (workspace_id, section_key)
+	);
 	`
 
 	if _, err := db.conn.Exec(schema); err != nil {
@@ -221,6 +229,10 @@ func (db *DB) migrate() error {
 	}
 	if err := db.addColumnIfMissing("users", "is_external",
 		"ALTER TABLE users ADD COLUMN is_external INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := db.addColumnIfMissing("channels", "mention_count",
+		"ALTER TABLE channels ADD COLUMN mention_count INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 

@@ -4004,6 +4004,23 @@ func TestChannelSelectedFallsBackToSpinnerOnCacheMiss(t *testing.T) {
 	}
 }
 
+func queuedChannelSelectedMsg(cmd tea.Cmd) (ChannelSelectedMsg, bool) {
+	if cmd == nil {
+		return ChannelSelectedMsg{}, false
+	}
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, child := range batch {
+			if selected, ok := queuedChannelSelectedMsg(child); ok {
+				return selected, true
+			}
+		}
+		return ChannelSelectedMsg{}, false
+	}
+	selected, ok := msg.(ChannelSelectedMsg)
+	return selected, ok
+}
+
 // TestWorkspaceSwitchedQueuesChannelSelected verifies that the
 // WorkspaceSwitchedMsg handler queues a ChannelSelectedMsg for the
 // restored (or first) channel rather than wiping the pane itself. The
@@ -4044,6 +4061,164 @@ func TestWorkspaceSwitchedQueuesChannelSelected(t *testing.T) {
 	walk(cmd)
 	if !found {
 		t.Fatalf("expected WorkspaceSwitchedMsg to queue ChannelSelectedMsg{ID:C9}, got none")
+	}
+}
+
+func TestWorkspaceReadyRestoresLastViewedChannel(t *testing.T) {
+	app := NewApp()
+
+	_, cmd := app.Update(WorkspaceReadyMsg{
+		TeamID:              "T1",
+		TeamName:            "Acme",
+		Channels:            []sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}, {ID: "D1", Name: "alice", Type: "dm"}},
+		InitialActive:       true,
+		LastViewedChannelID: "D1",
+	})
+
+	selected, ok := queuedChannelSelectedMsg(cmd)
+	if !ok {
+		t.Fatal("expected WorkspaceReadyMsg to queue ChannelSelectedMsg")
+	}
+	if selected.ID != "D1" || selected.Type != "dm" {
+		t.Fatalf("selected = %+v, want D1 dm", selected)
+	}
+}
+
+func TestWorkspaceReadyFallsBackWhenLastViewedMissing(t *testing.T) {
+	app := NewApp()
+
+	_, cmd := app.Update(WorkspaceReadyMsg{
+		TeamID:              "T1",
+		TeamName:            "Acme",
+		Channels:            []sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}, {ID: "C2", Name: "ops", Type: "channel"}},
+		InitialActive:       true,
+		LastViewedChannelID: "C-missing",
+	})
+
+	selected, ok := queuedChannelSelectedMsg(cmd)
+	if !ok {
+		t.Fatal("expected WorkspaceReadyMsg to queue ChannelSelectedMsg")
+	}
+	if selected.ID != "C1" {
+		t.Fatalf("selected ID = %q, want fallback C1", selected.ID)
+	}
+}
+
+// queuedSyntheticActivationMsg walks the batched tea.Cmd tree looking
+// for either ThreadsViewActivatedMsg or ActivityViewActivatedMsg. Used
+// by the synthetic last-viewed restore tests.
+func queuedSyntheticActivationMsg(cmd tea.Cmd) (string, bool) {
+	if cmd == nil {
+		return "", false
+	}
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, child := range batch {
+			if kind, ok := queuedSyntheticActivationMsg(child); ok {
+				return kind, true
+			}
+		}
+		return "", false
+	}
+	switch msg.(type) {
+	case ThreadsViewActivatedMsg:
+		return "threads", true
+	case ActivityViewActivatedMsg:
+		return "activity", true
+	}
+	return "", false
+}
+
+func TestWorkspaceReadyRestoresThreadsView(t *testing.T) {
+	// LastViewedChannelID set to the synthetic Threads sentinel must
+	// dispatch ThreadsViewActivatedMsg and NOT queue a
+	// ChannelSelectedMsg for a phantom channel.
+	app := NewApp()
+
+	_, cmd := app.Update(WorkspaceReadyMsg{
+		TeamID:              "T1",
+		TeamName:            "Acme",
+		Channels:            []sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}},
+		InitialActive:       true,
+		LastViewedChannelID: LastViewedKindThreads,
+	})
+
+	kind, ok := queuedSyntheticActivationMsg(cmd)
+	if !ok {
+		t.Fatal("expected WorkspaceReadyMsg to queue ThreadsViewActivatedMsg")
+	}
+	if kind != "threads" {
+		t.Fatalf("queued activation kind = %q, want threads", kind)
+	}
+	if sel, ok := queuedChannelSelectedMsg(cmd); ok {
+		t.Fatalf("synthetic restore must not queue ChannelSelectedMsg, got %+v", sel)
+	}
+}
+
+func TestWorkspaceReadyRestoresActivityView(t *testing.T) {
+	app := NewApp()
+
+	_, cmd := app.Update(WorkspaceReadyMsg{
+		TeamID:              "T1",
+		TeamName:            "Acme",
+		Channels:            []sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}},
+		InitialActive:       true,
+		LastViewedChannelID: LastViewedKindActivity,
+	})
+
+	kind, ok := queuedSyntheticActivationMsg(cmd)
+	if !ok {
+		t.Fatal("expected WorkspaceReadyMsg to queue ActivityViewActivatedMsg")
+	}
+	if kind != "activity" {
+		t.Fatalf("queued activation kind = %q, want activity", kind)
+	}
+}
+
+func TestThreadsViewActivationRecordsSyntheticVisit(t *testing.T) {
+	// Activating Threads view records a visit against the synthetic
+	// Threads ID so the next launch restores it.
+	app := NewApp()
+	var got string
+	app.SetChannelVisitRecorder(func(id string) { got = id })
+
+	app.Update(ThreadsViewActivatedMsg{})
+
+	if got != LastViewedKindThreads {
+		t.Errorf("ThreadsViewActivatedMsg recorded id=%q, want %q", got, LastViewedKindThreads)
+	}
+}
+
+func TestActivityViewActivationRecordsSyntheticVisit(t *testing.T) {
+	app := NewApp()
+	var got string
+	app.SetChannelVisitRecorder(func(id string) { got = id })
+
+	app.Update(ActivityViewActivatedMsg{})
+
+	if got != LastViewedKindActivity {
+		t.Errorf("ActivityViewActivatedMsg recorded id=%q, want %q", got, LastViewedKindActivity)
+	}
+}
+
+func TestWorkspaceSwitchedPrefersSessionChannelOverPersisted(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+	app.activeChannelID = "Cold"
+	app.lastChannelByTeam["T2"] = "Csession"
+
+	_, cmd := app.Update(WorkspaceSwitchedMsg{
+		TeamID:              "T2",
+		Channels:            []sidebar.ChannelItem{{ID: "Cpersist", Name: "persisted", Type: "channel"}, {ID: "Csession", Name: "session", Type: "channel"}},
+		LastViewedChannelID: "Cpersist",
+	})
+
+	selected, ok := queuedChannelSelectedMsg(cmd)
+	if !ok {
+		t.Fatal("expected WorkspaceSwitchedMsg to queue ChannelSelectedMsg")
+	}
+	if selected.ID != "Csession" {
+		t.Fatalf("selected ID = %q, want session channel", selected.ID)
 	}
 }
 
@@ -4090,6 +4265,153 @@ func TestWorkspaceReadyFirstChannelSetsLoading(t *testing.T) {
 
 	if !app.messagepane.IsLoading() {
 		t.Fatalf("expected messagepane loading=true on first-channel auto-select, got false")
+	}
+}
+
+func TestWorkspaceReadyEmptyRestoreTargetKeepsLoading(t *testing.T) {
+	app := NewApp()
+	app.SetLoadingWorkspaces([]string{"Acme"})
+
+	app.Update(WorkspaceReadyMsg{
+		TeamID:              "T1",
+		TeamName:            "Acme",
+		Channels:            nil,
+		InitialActive:       true,
+		LastViewedChannelID: "D1",
+	})
+
+	if !app.loading {
+		t.Fatal("expected global loading overlay to remain while restored channel list hydrates")
+	}
+	if !app.messagepane.IsLoading() {
+		t.Fatal("expected messagepane loading=true while waiting for restored channel list")
+	}
+	if app.pendingInitialReadyTeamName != "Acme" {
+		t.Fatalf("pendingInitialReadyTeamName = %q, want Acme", app.pendingInitialReadyTeamName)
+	}
+	if app.pendingInitialRestoreChannelID != "D1" {
+		t.Fatalf("pendingInitialRestoreChannelID = %q, want D1", app.pendingInitialRestoreChannelID)
+	}
+}
+
+func TestSectionsRefreshedClearsDeferredInitialLoading(t *testing.T) {
+	app := NewApp()
+	app.SetLoadingWorkspaces([]string{"Acme"})
+	app.Update(WorkspaceReadyMsg{
+		TeamID:              "T1",
+		TeamName:            "Acme",
+		Channels:            nil,
+		InitialActive:       true,
+		LastViewedChannelID: "D1",
+	})
+
+	_, cmd := app.Update(SectionsRefreshedMsg{
+		TeamID:   "T1",
+		Channels: []sidebar.ChannelItem{{ID: "D1", Name: "alice", Type: "dm"}},
+	})
+	selected, ok := queuedChannelSelectedMsg(cmd)
+	if !ok {
+		t.Fatal("expected deferred restore to queue ChannelSelectedMsg")
+	}
+	if selected.ID != "D1" || selected.Type != "dm" {
+		t.Fatalf("selected = %+v, want D1 dm", selected)
+	}
+
+	if app.loading {
+		t.Fatal("expected loading overlay to clear once channels hydrate")
+	}
+	if app.pendingInitialReadyTeamName != "" {
+		t.Fatalf("pendingInitialReadyTeamName = %q, want empty", app.pendingInitialReadyTeamName)
+	}
+	if app.pendingInitialRestoreChannelID != "" {
+		t.Fatalf("pendingInitialRestoreChannelID = %q, want empty", app.pendingInitialRestoreChannelID)
+	}
+}
+
+func TestDeferredInitialRestoreDoesNotFallbackBeforeExactTarget(t *testing.T) {
+	app := NewApp()
+	app.SetLoadingWorkspaces([]string{"Acme"})
+	app.Update(WorkspaceReadyMsg{
+		TeamID:              "T1",
+		TeamName:            "Acme",
+		Channels:            nil,
+		InitialActive:       true,
+		LastViewedChannelID: "D1",
+	})
+
+	_, cmd := app.Update(SectionsRefreshedMsg{
+		TeamID:   "T1",
+		Channels: []sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}},
+	})
+	if selected, ok := queuedChannelSelectedMsg(cmd); ok {
+		t.Fatalf("unexpected fallback selection before restored DM appears: %+v", selected)
+	}
+	if !app.loading {
+		t.Fatal("expected loading overlay to remain while waiting for exact restored DM")
+	}
+	if app.pendingInitialRestoreChannelID != "D1" {
+		t.Fatalf("pendingInitialRestoreChannelID = %q, want D1", app.pendingInitialRestoreChannelID)
+	}
+}
+
+func TestDeferredInitialRestoreSelectsLateDMAfterLoadingTimeout(t *testing.T) {
+	app := NewApp()
+	app.SetLoadingWorkspaces([]string{"Acme"})
+	app.Update(WorkspaceReadyMsg{
+		TeamID:              "T1",
+		TeamName:            "Acme",
+		Channels:            nil,
+		InitialActive:       true,
+		LastViewedChannelID: "D1",
+	})
+
+	app.Update(LoadingTimeoutMsg{})
+	if app.loading {
+		t.Fatal("expected loading overlay to clear on timeout")
+	}
+	if app.pendingInitialRestoreChannelID != "D1" {
+		t.Fatalf("pendingInitialRestoreChannelID = %q, want D1 after timeout", app.pendingInitialRestoreChannelID)
+	}
+
+	_, cmd := app.Update(ConversationOpenedMsg{
+		TeamID: "T1",
+		Item:   sidebar.ChannelItem{ID: "D1", Name: "alice", Type: "dm"},
+	})
+	selected, ok := queuedChannelSelectedMsg(cmd)
+	if !ok {
+		t.Fatal("expected late restored DM to queue ChannelSelectedMsg")
+	}
+	if selected.ID != "D1" || selected.Type != "dm" {
+		t.Fatalf("selected = %+v, want D1 dm", selected)
+	}
+}
+
+func TestDeferredInitialRestoreDoesNotStealFocusAfterManualSelection(t *testing.T) {
+	app := NewApp()
+	app.SetLoadingWorkspaces([]string{"Acme"})
+	app.Update(WorkspaceReadyMsg{
+		TeamID:              "T1",
+		TeamName:            "Acme",
+		Channels:            nil,
+		InitialActive:       true,
+		LastViewedChannelID: "D1",
+	})
+
+	app.Update(LoadingTimeoutMsg{})
+	app.Update(ChannelSelectedMsg{ID: "C1", Name: "general", Type: "channel"})
+	if app.pendingInitialRestoreChannelID != "" {
+		t.Fatalf("pendingInitialRestoreChannelID = %q, want cleared after manual selection", app.pendingInitialRestoreChannelID)
+	}
+
+	_, cmd := app.Update(ConversationOpenedMsg{
+		TeamID: "T1",
+		Item:   sidebar.ChannelItem{ID: "D1", Name: "alice", Type: "dm"},
+	})
+	if selected, ok := queuedChannelSelectedMsg(cmd); ok {
+		t.Fatalf("late restored DM stole focus after manual selection: %+v", selected)
+	}
+	if app.activeChannelID != "C1" {
+		t.Fatalf("activeChannelID = %q, want C1", app.activeChannelID)
 	}
 }
 
@@ -5226,5 +5548,78 @@ func TestChannelSearch_HitOnActiveChannelSelectsImmediately(t *testing.T) {
 	}
 	if got := app.messagepane.SelectedIndex(); got != 1 {
 		t.Fatalf("messagepane must focus the target row immediately, got selected=%d", got)
+	}
+}
+
+func TestApp_MouseWheelBurstIsCoalesced(t *testing.T) {
+	a := NewApp()
+	a.width = 160
+	a.height = 30
+	items := make([]messages.MessageItem, 30)
+	for i := range items {
+		items[i] = messages.MessageItem{
+			TS:        fmt.Sprintf("%d.0", i+1),
+			UserName:  "u",
+			UserID:    "U1",
+			Text:      fmt.Sprintf("message %d", i+1),
+			Timestamp: "12:00 PM",
+		}
+	}
+	a.messagepane.SetMessages(items)
+	_ = a.View() // populate mouse hit-test layout
+
+	x := a.layoutSidebarEnd + 5
+	firstCmds := 0
+	for i := 0; i < 100; i++ {
+		_, cmd := a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelUp})
+		if cmd != nil {
+			firstCmds++
+		}
+	}
+	if firstCmds != 1 {
+		t.Fatalf("wheel burst scheduled %d flush commands, want 1", firstCmds)
+	}
+	if got := a.messagepane.SelectedIndex(); got != len(items)-1 {
+		t.Fatalf("wheel events should coalesce before mutating selection; got %d want %d", got, len(items)-1)
+	}
+
+	_, cmd := a.Update(mouseWheelFlushMsg{})
+	if got, want := a.messagepane.SelectedIndex(), len(items)-1-maxMouseWheelPerFrame; got != want {
+		t.Fatalf("first flush selected %d, want %d", got, want)
+	}
+	if cmd == nil {
+		t.Fatal("first flush should schedule the next bounded flush for the remaining burst")
+	}
+
+	for a.pendingWheelActive {
+		a.Update(mouseWheelFlushMsg{})
+	}
+	if got := a.messagepane.SelectedIndex(); got != 0 {
+		t.Fatalf("full burst selected %d, want 0", got)
+	}
+}
+
+func TestApp_MouseWheelBurstTemporarilyDisablesMouseMode(t *testing.T) {
+	a := NewApp()
+	a.width = 160
+	a.height = 30
+	a.sidebar.SetItems([]sidebar.ChannelItem{
+		{ID: "C1", Name: "general", Type: "channel"},
+		{ID: "C2", Name: "random", Type: "channel"},
+	})
+	_ = a.View() // populate sidebar hit-test layout
+
+	x := a.layoutRailWidth + 1
+	_, cmd := a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelDown})
+	if cmd == nil {
+		t.Fatal("first wheel event should schedule a coalesced flush")
+	}
+	if v := a.View(); v.MouseMode != tea.MouseModeNone {
+		t.Fatalf("pending wheel burst MouseMode = %v, want MouseModeNone", v.MouseMode)
+	}
+
+	a.Update(mouseWheelFlushMsg{})
+	if v := a.View(); v.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("after wheel flush MouseMode = %v, want MouseModeCellMotion", v.MouseMode)
 	}
 }

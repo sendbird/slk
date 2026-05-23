@@ -105,6 +105,13 @@ type Model struct {
 	// banner above the list/empty-state. Default is true (optimistic).
 	subscriptionsAvailable bool
 
+	// loading is true between construction (or workspace switch) and
+	// the first SetSummaries call. While true the empty-state
+	// placeholder ("no threads") is replaced with a "Loading…"
+	// indicator so the panel never flashes "no threads" before the
+	// threads-list fetcher has had a chance to populate it.
+	loading bool
+
 	version int64
 }
 
@@ -229,6 +236,22 @@ func (m *Model) SetSummaries(s []cache.ThreadSummary) {
 	m.selected = newSel
 	m.clampSelection()
 	m.hasSnapped = false // force re-snap on next render
+	// First SetSummaries call ends the bootstrap loading state; an
+	// empty slice now legitimately means "no threads."
+	m.loading = false
+	m.dirty()
+}
+
+// SetLoading toggles the bootstrap loading indicator. Setting true is
+// only meaningful before the first SetSummaries call (or after a
+// workspace switch where the previous workspace's summaries should be
+// suppressed until fresh data arrives). Setting false is equivalent to
+// SetSummaries(nil) for the empty-state branch.
+func (m *Model) SetLoading(loading bool) {
+	if m.loading == loading {
+		return
+	}
+	m.loading = loading
 	m.dirty()
 }
 
@@ -509,7 +532,11 @@ func (m *Model) View(height, width int) string {
 	// banner.
 	var body string
 	if len(m.summaries) == 0 {
-		empty := mutedStyle().Render("no threads")
+		text := "no threads"
+		if m.loading {
+			text = "⏳  Loading threads…"
+		}
+		empty := mutedStyle().Render(text)
 		body = lipgloss.Place(width, bodyHeight, lipgloss.Center, lipgloss.Center, empty)
 	} else {
 		lines := m.renderRows(width)

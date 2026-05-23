@@ -985,9 +985,18 @@ func (c *Client) UploadFiles(
 // UnreadInfo holds the unread state for a single channel.
 type UnreadInfo struct {
 	ChannelID string
-	Count     int
-	HasUnread bool
-	LastRead  string // Slack message timestamp
+	// Count is the badge value the UI uses for the per-row indicator.
+	// For channels and mpims it equals MentionCount, falling back to 1
+	// when has_unreads is true but no mentions exist. For ims it is 1
+	// when has_unreads (DMs carry no mention concept on the wire).
+	Count int
+	// MentionCount is Slack's raw mention_count value, with no fallback
+	// substitution. Used by the sidebar to lift mention-bearing channels
+	// to the top of their section. Ims (1:1 DMs) always report 0 here
+	// because client.counts does not include mention_count for ims.
+	MentionCount int
+	HasUnread    bool
+	LastRead     string // Slack message timestamp
 }
 
 // ThreadsAggregate captures Slack's server-side notion of whether the
@@ -1074,9 +1083,10 @@ func (c *Client) GetUnreadCounts() ([]UnreadInfo, ThreadsAggregate, error) {
 	var unreads []UnreadInfo
 	for _, ch := range result.Channels {
 		info := UnreadInfo{
-			ChannelID: ch.ID,
-			LastRead:  ch.LastRead,
-			HasUnread: ch.HasUnreads,
+			ChannelID:    ch.ID,
+			LastRead:     ch.LastRead,
+			HasUnread:    ch.HasUnreads,
+			MentionCount: ch.MentionCount,
 		}
 		if ch.HasUnreads {
 			info.Count = ch.MentionCount
@@ -1088,9 +1098,10 @@ func (c *Client) GetUnreadCounts() ([]UnreadInfo, ThreadsAggregate, error) {
 	}
 	for _, ch := range result.Mpims {
 		info := UnreadInfo{
-			ChannelID: ch.ID,
-			LastRead:  ch.LastRead,
-			HasUnread: ch.HasUnreads,
+			ChannelID:    ch.ID,
+			LastRead:     ch.LastRead,
+			HasUnread:    ch.HasUnreads,
+			MentionCount: ch.MentionCount,
 		}
 		if ch.HasUnreads {
 			info.Count = max(ch.MentionCount, 1)
