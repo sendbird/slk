@@ -123,3 +123,68 @@ func TestInputSourceSwitcherCurrentFailureStillSwitchesNormal(t *testing.T) {
 		t.Fatalf("selected = %#v, want %#v", got, want)
 	}
 }
+
+func TestInputSourceSwitcherChannelFinderEnterStoresAndSwitchesEnglish(t *testing.T) {
+	r := &fakeInputSourceRunner{currents: []string{"com.apple.inputmethod.Korean.2SetKorean"}}
+	s := testInputSourceSwitcher(r)
+
+	s.OnModeChange(ModeNormal, ModeChannelFinder)
+
+	if got, want := s.previousFinderSource, "com.apple.inputmethod.Korean.2SetKorean"; got != want {
+		t.Fatalf("previousFinderSource = %q, want %q", got, want)
+	}
+	if got, want := r.selected, []string{"com.apple.keylayout.ABC"}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("selected = %#v, want %#v", got, want)
+	}
+}
+
+func TestInputSourceSwitcherChannelFinderLeaveRestoresPrevious(t *testing.T) {
+	r := &fakeInputSourceRunner{currents: []string{"com.apple.inputmethod.Korean.2SetKorean"}}
+	s := testInputSourceSwitcher(r)
+
+	s.OnModeChange(ModeNormal, ModeChannelFinder)
+	s.OnModeChange(ModeChannelFinder, ModeNormal)
+
+	if s.previousFinderSource != "" {
+		t.Fatalf("previousFinderSource = %q, want cleared after restore", s.previousFinderSource)
+	}
+	if got, want := r.selected, []string{"com.apple.keylayout.ABC", "com.apple.inputmethod.Korean.2SetKorean"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("selected = %#v, want %#v", got, want)
+	}
+}
+
+// The channel-finder stash must NOT be clobbered by an Insert→Normal
+// transition happening in between (e.g., user enters Insert briefly,
+// returns to Normal — the channel finder slot belongs to ChannelFinder).
+func TestInputSourceSwitcherChannelFinderSlotDoesNotClobberInsertSlot(t *testing.T) {
+	r := &fakeInputSourceRunner{
+		currents: []string{
+			"com.apple.inputmethod.Korean.2SetKorean", // captured by Insert→Normal
+			"com.apple.keylayout.ABC",                 // captured by Normal→ChannelFinder
+		},
+	}
+	s := testInputSourceSwitcher(r)
+
+	s.OnModeChange(ModeInsert, ModeNormal)
+	s.OnModeChange(ModeNormal, ModeChannelFinder)
+
+	if got, want := s.previousInsertSource, "com.apple.inputmethod.Korean.2SetKorean"; got != want {
+		t.Fatalf("previousInsertSource = %q, want %q", got, want)
+	}
+	if got, want := s.previousFinderSource, "com.apple.keylayout.ABC"; got != want {
+		t.Fatalf("previousFinderSource = %q, want %q", got, want)
+	}
+}
+
+func TestInputSourceSwitcherChannelFinderLeaveWithoutEnterNoop(t *testing.T) {
+	r := &fakeInputSourceRunner{}
+	s := testInputSourceSwitcher(r)
+
+	// Never entered ChannelFinder; a stray leave (e.g. mode flipped
+	// programmatically) must not call Select.
+	s.OnModeChange(ModeChannelFinder, ModeNormal)
+
+	if len(r.selected) != 0 {
+		t.Fatalf("selected = %#v, want none", r.selected)
+	}
+}

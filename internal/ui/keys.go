@@ -20,6 +20,7 @@ type KeyMap struct {
 	InsertMode          key.Binding
 	CommandMode         key.Binding
 	SearchMode          key.Binding
+	ChannelSearch       key.Binding
 	Tab                 key.Binding
 	ShiftTab            key.Binding
 	ToggleSidebar       key.Binding
@@ -63,6 +64,7 @@ func DefaultKeyMap() KeyMap {
 		InsertMode:          key.NewBinding(key.WithKeys("i", "f2"), key.WithHelp("i/F2", "insert mode")),
 		CommandMode:         key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "command mode")),
 		SearchMode:          key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "global search")),
+		ChannelSearch:       key.NewBinding(key.WithKeys("ctrl+f"), key.WithHelp("ctrl+f", "search in channel")),
 		Tab:                 key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next panel")),
 		ShiftTab:            key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev panel")),
 		ToggleSidebar:       key.NewBinding(key.WithKeys("ctrl+b"), key.WithHelp("ctrl+b", "toggle sidebar")),

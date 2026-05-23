@@ -5,8 +5,40 @@ import (
 	"strings"
 
 	slackclient "github.com/gammons/slk/internal/slack"
+	"github.com/gammons/slk/internal/ui"
 	"github.com/gammons/slk/internal/ui/globalsearch"
 )
+
+// channelSearchPrefix turns a Ctrl+F scope into the Slack search
+// query prefix that restricts results to the active channel or DM.
+//
+// Mappings:
+//   - channel / private  → "in:<name>"
+//   - dm / app           → "with:<@U…>" when DMUserID is set; otherwise empty
+//   - group_dm           → empty (the App's open path already filters this out)
+//
+// Slack's search modifier accepts `in:<name>` without the leading `#`
+// — the web client autocompletes the hash for display, but the API
+// parses the modifier on the bare name. Adding the `#` previously
+// caused the API to fall back to an unfiltered search on some
+// workspaces.
+//
+// Returns an empty string if no prefix can be derived, in which case
+// the caller must fail closed rather than silently falling back to a
+// misleadingly unscoped search.
+func channelSearchPrefix(scope ui.ChannelSearchScope) string {
+	switch scope.Type {
+	case "channel", "private":
+		if scope.Name != "" {
+			return "in:" + scope.Name
+		}
+	case "dm", "app":
+		if scope.DMUserID != "" {
+			return "with:<@" + scope.DMUserID + ">"
+		}
+	}
+	return ""
+}
 
 // messageHitsToItems converts the slack client's normalized message
 // search hits into globalsearch Items. `userNames` is the workspace's
@@ -32,8 +64,9 @@ func messageHitsToItems(hits []slackclient.MessageSearchHit, userNames map[strin
 		// on one terminal line.
 		preview := strings.ReplaceAll(h.Text, "\n", " ")
 		preview = strings.TrimSpace(preview)
-		if len(preview) > 80 {
-			preview = preview[:80] + "…"
+		previewRunes := []rune(preview)
+		if len(previewRunes) > 80 {
+			preview = string(previewRunes[:80]) + "…"
 		}
 		label := fmt.Sprintf("%s — %s", name, preview)
 		out = append(out, globalsearch.Item{
@@ -43,6 +76,7 @@ func messageHitsToItems(hits []slackclient.MessageSearchHit, userNames map[strin
 			Type:        "message",
 			ChannelID:   h.ChannelID,
 			ChannelName: h.ChannelName,
+			ChannelType: h.ChannelType,
 			MessageTS:   h.TS,
 			Permalink:   h.Permalink,
 		})
