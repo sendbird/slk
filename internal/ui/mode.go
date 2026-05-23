@@ -18,6 +18,7 @@ const (
 	ModeFilePicker
 	ModeConfirm
 	ModeHelp
+	ModeNewConvoPicker
 )
 
 func (m Mode) String() string {
@@ -50,6 +51,8 @@ func (m Mode) String() string {
 		return "CONFIRM"
 	case ModeHelp:
 		return "HELP"
+	case ModeNewConvoPicker:
+		return "NEW-CONVO"
 	default:
 		return "UNKNOWN"
 	}

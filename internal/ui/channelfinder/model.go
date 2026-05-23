@@ -130,6 +130,26 @@ func (m *Model) MarkJoined(channelID string) {
 	}
 }
 
+// UpsertItem inserts-or-replaces a single item by ID. Used when a
+// conversation appears mid-session (a freshly opened DM, an mpim, a
+// channel the user just joined) so the finder picks it up immediately
+// without waiting for the next full SetItems refresh.
+func (m *Model) UpsertItem(it Item) {
+	for i := range m.items {
+		if m.items[i].ID == it.ID {
+			m.items[i] = it
+			if m.visible {
+				m.filter()
+			}
+			return
+		}
+	}
+	m.items = append(m.items, it)
+	if m.visible {
+		m.filter()
+	}
+}
+
 // UpdateLastVisited sets the LastVisited timestamp for the matching
 // item, if any, and re-runs filter() if the overlay is currently
 // visible so the new ordering takes effect on the next render. No-op

@@ -34,6 +34,7 @@ import (
 	"github.com/gammons/slk/internal/ui/imgrender"
 	"github.com/gammons/slk/internal/ui/messages"
 	"github.com/gammons/slk/internal/ui/messages/blockkit"
+	"github.com/gammons/slk/internal/ui/newconvopicker"
 	"github.com/gammons/slk/internal/ui/presencemenu"
 	"github.com/gammons/slk/internal/ui/reactionpicker"
 	"github.com/gammons/slk/internal/ui/sidebar"
@@ -170,7 +171,12 @@ type WorkspaceContext struct {
 	// FinderItems is the merged list shown in the Ctrl+T finder. Initially
 	// contains only joined channels; the BrowseableChannelsLoadedMsg pipeline
 	// extends it with non-joined public channels in the background.
-	FinderItems   []channelfinder.Item
+	FinderItems []channelfinder.Item
+	// PickerUsers is the workspace user roster (cache.ListUsers, projected
+	// onto newconvopicker.Item) fed to the "new conversation" picker.
+	// Populated synchronously at bootstrap and refreshed when the background
+	// users.list fetch lands.
+	PickerUsers   []newconvopicker.Item
 	TeamID        string
 	TeamName      string
 	UserID        string
@@ -1442,6 +1448,41 @@ func run() error {
 			}
 			return ui.ChannelJoinedMsg{ID: channelID, Name: channelName}
 		})
+
+		app.SetDMOpener(func(teamID string, userIDs []string) tea.Msg {
+			// Route by teamID captured at submit time (not router.Active())
+			// so a workspace switch mid-flight can't redirect the DM open
+			// to the wrong workspace.
+			wctx := router.ByID(teamID)
+			if wctx == nil {
+				return ui.DMOpenFailedMsg{TeamID: teamID, UserIDs: userIDs, Err: fmt.Errorf("workspace %s no longer available", teamID)}
+			}
+			ctx := context.Background()
+			ch, err := wctx.Client.OpenConversation(ctx, userIDs)
+			if err != nil {
+				return ui.DMOpenFailedMsg{TeamID: teamID, UserIDs: userIDs, Err: err}
+			}
+			// Shape the new conversation into the same item types the
+			// rest of the UI uses, so sidebar/finder dedup/refresh stays
+			// coherent (matches the WS-event path).
+			sidebarItem, finderItem := buildChannelItem(*ch, wctx, cfg, wctx.TeamID)
+			// Persist on the originating workspace's context regardless of
+			// whether it's currently active. If the user switched away
+			// before this returned, the App's case DMOpenedMsg arm will
+			// drop the active-side update, but the channel + picker
+			// state still need to be remembered for the next switch back.
+			upsertChannelInDB(db, *ch, sidebarItem.Type, wctx.TeamID)
+			upsertWctxChannel(wctx, sidebarItem, finderItem, userIDs)
+			return ui.DMOpenedMsg{
+				TeamID:      wctx.TeamID,
+				ChannelID:   ch.ID,
+				ChannelName: sidebarItem.Name,
+				ChannelType: sidebarItem.Type,
+				UserIDs:     userIDs,
+				SidebarItem: sidebarItem,
+				FinderItem:  finderItem,
+			}
+		})
 	}
 
 	// Bind all callbacks once. They read router.Active() at invocation.
@@ -1482,6 +1523,7 @@ func run() error {
 			Theme:               cfg.ResolveTheme(teamID),
 			Channels:            wctx.Channels,
 			FinderItems:         wctx.FinderItems,
+			PickerUsers:         applyDMChannelIDs(wctx.PickerUsers, dmChannelByUser(wctx.Channels)),
 			UserNames:           wctx.UserNames,
 			ExternalUsers:       external,
 			UserID:              wctx.UserID,
@@ -1633,6 +1675,7 @@ func run() error {
 				Theme:               cfg.ResolveTheme(wctx.TeamID),
 				Channels:            wctx.Channels,
 				FinderItems:         wctx.FinderItems,
+				PickerUsers:         applyDMChannelIDs(wctx.PickerUsers, dmChannelByUser(wctx.Channels)),
 				UserNames:           wctx.UserNames,
 				ExternalUsers:       external,
 				UserID:              wctx.UserID,
@@ -1823,6 +1866,10 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 			wctx.AvatarURLs.Store(u.ID, u.AvatarURL)
 		}
 	}
+
+	// Seed the picker user list from the cache. Refreshed when the
+	// background users.list fetch lands (see refreshPickerUsers below).
+	wctx.PickerUsers = buildPickerUsers(cachedUsers, wctx.UserID)
 
 	// Construct the per-workspace async user resolver. It writes
 	// resolved display names to the cache DB and emits

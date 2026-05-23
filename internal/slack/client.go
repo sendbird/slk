@@ -38,6 +38,7 @@ type SlackAPI interface {
 	GetPermalinkContext(ctx context.Context, params *slack.PermalinkParameters) (string, error)
 	AuthTest() (*slack.AuthTestResponse, error)
 	JoinConversation(channelID string) (*slack.Channel, string, []string, error)
+	OpenConversationContext(ctx context.Context, params *slack.OpenConversationParameters) (*slack.Channel, bool, bool, error)
 	SetUserPresenceContext(ctx context.Context, presence string) error
 	GetUserPresenceContext(ctx context.Context, user string) (*slack.UserPresence, error)
 	SetSnoozeContext(ctx context.Context, minutes int) (*slack.DNDStatus, error)
@@ -463,6 +464,23 @@ func (c *Client) JoinChannel(ctx context.Context, channelID string) error {
 		return fmt.Errorf("joining channel %s: %w", channelID, err)
 	}
 	return nil
+}
+
+// OpenConversation opens (or returns the existing) DM / multiparty DM
+// channel for the given user IDs via conversations.open. One user ID
+// returns a 1:1 DM; two or more returns an mpim. Idempotent: Slack
+// returns the existing channel if it already exists.
+//
+// Returns the resolved *slack.Channel so callers can run it through
+// the same buildChannelItem path used by WS-pushed conversations,
+// keeping sidebar/finder item shapes consistent.
+func (c *Client) OpenConversation(ctx context.Context, userIDs []string) (*slack.Channel, error) {
+	params := &slack.OpenConversationParameters{Users: userIDs, ReturnIM: true}
+	ch, _, _, err := c.api.OpenConversationContext(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("opening conversation: %w", err)
+	}
+	return ch, nil
 }
 
 // GetUserProfile fetches a single user's profile by ID.

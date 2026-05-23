@@ -5,6 +5,7 @@ import (
 	"github.com/gammons/slk/internal/config"
 	"github.com/gammons/slk/internal/slackfmt"
 	"github.com/gammons/slk/internal/ui/channelfinder"
+	"github.com/gammons/slk/internal/ui/newconvopicker"
 	"github.com/gammons/slk/internal/ui/sidebar"
 	"github.com/slack-go/slack"
 )
@@ -107,4 +108,115 @@ func upsertChannelInDB(db *cache.DB, ch slack.Channel, chType string, teamID str
 		Topic:       ch.Topic.Value,
 		IsMember:    ch.IsMember,
 	})
+}
+
+// buildPickerUsers projects the workspace's cached users into the
+// shape consumed by the new-conversation picker. Excludes self
+// (currentUserID) and bots; carries IsExternal, presence, and the
+// short username from cache.User.Name. Callers that know the
+// userID→DM channel mapping (built from sidebar items or the
+// slack.Channel list) should pass it via applyDMChannelIDs to
+// populate DMChannelID, which lets the picker short-circuit Enter
+// for known users to a channel switch.
+func buildPickerUsers(users []cache.User, currentUserID string) []newconvopicker.Item {
+	out := make([]newconvopicker.Item, 0, len(users))
+	for _, u := range users {
+		if u.ID == currentUserID || u.IsBot {
+			continue
+		}
+		name := u.DisplayName
+		if name == "" {
+			name = u.Name
+		}
+		if name == "" {
+			name = u.ID
+		}
+		out = append(out, newconvopicker.Item{
+			ID:         u.ID,
+			Kind:       newconvopicker.KindUser,
+			Name:       name,
+			Username:   u.Name,
+			Presence:   u.Presence,
+			IsExternal: u.IsExternal,
+		})
+	}
+	return out
+}
+
+// applyDMChannelIDs fills out the DMChannelID field on picker user
+// items using a userID → channelID map. main.go has access to the
+// raw slack.Channel slice (with .User on IM rows), which is what
+// produces this mapping.
+func applyDMChannelIDs(items []newconvopicker.Item, dmByUser map[string]string) []newconvopicker.Item {
+	if len(dmByUser) == 0 {
+		return items
+	}
+	for i := range items {
+		if items[i].Kind != newconvopicker.KindUser {
+			continue
+		}
+		if ch, ok := dmByUser[items[i].ID]; ok {
+			items[i].DMChannelID = ch
+		}
+	}
+	return items
+}
+
+// dmChannelByUser projects sidebar items into a userID → DM channelID
+// map. Only "dm" rows with a non-empty DMUserID contribute. Used by
+// the new-conversation picker so it can short-circuit Enter on a
+// known user to a direct channel switch rather than re-calling
+// conversations.open.
+func dmChannelByUser(items []sidebar.ChannelItem) map[string]string {
+	out := make(map[string]string, len(items))
+	for _, it := range items {
+		if it.Type == "dm" && it.DMUserID != "" {
+			out[it.DMUserID] = it.ID
+		}
+	}
+	return out
+}
+
+// upsertWctxChannel records a freshly-opened DM/mpim onto the
+// WorkspaceContext so the channel survives a workspace switch and is
+// included on the next bootstrap. Idempotent: replaces by channel ID
+// when present in either slice, appends otherwise. For 1:1 DMs it
+// also patches the matching PickerUsers row to wire DMChannelID,
+// preventing the picker from re-opening the same conversation.
+func upsertWctxChannel(wctx *WorkspaceContext, sidebarItem sidebar.ChannelItem, finderItem channelfinder.Item, userIDs []string) {
+	if wctx == nil {
+		return
+	}
+	replaced := false
+	for i, it := range wctx.Channels {
+		if it.ID == sidebarItem.ID {
+			wctx.Channels[i] = sidebarItem
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		wctx.Channels = append(wctx.Channels, sidebarItem)
+	}
+	replaced = false
+	for i, it := range wctx.FinderItems {
+		if it.ID == finderItem.ID {
+			wctx.FinderItems[i] = finderItem
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		wctx.FinderItems = append(wctx.FinderItems, finderItem)
+	}
+	// Wire DMChannelID on the matching PickerUsers row for 1:1 DMs so
+	// the picker can short-circuit future Enters on this user.
+	if sidebarItem.Type == "dm" && sidebarItem.DMUserID != "" {
+		for i := range wctx.PickerUsers {
+			if wctx.PickerUsers[i].ID == sidebarItem.DMUserID {
+				wctx.PickerUsers[i].DMChannelID = sidebarItem.ID
+				break
+			}
+		}
+	}
 }
