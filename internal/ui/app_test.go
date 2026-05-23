@@ -313,6 +313,23 @@ func TestHandleInsertMode_ShiftEnterInsertsNewline(t *testing.T) {
 	}
 }
 
+func queuedChannelSelectedMsg(cmd tea.Cmd) (ChannelSelectedMsg, bool) {
+	if cmd == nil {
+		return ChannelSelectedMsg{}, false
+	}
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, child := range batch {
+			if selected, ok := queuedChannelSelectedMsg(child); ok {
+				return selected, true
+			}
+		}
+		return ChannelSelectedMsg{}, false
+	}
+	selected, ok := msg.(ChannelSelectedMsg)
+	return selected, ok
+}
+
 func TestHandleInsertMode_BackslashEnterInsertsNewline(t *testing.T) {
 	app := NewApp()
 	app.activeChannelID = "C1"
