@@ -189,8 +189,8 @@ type WorkspaceContext struct {
 	Presence   string    // "active" or "away"; "" until first fetch
 	DNDEnabled bool      // true if either snooze or admin-DND is active
 	DNDEndTS   time.Time // unified end timestamp; zero if not in DND
-	// LastVisitedByChannel maps channelID -> unix-second timestamp of
-	// the user's most recent visit to that channel in this workspace.
+	// LastVisitedByChannel maps channelID -> unix-millisecond timestamp
+	// of the user's most recent visit to that channel in this workspace.
 	// Populated once at connect from cache.GetChannelVisits and
 	// updated on every ChannelSelectedMsg via the visit recorder.
 	// Used to populate channelfinder.Item.LastVisited for sort.
@@ -1372,6 +1372,35 @@ func run() error {
 				return ui.ActivityListLoadedMsg{TeamID: teamID, Items: nil}
 			}
 			return ui.ActivityListLoadedMsg{TeamID: teamID, Items: items}
+		})
+
+		// Activity-view right-side preview: loads the channel-message
+		// context for the currently selected Activity item from the
+		// local cache. Cache-only so rapid j/k cursor moves don't fan
+		// out into N network calls — if the cache is cold for that
+		// channel the preview is empty, which is still better than the
+		// previous behavior (nothing at all).
+		app.SetActivityPreviewFetcher(func(channelID, anchorTS string) tea.Msg {
+			wctx := router.Active()
+			if wctx == nil {
+				return nil
+			}
+			var channelName, channelType string
+			for _, ch := range wctx.Channels {
+				if ch.ID == channelID {
+					channelName = ch.Name
+					channelType = ch.Type
+					break
+				}
+			}
+			msgs := loadCachedMessages(db, wctx.Client.UserID(), channelID, wctx.UserNames, tsFormat, router)
+			return ui.ActivityPreviewLoadedMsg{
+				ChannelID:   channelID,
+				ChannelName: channelName,
+				ChannelType: channelType,
+				AnchorTS:    anchorTS,
+				Messages:    msgs,
+			}
 		})
 
 		app.SetThreadReplySender(func(channelID, threadTS, text string) tea.Msg {

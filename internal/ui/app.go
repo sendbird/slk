@@ -123,6 +123,14 @@ type (
 		// is unaffected — going back to a channel still updates its
 		// last-visited timestamp.
 		FromHistory bool
+		// FromAutoSelect marks startup/workspace-switch fallback
+		// selections where the user's previous channel could not be
+		// resolved and we landed on channels[0] purely as a default.
+		// The handler skips visit recording for these so the fallback
+		// channel (typically the alphabetically-first joined channel,
+		// e.g. #0_announcements) doesn't get pinned at the top of the
+		// Ctrl+T finder by every cold start.
+		FromAutoSelect bool
 	}
 	MessagesLoadedMsg struct {
 		ChannelID  string
@@ -200,6 +208,21 @@ type (
 	ActivityListLoadedMsg struct {
 		TeamID string
 		Items  []cache.ActivityItem
+	}
+	// ActivityPreviewLoadedMsg carries the channel-message context for the
+	// currently selected Activity item. Fired asynchronously from main.go
+	// after a selection change (or activation) so the right-side preview
+	// pane can show the messages around the activity's anchor TS. The App
+	// drops the message if either: the user has left ViewActivity by the
+	// time it lands, or the current activity selection has moved on (TS
+	// no longer matches AnchorTS) — both are common when the user holds
+	// down j/k.
+	ActivityPreviewLoadedMsg struct {
+		ChannelID   string
+		ChannelName string
+		ChannelType string
+		AnchorTS    string
+		Messages    []messages.MessageItem
 	}
 	// ThreadsListDirtyMsg is dispatched when something that could affect
 	// the involved-threads list has changed (new message, mention, etc.)
@@ -800,6 +823,14 @@ type ThreadsListFetchFunc func(teamID string) tea.Msg
 // Returns the resulting tea.Msg (typically ActivityListLoadedMsg).
 type ActivityListFetchFunc func(teamID string) tea.Msg
 
+// ActivityPreviewFetchFunc loads the channel-message context shown in
+// the right-side preview pane for an Activity item. Implementations
+// pull from the local cache (synchronous-friendly) keyed by channelID,
+// and may use anchorTS as a hint for the "select this message in the
+// returned list" target (the App still re-checks the selection on
+// arrival, see ActivityPreviewLoadedMsg).
+type ActivityPreviewFetchFunc func(channelID, anchorTS string) tea.Msg
+
 type ReactionAddFunc func(channelID, messageTS, emoji string) error
 type ReactionRemoveFunc func(channelID, messageTS, emoji string) error
 
@@ -910,6 +941,15 @@ type App struct {
 	threadCompose   compose.Model
 	threadsView     threadsview.Model
 	activityView    activityview.Model
+	// activityPreview is a second messages.Model instance that renders
+	// the channel-message context for the currently selected Activity
+	// item. Read-only: never receives focus, no key routing, no Panel
+	// enum entry. Lives in the right half of the main-pane area only
+	// when view == ViewActivity. Reusing messages.Model keeps the
+	// look-and-feel identical to the main pane and inherits image /
+	// avatar / cache invalidation handling — at the cost that the
+	// cross-cutting messagepane lifecycle calls must mirror here too.
+	activityPreview messages.Model
 
 	// State
 	mode           Mode
@@ -961,8 +1001,15 @@ type App struct {
 
 	// Current context
 	activeChannelID string
-	activeTeamID    string // workspace whose data is currently loaded into the side panels
-	pendingTopKey   bool
+	// activeChannelFromAutoSelect is true when the current activeChannelID
+	// was picked by a startup/workspace-switch fallback (FromAutoSelect)
+	// rather than by an explicit user action. Used to skip persisting it
+	// into lastChannelByTeam on workspace switch — otherwise the fallback
+	// channel becomes the "last viewed" for that workspace and pins itself
+	// on every subsequent round-trip.
+	activeChannelFromAutoSelect bool
+	activeTeamID                string // workspace whose data is currently loaded into the side panels
+	pendingTopKey               bool
 
 	// bootstrapActiveClaimed flips on the first WorkspaceReadyMsg whose
 	// InitialActive=true is observed. Subsequent InitialActive=true
@@ -1043,6 +1090,10 @@ type App struct {
 	openDMFn            OpenDMFunc
 	threadsListFetcher  ThreadsListFetchFunc
 	activityListFetcher ActivityListFetchFunc
+	// activityPreviewFetcher loads the channel-message context for the
+	// right-side preview shown next to the activity list. Called on
+	// activity-view activation and on selection-cursor movement.
+	activityPreviewFetcher ActivityPreviewFetchFunc
 	// channelLastReadFetcher returns the parent channel's last_read_ts
 	// so the thread panel can render a "── new ──" boundary. Optional —
 	// when nil, the thread panel renders without an unread boundary.
@@ -1280,6 +1331,7 @@ func NewApp() *App {
 		threadCompose:         compose.New("thread"),
 		threadsView:           threadsview.New(nil, ""),
 		activityView:          activityview.New(nil, ""),
+		activityPreview:       messages.New(nil, ""),
 		reactionPicker:        reactionpicker.New(),
 		confirmPrompt:         confirmprompt.New(),
 		mode:                  ModeNormal,
@@ -1391,6 +1443,7 @@ func (a *App) finishPendingInitialReadyWithChannels(channels []sidebar.ChannelIt
 		return nil
 	}
 	target, ok := exactChannelByID(channels, a.pendingInitialRestoreChannelID)
+	matched := ok
 	if !ok {
 		if !allowFallback {
 			return nil
@@ -1405,13 +1458,20 @@ func (a *App) finishPendingInitialReadyWithChannels(channels []sidebar.ChannelIt
 	}
 	a.sidebar.SelectByID(target.ID)
 	return func() tea.Msg {
-		return ChannelSelectedMsg{ID: target.ID, Name: target.Name, Type: target.Type}
+		return ChannelSelectedMsg{ID: target.ID, Name: target.Name, Type: target.Type, FromAutoSelect: !matched}
 	}
 }
 
-func channelTargetByID(channels []sidebar.ChannelItem, ids ...string) (sidebar.ChannelItem, bool) {
+// channelTargetByID resolves the first matching channel from ids. The
+// second return signals whether a supplied ID actually matched a real
+// channel (true) versus the caller falling through to channels[0] as a
+// default (false). Callers use this to distinguish a real restore from
+// a "we had to pick something" auto-select so they can skip side
+// effects like recording a channel visit. The third return is true
+// whenever a target exists at all (i.e., channels is non-empty).
+func channelTargetByID(channels []sidebar.ChannelItem, ids ...string) (sidebar.ChannelItem, bool, bool) {
 	if len(channels) == 0 {
-		return sidebar.ChannelItem{}, false
+		return sidebar.ChannelItem{}, false, false
 	}
 	for _, id := range ids {
 		if id == "" {
@@ -1419,11 +1479,11 @@ func channelTargetByID(channels []sidebar.ChannelItem, ids ...string) (sidebar.C
 		}
 		for _, ch := range channels {
 			if ch.ID == id {
-				return ch, true
+				return ch, true, true
 			}
 		}
 	}
-	return channels[0], true
+	return channels[0], false, true
 }
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1574,6 +1634,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				panel, _, py, ok := a.panelAt(msg.X, msg.Y)
 				if ok && panel == PanelMessages && py >= 0 {
 					a.activityView.ClickAt(py)
+					return a, a.loadActivityPreviewCmd()
 				}
 				break
 			}
@@ -1923,15 +1984,34 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.activeChannelID = msg.ID
 		a.lastTypingSent = time.Time{} // reset typing throttle for new channel
 		// Update local finder ordering immediately so the next Ctrl+T
-		// sees this channel at the top of the recents.
-		now := time.Now().Unix()
-		a.channelFinder.UpdateLastVisited(msg.ID, now)
-		a.globalSearch.UpdateLastVisited(msg.ID, now)
-		// Persist the visit (SQLite write + WorkspaceContext map update)
-		// asynchronously via main.go's recorder closure.
-		if a.channelVisitRecorder != nil {
-			a.channelVisitRecorder(msg.ID)
+		// sees this channel at the top of the recents. Must use
+		// UnixMilli to match the scale persisted by channelVisitRecorder
+		// and seeded into FinderItems from wctx.LastVisitedByChannel —
+		// mixing seconds and milliseconds in the same sorted list makes
+		// new visits sort *below* older ones.
+		// Skip both updates for FromAutoSelect — that's a startup
+		// fallback to channels[0], not a user-initiated visit; counting
+		// it would pin the alphabetically-first joined channel at the
+		// top of the finder on every cold start.
+		if !msg.FromAutoSelect {
+			now := time.Now().UnixMilli()
+			a.channelFinder.UpdateLastVisited(msg.ID, now)
+			a.globalSearch.UpdateLastVisited(msg.ID, now)
+			// Persist the visit (SQLite write + WorkspaceContext map update)
+			// asynchronously via main.go's recorder closure.
+			if a.channelVisitRecorder != nil {
+				a.channelVisitRecorder(msg.ID)
+			}
 		}
+		// Track whether the current activeChannelID represents real user
+		// intent vs. a startup/workspace-switch fallback. The workspace-
+		// switch handler reads activeChannelID into lastChannelByTeam so
+		// that flipping back to this workspace later restores the same
+		// channel — but for a fallback selection that "same channel" is
+		// channels[0], which would re-pin the alphabetically-first joined
+		// channel on every workspace round-trip (the same bug as
+		// FromAutoSelect-gated visit recording, one indirection deeper).
+		a.activeChannelFromAutoSelect = msg.FromAutoSelect
 		if !msg.FromHistory {
 			a.pushNavHistory(a.activeTeamID, msg.ID)
 		}
@@ -2116,6 +2196,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.threadPanel.HasReply(msg.TS) {
 			a.threadPanel.InvalidateCache()
 		}
+		// Activity preview: same shape as messagepane — when it's
+		// currently showing the affected channel, the cached render
+		// needs the bytes inline. The model itself filters by active
+		// channel name so this is a no-op when the preview is showing
+		// a different channel or is empty.
+		a.activityPreview.HandleImageReady(msg.Channel, msg.TS, msg.Key)
 
 	case messages.AvatarReadyMsg:
 		// A lazy avatar fetch landed for msg.UserID. Both the messages
@@ -2125,6 +2211,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// is cheap relative to the cost of a missing avatar.
 		a.messagepane.HandleAvatarReady(msg.UserID)
 		a.threadPanel.HandleAvatarReady(msg.UserID)
+		a.activityPreview.HandleAvatarReady(msg.UserID)
 
 	case imgrender.ImageFailedMsg:
 		debuglog.ImgFetch("recv: kind=failed key=%s req_id=%d", msg.Key, msg.ReqID)
@@ -2137,6 +2224,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Mirror the in-flight bookkeeping on the thread panel so a
 		// permanently-failed image isn't re-attempted from the thread.
 		a.threadPanel.HandleImageFailed(msg.Key)
+		// Same for the activity preview pane.
+		a.activityPreview.HandleImageFailed(msg.Key)
 
 	case messages.OpenImagePreviewMsg:
 		// Open the overlay IMMEDIATELY in a loading state so the user
@@ -2588,6 +2677,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.sidebar.SetThreadsActive(false)
 		a.sidebar.SetActivityActive(true)
 		a.focusedPanel = PanelMessages
+		// Close any open thread panel — activity view needs the right
+		// half of the main-pane area for its own preview. Letting both
+		// coexist would either three-way split the layout (unusable
+		// widths) or hide one behind the other.
+		a.CloseThread()
 		if a.channelVisitRecorder != nil {
 			a.channelVisitRecorder(LastViewedKindActivity)
 		}
@@ -2595,6 +2689,14 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			fetcher := a.activityListFetcher
 			team := a.activeTeamID
 			cmds = append(cmds, func() tea.Msg { return fetcher(team) })
+		}
+		// Seed the right-side preview with whatever's currently selected.
+		// The list itself may not have refreshed yet — that's fine, the
+		// fetcher reads from the cache and the previously-selected item
+		// is still valid. The follow-up ActivityListLoadedMsg below will
+		// re-seed if SetItems changed the selection target.
+		if cmd := a.loadActivityPreviewCmd(); cmd != nil {
+			cmds = append(cmds, cmd)
 		}
 
 	case ThreadsListLoadedMsg:
@@ -2616,6 +2718,43 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.TeamID == a.activeTeamID {
 			a.activityView.SetItems(msg.Items)
 			a.sidebar.SetActivityUnreadCount(a.activityView.UnreadCount())
+			// Re-seed the preview if we're currently in Activity view —
+			// SetItems may have picked a different selection target (or
+			// the first valid one when the previous selection vanished).
+			if a.view == ViewActivity {
+				if cmd := a.loadActivityPreviewCmd(); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			}
+		}
+
+	case ActivityPreviewLoadedMsg:
+		// Drop the message if the user has navigated away from the
+		// activity view or if the selection has moved on since the
+		// fetch was dispatched (rapid j/k can spawn multiple in-flight
+		// fetches; only the latest one matches the current cursor).
+		if a.view != ViewActivity {
+			break
+		}
+		item, ok := a.activityView.SelectedItem()
+		if !ok || item.ChannelID != msg.ChannelID || item.TS != msg.AnchorTS {
+			break
+		}
+		a.activityPreview.SetChannel(msg.ChannelName, "")
+		a.activityPreview.SetChannelType(msg.ChannelType)
+		a.activityPreview.SetMessages(msg.Messages)
+		// Highlight the anchor message if it's present in the loaded
+		// window. messages.Model.SetMessages selects the last message
+		// (len(msgs)-1) by default; SelectByIndex moves the selection
+		// to the activity's target so the user immediately sees which
+		// message generated the activity (mention, reply, reaction,
+		// etc.). If the target isn't in the window we leave the
+		// default selection rather than guess.
+		for i := range msg.Messages {
+			if msg.Messages[i].TS == msg.AnchorTS {
+				a.activityPreview.SelectByIndex(i)
+				break
+			}
 		}
 
 	case ThreadsListDirtyMsg:
@@ -2779,6 +2918,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.messagepane.PatchUserName(msg.UserID, msg.DisplayName)
 		a.threadPanel.PatchUserName(msg.UserID, msg.DisplayName)
 		a.newConvoPicker.PatchUserName(msg.UserID, msg.DisplayName)
+		a.activityPreview.PatchUserName(msg.UserID, msg.DisplayName)
 		// IsBot affects DM channel-type classification, but that's
 		// orchestrated by DMNameResolvedMsg; this handler is only the
 		// in-history name patch. IsBot is carried for forward
@@ -2813,8 +2953,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Remember which channel we were on in the workspace we're
 		// leaving so that switching back lands the user on the same
 		// channel rather than always snapping to the sidebar's first
-		// entry.
-		if a.activeTeamID != "" && a.activeChannelID != "" && a.activeTeamID != msg.TeamID {
+		// entry. Skip when the active channel was itself an
+		// auto-select fallback: that channel never represented user
+		// intent, and persisting it here would pin channels[0] of the
+		// outgoing workspace as its "last viewed" forever after, which
+		// is the same bug FromAutoSelect was added to prevent for the
+		// visit recorder.
+		if a.activeTeamID != "" && a.activeChannelID != "" && a.activeTeamID != msg.TeamID && !a.activeChannelFromAutoSelect {
 			a.lastChannelByTeam[a.activeTeamID] = a.activeChannelID
 		}
 		a.cancelEdit()
@@ -2871,6 +3016,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.messagepane.InvalidateCache()
 			a.threadPanel.InvalidateCache()
 			a.sidebar.InvalidateCache()
+			a.activityPreview.InvalidateCache()
 			a.compose.RefreshStyles()
 			a.threadCompose.RefreshStyles()
 			a.globalSearch.RefreshStyles()
@@ -2891,10 +3037,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.sidebar.SelectActivityRow()
 				cmds = append(cmds, func() tea.Msg { return ActivityViewActivatedMsg{} })
 			}
-		} else if target, ok := channelTargetByID(msg.Channels, a.lastChannelByTeam[msg.TeamID], msg.LastViewedChannelID); ok {
+		} else if target, matched, ok := channelTargetByID(msg.Channels, a.lastChannelByTeam[msg.TeamID], msg.LastViewedChannelID); ok {
 			a.sidebar.SelectByID(target.ID)
 			cmds = append(cmds, func() tea.Msg {
-				return ChannelSelectedMsg{ID: target.ID, Name: target.Name, Type: target.Type}
+				return ChannelSelectedMsg{ID: target.ID, Name: target.Name, Type: target.Type, FromAutoSelect: !matched}
 			})
 		} else {
 			a.sidebar.SelectThreadsRow()
@@ -3033,6 +3179,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.messagepane.InvalidateCache()
 				a.threadPanel.InvalidateCache()
 				a.sidebar.InvalidateCache()
+				a.activityPreview.InvalidateCache()
 				a.compose.RefreshStyles()
 				a.threadCompose.RefreshStyles()
 				a.globalSearch.RefreshStyles()
@@ -3084,7 +3231,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, func() tea.Msg { return ActivityViewActivatedMsg{} })
 				}
 			default:
-				if target, ok := channelTargetByID(msg.Channels, msg.LastViewedChannelID); ok {
+				if target, matched, ok := channelTargetByID(msg.Channels, msg.LastViewedChannelID); ok {
 					a.sidebar.SelectByID(target.ID)
 					a.messagepane.SetLoading(true)
 					a.messagepane.SetMessages(nil)
@@ -3092,7 +3239,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return SpinnerTickMsg{}
 					}))
 					cmds = append(cmds, func() tea.Msg {
-						return ChannelSelectedMsg{ID: target.ID, Name: target.Name, Type: target.Type}
+						return ChannelSelectedMsg{ID: target.ID, Name: target.Name, Type: target.Type, FromAutoSelect: !matched}
 					})
 				} else if deferInitialReady {
 					a.messagepane.SetLoading(true)
@@ -3827,16 +3974,16 @@ func (a *App) handleNormalMode(msg tea.KeyMsg) tea.Cmd {
 		}
 
 	case a.matchesKey(msg, a.keys.PageUp):
-		a.scrollFocusedPanel(-a.pageSize())
+		return a.scrollFocusedPanel(-a.pageSize())
 
 	case a.matchesKey(msg, a.keys.PageDown):
-		a.scrollFocusedPanel(a.pageSize())
+		return a.scrollFocusedPanel(a.pageSize())
 
 	case a.matchesKey(msg, a.keys.HalfPageUp):
-		a.scrollFocusedPanel(-a.halfPageSize())
+		return a.scrollFocusedPanel(-a.halfPageSize())
 
 	case a.matchesKey(msg, a.keys.HalfPageDown):
-		a.scrollFocusedPanel(a.halfPageSize())
+		return a.scrollFocusedPanel(a.halfPageSize())
 
 	case a.matchesKey(msg, a.keys.Help):
 		a.help.SetEntries(help.FromKeyMap(a.keys))
@@ -4677,6 +4824,7 @@ func (a *App) handleThemeSwitcherMode(msg tea.KeyMsg) tea.Cmd {
 		a.messagepane.InvalidateCache()
 		a.threadPanel.InvalidateCache()
 		a.sidebar.InvalidateCache()
+		a.activityPreview.InvalidateCache()
 		// Refresh compose textarea styles for new theme
 		a.compose.RefreshStyles()
 		a.threadCompose.RefreshStyles()
@@ -5134,7 +5282,7 @@ func (a *App) handleDown() tea.Cmd {
 		}
 		if a.view == ViewActivity {
 			a.activityView.MoveDown()
-			return nil
+			return a.loadActivityPreviewCmd()
 		}
 		a.messagepane.MoveDown()
 	case PanelThread:
@@ -5155,7 +5303,7 @@ func (a *App) handleUp() tea.Cmd {
 		}
 		if a.view == ViewActivity {
 			a.activityView.MoveUp()
-			return nil
+			return a.loadActivityPreviewCmd()
 		}
 		a.messagepane.MoveUp()
 		// If at top, fetch older messages
@@ -5192,6 +5340,10 @@ func (a *App) handleGoToTop() tea.Cmd {
 			a.threadsView.GoToTop()
 			return a.openSelectedThreadCmd(false)
 		}
+		if a.view == ViewActivity {
+			a.activityView.GoToTop()
+			return a.loadActivityPreviewCmd()
+		}
 		a.messagepane.GoToTop()
 		if a.messagepane.AtTop() && !a.fetchingOlder && a.olderMessagesFetcher != nil {
 			a.fetchingOlder = true
@@ -5226,7 +5378,7 @@ func (a *App) handleGoToBottom() tea.Cmd {
 		}
 		if a.view == ViewActivity {
 			a.activityView.GoToBottom()
-			return nil
+			return a.loadActivityPreviewCmd()
 		}
 		a.messagepane.GoToBottom()
 	case PanelThread:
@@ -5366,6 +5518,9 @@ func (a *App) flushMouseWheel() tea.Cmd {
 					a.activityView.MoveDown()
 				}
 			}
+			if cmd := a.loadActivityPreviewCmd(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		default:
 			for i := 0; i < steps; i++ {
 				if up {
@@ -5470,9 +5625,12 @@ func (a *App) panelAt(x, y int) (panel Panel, paneX, paneY int, ok bool) {
 // started -- effectively undoing the page jump. Moving by N selection
 // steps fixes that and also exercises sidebar's threads-row transition
 // logic naturally.
-func (a *App) scrollFocusedPanel(delta int) {
+// Returns a tea.Cmd when the resulting selection change has a side
+// effect to dispatch (currently: activity-view selection triggers a
+// preview reload). Callers should `return a.scrollFocusedPanel(...)`.
+func (a *App) scrollFocusedPanel(delta int) tea.Cmd {
 	if delta == 0 {
-		return
+		return nil
 	}
 	steps := delta
 	if steps < 0 {
@@ -5510,6 +5668,7 @@ func (a *App) scrollFocusedPanel(delta int) {
 					a.activityView.MoveDown()
 				}
 			}
+			return a.loadActivityPreviewCmd()
 		} else {
 			if delta < 0 {
 				for i := 0; i < steps; i++ {
@@ -5532,6 +5691,7 @@ func (a *App) scrollFocusedPanel(delta int) {
 			}
 		}
 	}
+	return nil
 }
 
 // openQuitConfirm raises the centered "Quit slk?" overlay. Called from
@@ -5879,6 +6039,34 @@ func (a *App) openSelectedThreadCmd(debounce bool) tea.Cmd {
 	return tea.Batch(batch...)
 }
 
+// loadActivityPreviewCmd returns a tea.Cmd that fires the configured
+// activityPreviewFetcher for the currently selected Activity item.
+// Returns nil — safe to append unconditionally — when there's no fetcher
+// wired, no current selection, or the selection has no channel attached.
+// The fetcher itself is responsible for pulling from the cache; the App
+// re-checks the returned message's AnchorTS against the live selection
+// when ActivityPreviewLoadedMsg arrives, so a stale fetch (user moved
+// cursor while a fetch was in flight) is dropped automatically.
+// As a side effect, clears the preview panel when there's no valid
+// selection — otherwise a previous activity's message list would
+// linger on screen after the list is emptied or the cursor lands on
+// a no-channel item.
+func (a *App) loadActivityPreviewCmd() tea.Cmd {
+	if a.activityPreviewFetcher == nil {
+		return nil
+	}
+	item, ok := a.activityView.SelectedItem()
+	if !ok || item.ChannelID == "" {
+		a.activityPreview.SetChannel("", "")
+		a.activityPreview.SetMessages(nil)
+		return nil
+	}
+	fetcher := a.activityPreviewFetcher
+	channelID := item.ChannelID
+	anchorTS := item.TS
+	return func() tea.Msg { return fetcher(channelID, anchorTS) }
+}
+
 // applyThreadUnreadBoundary tells the thread panel where the unread
 // boundary is for `channelID` so it can render a "── new ──" landmark
 // before the first reply the user hasn't seen. No-op when no last-read
@@ -6066,6 +6254,7 @@ func (a *App) SetChannels(items []sidebar.ChannelItem) {
 	a.threadPanel.SetChannelNames(names)
 	a.threadsView.SetChannelNames(names)
 	a.activityView.SetChannelNames(names)
+	a.activityPreview.SetChannelNames(names)
 }
 
 // SetChannelFetcher sets the callback used to load messages when a channel is selected.
@@ -6235,6 +6424,13 @@ func (a *App) SetActivityListFetcher(f ActivityListFetchFunc) {
 	a.activityListFetcher = f
 }
 
+// SetActivityPreviewFetcher wires the function that loads the channel-
+// message context for the activity-view right-side preview. Called by
+// main.go. Safe to leave nil — the preview pane just stays empty.
+func (a *App) SetActivityPreviewFetcher(f ActivityPreviewFetchFunc) {
+	a.activityPreviewFetcher = f
+}
+
 func (a *App) SetChannelFinderItems(items []channelfinder.Item) {
 	a.channelFinder.SetItems(items)
 	a.globalSearch.SetItems(globalSearchItemsFromFinder(items))
@@ -6284,6 +6480,7 @@ func globalSearchItemsFromFinder(items []channelfinder.Item) []globalsearch.Item
 func (a *App) SetAvatarFunc(fn messages.AvatarFunc) {
 	a.messagepane.SetAvatarFunc(fn)
 	a.threadPanel.SetAvatarFunc(fn)
+	a.activityPreview.SetAvatarFunc(fn)
 }
 
 // SetImageContext configures the inline-image rendering pipeline on the
@@ -6292,6 +6489,7 @@ func (a *App) SetAvatarFunc(fn messages.AvatarFunc) {
 func (a *App) SetImageContext(ctx imgrender.ImageContext) {
 	a.messagepane.SetImageContext(ctx)
 	a.threadPanel.SetImageContext(ctx)
+	a.activityPreview.SetImageContext(ctx)
 	a.imgCellPixels = ctx.CellPixels
 }
 
@@ -6580,6 +6778,7 @@ func (a *App) SetUserNames(names map[string]string) {
 	a.activityView.SetUserNames(names)
 	a.messagepane.SetUserNames(names)
 	a.threadPanel.SetUserNames(names)
+	a.activityPreview.SetUserNames(names)
 
 	// Build user list for mention picker
 	users := make([]mentionpicker.User, 0, len(names))
@@ -6669,6 +6868,10 @@ func (a *App) SetSlashCommands(commands []slashpicker.Command) {
 // SetInitialChannel sets the active channel and its messages before the TUI starts.
 func (a *App) SetInitialChannel(channelID, channelName string, msgs []messages.MessageItem) {
 	a.activeChannelID = channelID
+	// Pre-TUI initialization is by definition a deliberate setup, not
+	// a fallback; the persisted lastChannelByTeam guard relies on this
+	// flag, so keep them in sync with every activeChannelID write.
+	a.activeChannelFromAutoSelect = false
 	a.messagepane.SetChannel(channelName, "")
 	a.messagepane.SetMessages(msgs)
 	a.compose.SetChannel(channelName)
@@ -7079,7 +7282,25 @@ func (a *App) View() tea.View {
 		}
 	}
 
-	msgWidth := msgAreaWidth - msgBorder - threadWidth - threadBorder
+	// Activity-view right-side preview. Takes the same conceptual slot
+	// as the thread panel but is mutually exclusive with it (thread is
+	// closed on activity-view activation), and uses different proportions
+	// since the preview shows full channel messages — needs more width
+	// than a thread reply column. Auto-hide on too-narrow terminals so
+	// the activity list itself stays usable.
+	activityPreviewWidth := 0
+	activityPreviewBorder := 0
+	if a.view == ViewActivity {
+		activityPreviewBorder = 2
+		activityPreviewWidth = msgAreaWidth * 60 / 100
+		listWidth := msgAreaWidth - activityPreviewWidth - msgBorder - activityPreviewBorder
+		if listWidth < 30 || activityPreviewWidth < 40 {
+			activityPreviewWidth = 0
+			activityPreviewBorder = 0
+		}
+	}
+
+	msgWidth := msgAreaWidth - msgBorder - threadWidth - threadBorder - activityPreviewWidth - activityPreviewBorder
 	if msgWidth < 10 {
 		msgWidth = 10
 	}
@@ -7434,6 +7655,30 @@ func (a *App) View() tea.View {
 		}
 
 		panels = append(panels, threadTopBordered+"\n"+threadBottomBordered)
+	}
+
+	// Activity-view right-side preview pane. Renders the channel-message
+	// context for the currently selected Activity item using a second
+	// messages.Model instance (read-only — never focused, never receives
+	// key input). Sits in the same conceptual slot as the thread panel
+	// (mutually exclusive: ActivityViewActivatedMsg closes the thread)
+	// and uses different proportions (60% of the main-pane area, since
+	// it shows full channel messages rather than thread replies).
+	if a.view == ViewActivity && activityPreviewWidth > 0 {
+		// Never give the preview focus — it's read-only.
+		a.activityPreview.SetFocused(false)
+		previewContentHeight := contentHeight - 2
+		if previewContentHeight < 3 {
+			previewContentHeight = 3
+		}
+		previewBorderStyle := styles.UnfocusedBorder.Width(activityPreviewWidth)
+		previewView := a.activityPreview.View(previewContentHeight, activityPreviewWidth-2)
+		previewView = messages.ReapplyBgAfterResets(previewView, messages.BgANSI())
+		previewOut := exactSize(
+			previewBorderStyle.Render(previewView),
+			activityPreviewWidth+activityPreviewBorder, contentHeight,
+		)
+		panels = append(panels, previewOut)
 	}
 
 	// Substitute the preview panel for the messages+thread region.
