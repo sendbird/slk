@@ -173,6 +173,59 @@ func TestUpsertMessageRoundTripsRawJSON(t *testing.T) {
 	}
 }
 
+func TestLatestReplyRoundTrip(t *testing.T) {
+	db := setupDBWithWorkspace(t)
+	defer db.Close()
+	db.UpsertChannel(Channel{ID: "C1", WorkspaceID: "T1", Name: "general", Type: "channel", IsMember: true})
+
+	if err := db.UpsertMessage(Message{
+		TS:          "1700000001.000000",
+		ChannelID:   "C1",
+		WorkspaceID: "T1",
+		UserID:      "U1",
+		Text:        "parent",
+		ThreadTS:    "1700000001.000000",
+		ReplyCount:  2,
+		LatestReply: "1700000003.000000",
+	}); err != nil {
+		t.Fatalf("upsert parent: %v", err)
+	}
+	if err := db.UpsertMessage(Message{
+		TS:          "1700000002.000000",
+		ChannelID:   "C1",
+		WorkspaceID: "T1",
+		UserID:      "U2",
+		Text:        "reply",
+		ThreadTS:    "1700000001.000000",
+	}); err != nil {
+		t.Fatalf("upsert reply: %v", err)
+	}
+
+	got, err := db.GetMessage("C1", "1700000001.000000")
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+	if got.LatestReply != "1700000003.000000" {
+		t.Fatalf("GetMessage LatestReply=%q, want 1700000003.000000", got.LatestReply)
+	}
+
+	msgs, err := db.GetMessages("C1", 10, "")
+	if err != nil {
+		t.Fatalf("GetMessages: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].LatestReply != "1700000003.000000" {
+		t.Fatalf("GetMessages did not preserve LatestReply: %+v", msgs)
+	}
+
+	replies, err := db.GetThreadReplies("C1", "1700000001.000000")
+	if err != nil {
+		t.Fatalf("GetThreadReplies: %v", err)
+	}
+	if len(replies) == 0 || replies[0].LatestReply != "1700000003.000000" {
+		t.Fatalf("GetThreadReplies did not preserve parent LatestReply: %+v", replies)
+	}
+}
+
 // TestGetMessagesReturnsNewestN guards against a regression where
 // GetMessages picked the OLDEST N rows by doing `ORDER BY ts ASC LIMIT N`.
 // Once the cache outgrows N rows (any active channel after a day or two),
@@ -275,7 +328,7 @@ func TestGetThreadReplies(t *testing.T) {
 // TestGetMessages_IncludesThreadParents guards against the regression
 // where thread parents (top-level messages whose thread_ts equals
 // their own ts because they have replies) were excluded from
-// GetMessages by the original `thread_ts = ''` filter. Slack's
+// GetMessages by the original `thread_ts = ”` filter. Slack's
 // conversations.history returns parents with thread_ts == ts, so an
 // active channel quickly accumulates parents that the cache view
 // silently dropped until the next network refresh masked the bug.

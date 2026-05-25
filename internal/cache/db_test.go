@@ -300,3 +300,85 @@ func TestMigrate_CreatesThreadSubscriptionsTable(t *testing.T) {
 		t.Fatalf("thread_subscriptions: want %d cols, got %d", wantCols, count)
 	}
 }
+
+func TestMigrate_BackfillsMessageLatestReplyFromRawJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	conn, err := sql.Open("sqlite", appendPragmas(path))
+	if err != nil {
+		t.Fatalf("open old db: %v", err)
+	}
+	_, err = conn.Exec(`
+		CREATE TABLE messages (
+			ts TEXT NOT NULL,
+			channel_id TEXT NOT NULL,
+			workspace_id TEXT NOT NULL,
+			user_id TEXT NOT NULL DEFAULT '',
+			text TEXT NOT NULL DEFAULT '',
+			thread_ts TEXT NOT NULL DEFAULT '',
+			reply_count INTEGER NOT NULL DEFAULT 0,
+			edited_at TEXT NOT NULL DEFAULT '',
+			is_deleted INTEGER NOT NULL DEFAULT 0,
+			raw_json TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL DEFAULT 0,
+			subtype TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (ts, channel_id)
+		);
+		INSERT INTO messages (ts, channel_id, workspace_id, raw_json)
+		VALUES
+			('1.000000', 'C1', 'T1', '{"latest_reply":"3.000000"}'),
+			('2.000000', 'C1', 'T1', '{not valid json');
+	`)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("seed old db: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close old db: %v", err)
+	}
+
+	db, err := New(path)
+	if err != nil {
+		t.Fatalf("New migrated db: %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.conn.Query(`PRAGMA table_info(messages)`)
+	if err != nil {
+		t.Fatalf("PRAGMA table_info: %v", err)
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if name == "latest_reply" {
+			found = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("close pragma rows: %v", err)
+	}
+	if !found {
+		t.Fatal("messages.latest_reply column missing after migration")
+	}
+
+	var latestReply string
+	if err := db.conn.QueryRow(`SELECT latest_reply FROM messages WHERE channel_id = 'C1' AND ts = '1.000000'`).Scan(&latestReply); err != nil {
+		t.Fatalf("select migrated latest_reply: %v", err)
+	}
+	if latestReply != "3.000000" {
+		t.Fatalf("latest_reply=%q, want 3.000000", latestReply)
+	}
+
+	if err := db.conn.QueryRow(`SELECT latest_reply FROM messages WHERE channel_id = 'C1' AND ts = '2.000000'`).Scan(&latestReply); err != nil {
+		t.Fatalf("select invalid-json latest_reply: %v", err)
+	}
+	if latestReply != "" {
+		t.Fatalf("invalid JSON latest_reply=%q, want empty", latestReply)
+	}
+}

@@ -14,6 +14,7 @@ type Message struct {
 	Text        string
 	ThreadTS    string
 	ReplyCount  int
+	LatestReply string
 	EditedAt    string
 	IsDeleted   bool
 	RawJSON     string
@@ -27,19 +28,23 @@ type Message struct {
 
 func (db *DB) UpsertMessage(m Message) error {
 	_, err := db.conn.Exec(`
-		INSERT INTO messages (ts, channel_id, workspace_id, user_id, text, thread_ts, reply_count, edited_at, is_deleted, raw_json, created_at, subtype)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(ts, channel_id) DO UPDATE SET
-			user_id=excluded.user_id,
-			text=excluded.text,
-			thread_ts=excluded.thread_ts,
-			reply_count=excluded.reply_count,
-			edited_at=excluded.edited_at,
-			is_deleted=excluded.is_deleted,
-			raw_json=excluded.raw_json,
-			subtype=excluded.subtype
-	`, m.TS, m.ChannelID, m.WorkspaceID, m.UserID, m.Text, m.ThreadTS,
-		m.ReplyCount, m.EditedAt, boolToInt(m.IsDeleted), m.RawJSON, m.CreatedAt, m.Subtype)
+			INSERT INTO messages (ts, channel_id, workspace_id, user_id, text, thread_ts, reply_count, latest_reply, edited_at, is_deleted, raw_json, created_at, subtype)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(ts, channel_id) DO UPDATE SET
+				user_id=excluded.user_id,
+				text=excluded.text,
+				thread_ts=excluded.thread_ts,
+				reply_count=excluded.reply_count,
+				latest_reply=CASE
+					WHEN excluded.latest_reply != '' THEN excluded.latest_reply
+					ELSE messages.latest_reply
+				END,
+				edited_at=excluded.edited_at,
+				is_deleted=excluded.is_deleted,
+				raw_json=excluded.raw_json,
+				subtype=excluded.subtype
+		`, m.TS, m.ChannelID, m.WorkspaceID, m.UserID, m.Text, m.ThreadTS,
+		m.ReplyCount, m.LatestReply, m.EditedAt, boolToInt(m.IsDeleted), m.RawJSON, m.CreatedAt, m.Subtype)
 	if err != nil {
 		debuglog.Cache("UpsertMessage: channel=%s ts=%s ERR=%v", m.ChannelID, m.TS, err)
 		return fmt.Errorf("upserting message: %w", err)
@@ -71,10 +76,10 @@ func (db *DB) GetMessages(channelID string, limit int, beforeTS string) ([]Messa
 	// Plain replies (thread_ts != '' && thread_ts != ts && subtype != broadcast)
 	// belong to the thread panel, not the main feed.
 	inner := `
-		SELECT ts, channel_id, workspace_id, user_id, text, thread_ts, reply_count, edited_at, is_deleted, raw_json, created_at, subtype
-		FROM messages
-		WHERE channel_id = ? AND is_deleted = 0
-		  AND (thread_ts = '' OR thread_ts = ts OR subtype = 'thread_broadcast')`
+			SELECT ts, channel_id, workspace_id, user_id, text, thread_ts, reply_count, latest_reply, edited_at, is_deleted, raw_json, created_at, subtype
+			FROM messages
+			WHERE channel_id = ? AND is_deleted = 0
+			  AND (thread_ts = '' OR thread_ts = ts OR subtype = 'thread_broadcast')`
 	args := []any{channelID}
 
 	if beforeTS != "" {
@@ -96,11 +101,11 @@ func (db *DB) GetMessage(channelID, ts string) (Message, error) {
 	var m Message
 	var isDeleted int
 	err := db.conn.QueryRow(`
-		SELECT ts, channel_id, workspace_id, user_id, text, thread_ts, reply_count, edited_at, is_deleted, raw_json, created_at, subtype
-		FROM messages
-		WHERE channel_id = ? AND ts = ?
+			SELECT ts, channel_id, workspace_id, user_id, text, thread_ts, reply_count, latest_reply, edited_at, is_deleted, raw_json, created_at, subtype
+			FROM messages
+			WHERE channel_id = ? AND ts = ?
 	`, channelID, ts).Scan(&m.TS, &m.ChannelID, &m.WorkspaceID, &m.UserID, &m.Text,
-		&m.ThreadTS, &m.ReplyCount, &m.EditedAt, &isDeleted, &m.RawJSON, &m.CreatedAt, &m.Subtype)
+		&m.ThreadTS, &m.ReplyCount, &m.LatestReply, &m.EditedAt, &isDeleted, &m.RawJSON, &m.CreatedAt, &m.Subtype)
 	if err != nil {
 		return m, err
 	}
@@ -110,10 +115,10 @@ func (db *DB) GetMessage(channelID, ts string) (Message, error) {
 
 func (db *DB) GetThreadReplies(channelID, threadTS string) ([]Message, error) {
 	query := `
-		SELECT ts, channel_id, workspace_id, user_id, text, thread_ts, reply_count, edited_at, is_deleted, raw_json, created_at, subtype
-		FROM messages
-		WHERE channel_id = ? AND thread_ts = ? AND is_deleted = 0
-		ORDER BY ts ASC`
+			SELECT ts, channel_id, workspace_id, user_id, text, thread_ts, reply_count, latest_reply, edited_at, is_deleted, raw_json, created_at, subtype
+			FROM messages
+			WHERE channel_id = ? AND thread_ts = ? AND is_deleted = 0
+			ORDER BY ts ASC`
 
 	return db.queryMessages(query, channelID, threadTS)
 }
@@ -140,7 +145,7 @@ func (db *DB) queryMessages(query string, args ...any) ([]Message, error) {
 		var m Message
 		var isDeleted int
 		if err := rows.Scan(&m.TS, &m.ChannelID, &m.WorkspaceID, &m.UserID, &m.Text,
-			&m.ThreadTS, &m.ReplyCount, &m.EditedAt, &isDeleted, &m.RawJSON, &m.CreatedAt, &m.Subtype); err != nil {
+			&m.ThreadTS, &m.ReplyCount, &m.LatestReply, &m.EditedAt, &isDeleted, &m.RawJSON, &m.CreatedAt, &m.Subtype); err != nil {
 			return nil, fmt.Errorf("scanning message: %w", err)
 		}
 		m.IsDeleted = isDeleted == 1

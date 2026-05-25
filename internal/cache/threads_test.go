@@ -194,6 +194,121 @@ func TestListSubscribedThreads_SortByLastReplyTSDesc(t *testing.T) {
 	}
 }
 
+func TestListSubscribedThreads_UsesParentLatestReplyForOrdering(t *testing.T) {
+	const selfID = "U1"
+	db := setupDBWithWorkspace(t)
+	if err := db.UpsertChannel(Channel{ID: "C1", WorkspaceID: "T1", Name: "test-region-schedule", Type: "channel"}); err != nil {
+		t.Fatalf("UpsertChannel C1: %v", err)
+	}
+	if err := db.UpsertChannel(Channel{ID: "C2", WorkspaceID: "T1", Name: "prj-sake", Type: "channel"}); err != nil {
+		t.Fatalf("UpsertChannel C2: %v", err)
+	}
+
+	if err := db.UpsertMessage(Message{
+		TS:          "1700000100.000000",
+		ChannelID:   "C1",
+		WorkspaceID: "T1",
+		UserID:      "U2",
+		Text:        "stale locally but fresh in Slack metadata",
+		ThreadTS:    "1700000100.000000",
+		ReplyCount:  34,
+		LatestReply: "1700000500.000000",
+	}); err != nil {
+		t.Fatalf("UpsertMessage C1 parent: %v", err)
+	}
+	mustUpsertMsg(t, db, "1700000200.000000", "C1", "U3", "old cached reply", "1700000100.000000")
+	if err := db.UpsertThreadSubscription("T1", "C1", "1700000100.000000", "1700000450.000000", true); err != nil {
+		t.Fatalf("UpsertThreadSubscription C1: %v", err)
+	}
+
+	mustUpsertMsg(t, db, "1700000300.000000", "C2", selfID, "parent", "1700000300.000000")
+	mustUpsertMsg(t, db, "1700000400.000000", "C2", "U2", "cached latest reply", "1700000300.000000")
+	if err := db.UpsertThreadSubscription("T1", "C2", "1700000300.000000", "1700000400.000000", true); err != nil {
+		t.Fatalf("UpsertThreadSubscription C2: %v", err)
+	}
+
+	got, err := db.ListSubscribedThreads("T1", selfID)
+	if err != nil {
+		t.Fatalf("ListSubscribedThreads: %v", err)
+	}
+	if len(got) < 2 {
+		t.Fatalf("want >=2, got %d: %+v", len(got), got)
+	}
+	if got[0].ChannelID != "C1" || got[0].ThreadTS != "1700000100.000000" {
+		t.Fatalf("Slack latest_reply should sort C1 first, got %+v", got[0])
+	}
+	if got[0].LastReplyTS != "1700000500.000000" {
+		t.Fatalf("LastReplyTS=%q, want Slack latest_reply 1700000500.000000", got[0].LastReplyTS)
+	}
+	if got[0].LastReplyBy != "" {
+		t.Fatalf("LastReplyBy=%q, want empty when latest reply itself is not cached", got[0].LastReplyBy)
+	}
+}
+
+func TestListSubscribedThreads_UsesNewestReadBoundaryForLastReplyFallback(t *testing.T) {
+	const selfID = "U1"
+	db := setupDBWithWorkspace(t)
+	if err := db.UpsertChannel(Channel{ID: "C1", WorkspaceID: "T1", Name: "general", Type: "channel"}); err != nil {
+		t.Fatalf("UpsertChannel: %v", err)
+	}
+	if err := db.UpdateChannelReadState("C1", "1700000500.000000", false); err != nil {
+		t.Fatalf("UpdateChannelReadState: %v", err)
+	}
+	if err := db.UpsertThreadSubscription("T1", "C1", "1700000100.000000", "1700000200.000000", true); err != nil {
+		t.Fatalf("UpsertThreadSubscription: %v", err)
+	}
+
+	got, err := db.ListSubscribedThreads("T1", selfID)
+	if err != nil {
+		t.Fatalf("ListSubscribedThreads: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1, got %d: %+v", len(got), got)
+	}
+	if got[0].LastReplyTS != "1700000500.000000" {
+		t.Fatalf("LastReplyTS=%q, want newest read boundary 1700000500.000000", got[0].LastReplyTS)
+	}
+}
+
+func TestListSubscribedThreads_ChannelReadDoesNotOverrideCachedThreadActivity(t *testing.T) {
+	const selfID = "U1"
+	db := setupDBWithWorkspace(t)
+	if err := db.UpsertChannel(Channel{ID: "C1", WorkspaceID: "T1", Name: "general", Type: "channel"}); err != nil {
+		t.Fatalf("UpsertChannel C1: %v", err)
+	}
+	if err := db.UpsertChannel(Channel{ID: "C2", WorkspaceID: "T1", Name: "random", Type: "channel"}); err != nil {
+		t.Fatalf("UpsertChannel C2: %v", err)
+	}
+	if err := db.UpdateChannelReadState("C1", "1700000500.000000", false); err != nil {
+		t.Fatalf("UpdateChannelReadState C1: %v", err)
+	}
+
+	mustUpsertMsg(t, db, "1700000100.000000", "C1", "U2", "old parent", "1700000100.000000")
+	mustUpsertMsg(t, db, "1700000200.000000", "C1", "U3", "old reply", "1700000100.000000")
+	if err := db.UpsertThreadSubscription("T1", "C1", "1700000100.000000", "1700000150.000000", true); err != nil {
+		t.Fatalf("UpsertThreadSubscription C1: %v", err)
+	}
+
+	mustUpsertMsg(t, db, "1700000300.000000", "C2", "U2", "newer parent", "1700000300.000000")
+	if err := db.UpsertThreadSubscription("T1", "C2", "1700000300.000000", "1700000300.000000", true); err != nil {
+		t.Fatalf("UpsertThreadSubscription C2: %v", err)
+	}
+
+	got, err := db.ListSubscribedThreads("T1", selfID)
+	if err != nil {
+		t.Fatalf("ListSubscribedThreads: %v", err)
+	}
+	if len(got) < 2 {
+		t.Fatalf("want >=2, got %d: %+v", len(got), got)
+	}
+	if got[0].ChannelID != "C2" {
+		t.Fatalf("channel read state from C1 should not override cached thread activity; got first=%+v", got[0])
+	}
+	if got[1].ChannelID != "C1" || got[1].LastReplyTS != "1700000200.000000" {
+		t.Fatalf("C1 should keep cached thread activity timestamp, got %+v", got[1])
+	}
+}
+
 func TestListSubscribedThreads_UnreadUsesPerThreadLastRead(t *testing.T) {
 	const selfID = "U1"
 	db := setupDBWithWorkspace(t)

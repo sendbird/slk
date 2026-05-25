@@ -28,7 +28,7 @@ type fakeHistory struct {
 	responses        map[string][]*slack.GetConversationHistoryResponse
 	history          map[string][]slack.Message // alternate flat input: channelID → messages
 	calls            map[string]int
-	oldestSeen       map[string][]string // per-channel: oldest param of each call, in order
+	oldestSeen       map[string][]string        // per-channel: oldest param of each call, in order
 	repliesResponses map[string][]slack.Message // keyed by threadTS
 	repliesCalls     []struct{ Channel, TS string }
 
@@ -384,7 +384,12 @@ func TestBackfillSubscriptions_UpsertsRootMessageIntoMessagesCache(t *testing.T)
 	}
 	fake := &fakeHistory{
 		subscriptionsResponse: []slackclient.ThreadSubscriptionView{
-			subView("C1", "1700000100.000000", "1700000150.000000", "parent X", "U2", true),
+			func() slackclient.ThreadSubscriptionView {
+				v := subView("C1", "1700000100.000000", "1700000150.000000", "parent X", "U2", true)
+				v.RootMessage.ReplyCount = 1
+				v.RootMessage.LatestReply = "1700000200.000000"
+				return v
+			}(),
 		},
 	}
 	bf := newBackfiller(fake, db, "T1", "U1", nil, 4, 500, nil)
@@ -402,6 +407,9 @@ func TestBackfillSubscriptions_UpsertsRootMessageIntoMessagesCache(t *testing.T)
 	}
 	if msgs[0].Text != "parent X" || msgs[0].UserID != "U2" {
 		t.Fatalf("root_msg fields not preserved: %+v", msgs[0])
+	}
+	if msgs[0].LatestReply != "1700000200.000000" {
+		t.Fatalf("root_msg latest_reply not preserved: %+v", msgs[0])
 	}
 
 	// No GetReplies calls should have been made — root_msg already
