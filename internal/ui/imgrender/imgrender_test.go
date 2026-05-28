@@ -20,11 +20,11 @@ func TestComputeImageTarget_NoThumbs_ReturnsZero(t *testing.T) {
 	}
 }
 
-func TestComputeImageTarget_ZeroCellPixels_ReturnsZero(t *testing.T) {
+func TestComputeImageTarget_ZeroCellPixels_FallsBackToDefaultMetrics(t *testing.T) {
 	ctx := ImageContext{CellPixels: image.Pt(0, 0), MaxRows: 20}
 	got := computeImageTarget([]ThumbSpec{{URL: "u", W: 320, H: 240}}, ctx, 80)
-	if got != (image.Point{}) {
-		t.Fatalf("expected zero point for zero cell pixels, got %+v", got)
+	if got == (image.Point{}) {
+		t.Fatalf("expected fallback target for zero cell pixels, got %+v", got)
 	}
 }
 
@@ -61,6 +61,14 @@ func TestComputeImageTarget_ColsClampToOneWhenUnderflow(t *testing.T) {
 	got := computeImageTarget([]ThumbSpec{{W: 1, H: 100000}}, ctx, 80)
 	if got.X != 1 {
 		t.Fatalf("expected cols to clamp to 1, got %d", got.X)
+	}
+}
+
+func TestComputeImageTarget_NormalizesBogusCellMetrics(t *testing.T) {
+	ctx := ImageContext{CellPixels: image.Pt(40, 8), MaxRows: 20}
+	got := computeImageTarget([]ThumbSpec{{W: 480, H: 256}}, ctx, 80)
+	if got.X < 40 {
+		t.Fatalf("expected sane width after normalization, got %+v", got)
 	}
 }
 

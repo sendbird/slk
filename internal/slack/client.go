@@ -27,6 +27,7 @@ type SlackAPI interface {
 	GetConversationHistory(params *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error)
 	GetConversationReplies(params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error)
 	GetUsersContext(ctx context.Context, options ...slack.GetUsersOption) ([]slack.User, error)
+	GetUserGroupsContext(ctx context.Context, options ...slack.GetUserGroupsOption) ([]slack.UserGroup, error)
 	GetUsersInConversationContext(ctx context.Context, params *slack.GetUsersInConversationParameters) ([]string, string, error)
 	GetUserInfo(user string) (*slack.User, error)
 	GetEmoji() (map[string]string, error)
@@ -639,6 +640,29 @@ func (c *Client) GetUsers(ctx context.Context) ([]slack.User, error) {
 		return nil, fmt.Errorf("getting users: %w", err)
 	}
 	return users, nil
+}
+
+// GetUserGroups fetches the workspace's user groups (subteams) so the
+// renderer can resolve bare <!subteam^...> mentions back to their
+// human-readable handle. Returns an id -> handle map; the map is empty
+// when the workspace has no user groups.
+func (c *Client) GetUserGroups(ctx context.Context) (map[string]string, error) {
+	groups, err := c.api.GetUserGroupsContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting usergroups: %w", err)
+	}
+	out := make(map[string]string, len(groups))
+	for _, g := range groups {
+		name := g.Handle
+		if name == "" {
+			name = g.Name
+		}
+		if name == "" {
+			continue
+		}
+		out[g.ID] = name
+	}
+	return out, nil
 }
 
 // ListCustomEmoji fetches the workspace's custom emoji list via Slack's

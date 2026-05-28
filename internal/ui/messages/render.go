@@ -5,6 +5,7 @@ import (
 	"image/color"
 	"regexp"
 	"strings"
+	"sync"
 	"unicode"
 
 	"charm.land/lipgloss/v2"
@@ -36,7 +37,8 @@ var (
 	linkBareRe      = regexp.MustCompile(`<((?:https?://|mailto:)[^>]+)>`)
 
 	// Slack user/channel mentions: <@U1234> <#C1234|channel-name>
-	userMentionRe = regexp.MustCompile(`<@([A-Z0-9]+)>`)
+	userMentionRe    = regexp.MustCompile(`<@([A-Z0-9]+)>`)
+	subteamMentionRe = regexp.MustCompile(`<!subteam\^([A-Z0-9]+)(?:\|([^>]+))?>`)
 	// channelMentionRe matches both wire forms Slack accepts:
 	//   <#CHANNELID>          — bare ID (sometimes emitted by other clients,
 	//                           and what we used to emit ourselves)
@@ -59,6 +61,43 @@ var (
 		"&amp;", "&",
 	)
 )
+
+var (
+	usergroupNamesMu sync.RWMutex
+	usergroupNames   = map[string]string{}
+)
+
+// SetUsergroupNames merges the given usergroup id -> handle entries
+// into the process-wide map consulted by RenderSlackMarkdown when
+// expanding <!subteam^S123> tokens. Existing entries from prior calls
+// (e.g. other workspaces, earlier bootstrap fetches) are preserved so
+// racing updates from concurrent workspace connects don't clobber each
+// other — Slack subteam IDs are workspace-unique, so additive merge is
+// safe. Empty input is a no-op. Safe for concurrent callers.
+func SetUsergroupNames(names map[string]string) {
+	if len(names) == 0 {
+		return
+	}
+	usergroupNamesMu.Lock()
+	defer usergroupNamesMu.Unlock()
+	if usergroupNames == nil {
+		usergroupNames = map[string]string{}
+	}
+	for id, name := range names {
+		trim := strings.TrimPrefix(strings.TrimSpace(name), "@")
+		if trim == "" {
+			continue
+		}
+		usergroupNames[id] = trim
+	}
+}
+
+func usergroupName(id string) (string, bool) {
+	usergroupNamesMu.RLock()
+	defer usergroupNamesMu.RUnlock()
+	name, ok := usergroupNames[id]
+	return name, ok
+}
 
 // Render styles -- functions that read current theme colors so they
 // update correctly when the theme changes.
@@ -525,6 +564,14 @@ func renderInlineFormatting(text string, userNames map[string]string, channelNam
 		return osc8Hyperlink(url, linkStyle().Render(visible))
 	})
 
+	// Raw http(s) URLs in plain text (no surrounding <...> brackets).
+	// Some bot integrations emit these directly. We OSC 8-wrap them
+	// after the bracketed-form regexes have already run so the wrap
+	// doesn't fight with `<url>` / `<url|label>`; the scan is also
+	// OSC 8-aware so URLs that already sit inside an escape (the
+	// hyperlink target portion) don't get re-wrapped.
+	text = wrapPlainHTTPURLs(text)
+
 	// Channel mentions: <#C1234|channel-name> -> #channel-name, or
 	// <#C1234> -> #resolved-name (via channelNames map). When the
 	// channel can't be resolved we render "#unknown" so the user sees
@@ -559,6 +606,35 @@ func renderInlineFormatting(text string, userNames map[string]string, channelNam
 		return mentionStyle().Render("@" + name)
 	})
 
+	// User group mentions: <!subteam^S123|@team> -> @team. The
+	// labeled form is the most reliable source — but a lot of cached
+	// messages and richtext-derived bodies only carry the bare
+	// <!subteam^S123> form. We resolve those via the process-wide
+	// usergroupNames map (populated from usergroups.list at workspace
+	// connect), falling back to a readable @subteam placeholder when
+	// the id is unknown so the raw token never leaks to the UI.
+	text = subteamMentionRe.ReplaceAllStringFunc(text, func(match string) string {
+		groups := subteamMentionRe.FindStringSubmatch(match)
+		id := ""
+		if len(groups) > 1 {
+			id = groups[1]
+		}
+		label := ""
+		if len(groups) > 2 {
+			label = strings.TrimSpace(groups[2])
+		}
+		label = strings.TrimPrefix(label, "@")
+		if label == "" && id != "" {
+			if resolved, ok := usergroupName(id); ok {
+				label = resolved
+			}
+		}
+		if label == "" {
+			label = "subteam"
+		}
+		return mentionStyle().Render("@" + label)
+	})
+
 	// Emoji shortcodes: :red_circle: -> 🔴
 	// Strip skin-tone modifier suffixes from shortcodes first; toned
 	// emoji render inconsistently across terminals and break alignment.
@@ -577,6 +653,93 @@ func renderInlineFormatting(text string, userNames map[string]string, channelNam
 // We scan rune-by-rune so multi-byte UTF-8 (e.g. accented letters as
 // word chars) is handled correctly. The body of an italic run may
 // contain any rune except `_` and `\n`, matching the legacy regex.
+// rawHTTPURLRe matches a plain http(s) URL that callers haven't yet
+// OSC 8-wrapped. The character class deliberately excludes characters
+// that can't appear in a URL after the scheme (whitespace, angle
+// brackets, etc.) so trailing punctuation in prose doesn't get
+// swallowed; trimURLTail below shaves common terminators (`.,;:!?` `)`)
+// that follow the URL in a sentence.
+var rawHTTPURLRe = regexp.MustCompile(`https?://[^\s\x00-\x1f<>"'` + "`" + `()\[\]{}|^\\]+`)
+
+// wrapPlainHTTPURLs OSC 8-wraps any raw http(s) URL in text that
+// isn't already sitting inside an existing OSC 8 escape sequence.
+// The scan walks byte-by-byte so the URL regex can never match a
+// substring that overlaps an existing escape — without that
+// constraint, FindStringIndex would happily wrap the URL stored
+// inside a previously-emitted `\x1b]8;;<URL>\x1b\\` opener and we'd
+// end up with double-wrapped, broken hyperlinks.
+func wrapPlainHTTPURLs(text string) string {
+	if text == "" {
+		return text
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	i := 0
+	for i < len(text) {
+		// OSC 8 region: copy the opener + label + close verbatim.
+		if strings.HasPrefix(text[i:], "\x1b]8;;") {
+			_, next, ok := parseOSC8(text, i)
+			if !ok {
+				b.WriteByte(text[i])
+				i++
+				continue
+			}
+			b.WriteString(text[i:next])
+			i = next
+			closeIdx := strings.Index(text[i:], "\x1b]8;;")
+			if closeIdx < 0 {
+				continue
+			}
+			b.WriteString(text[i : i+closeIdx])
+			i += closeIdx
+			_, after, ok := parseOSC8(text, i)
+			if !ok {
+				continue
+			}
+			b.WriteString(text[i:after])
+			i = after
+			continue
+		}
+		// Any other ANSI escape: copy through.
+		if text[i] == '\x1b' {
+			end := skipEscape(text, i)
+			b.WriteString(text[i:end])
+			i = end
+			continue
+		}
+		// Plain-text byte: try matching a URL anchored at the cursor.
+		if loc := rawHTTPURLRe.FindStringIndex(text[i:]); loc != nil && loc[0] == 0 {
+			raw := text[i : i+loc[1]]
+			trimmed, suffix := trimURLTail(raw)
+			b.WriteString(osc8Hyperlink(trimmed, linkStyle().Render(trimmed)))
+			b.WriteString(suffix)
+			i += loc[1]
+			continue
+		}
+		b.WriteByte(text[i])
+		i++
+	}
+	return b.String()
+}
+
+// trimURLTail strips punctuation runes that conventionally follow a
+// URL inside prose (`.,;:!?`) and trailing `)` so the OSC 8 target
+// doesn't slurp the surrounding sentence.
+func trimURLTail(rawURL string) (string, string) {
+	tail := ""
+	for len(rawURL) > 0 {
+		last := rawURL[len(rawURL)-1]
+		switch last {
+		case '.', ',', ';', ':', '!', '?', ')':
+			tail = string(last) + tail
+			rawURL = rawURL[:len(rawURL)-1]
+		default:
+			return rawURL, tail
+		}
+	}
+	return rawURL, tail
+}
+
 func renderItalics(text string) string {
 	if !strings.ContainsRune(text, '_') {
 		return text

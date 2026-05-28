@@ -88,3 +88,10 @@ func TestPreview_SwapImageUpdatesIndex(t *testing.T) {
 		t.Errorf("count should remain 3, got %d", p.SiblingCount())
 	}
 }
+
+func TestFitInto_NormalizesBogusCellMetrics(t *testing.T) {
+	got := fitInto(480, 256, 80, 24, image.Pt(40, 8))
+	if got.X < 30 || got.Y < 10 {
+		t.Fatalf("unexpected tiny preview target from bogus cell metrics: %+v", got)
+	}
+}

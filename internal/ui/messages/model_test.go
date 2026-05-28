@@ -3,6 +3,7 @@ package messages
 
 import (
 	"bytes"
+	"fmt"
 	stdimage "image"
 	imgcolor "image/color"
 	imgpng "image/png"
@@ -37,6 +38,87 @@ func TestHitTestLink_LabeledHTTPLink(t *testing.T) {
 	}
 	if gotURL != "https://example.com/doc" {
 		t.Fatalf("url = %q, want https://example.com/doc", gotURL)
+	}
+}
+
+// TestModel_ScrollDownReachesBottomOfTallLastMessage exercises the
+// concrete user-reported regression: the LAST message in a channel is
+// many rows tall; the user scrolls up to read the start, then keeps
+// scrolling down. ScrollDown must walk yOffset all the way to
+// maxOffset without the selection-snap branch yanking it back to the
+// long message's startLine.
+func TestModel_ScrollDownReachesBottomOfTallLastMessage(t *testing.T) {
+	lines := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		lines = append(lines, fmt.Sprintf("line %03d body content", i))
+	}
+	m := New([]MessageItem{
+		{TS: "1.0", UserName: "head", UserID: "U0", Text: "first", Timestamp: "10:00 AM"},
+		{TS: "2.0", UserName: "alice", UserID: "U1", Text: strings.Join(lines, "\n"), Timestamp: "10:01 AM"},
+	}, "general")
+
+	const viewH = 20
+	const viewW = 120
+	_ = m.View(viewH, viewW)
+	maxOffset := m.totalLines - m.lastViewHeight
+	if maxOffset <= 50 {
+		t.Fatalf("test precondition: totalLines too small for the regression; totalLines=%d lastViewHeight=%d",
+			m.totalLines, m.lastViewHeight)
+	}
+
+	// Scroll all the way up to the start of the long last message.
+	m.ScrollUp(maxOffset + 10)
+	_ = m.View(viewH, viewW)
+	if got := m.yOffset; got != 0 {
+		t.Fatalf("ScrollUp past maxOffset should clamp to 0; got %d", got)
+	}
+
+	prev := m.yOffset
+	steps := maxOffset + 5
+	for i := 0; i < steps; i++ {
+		m.ScrollDown(1)
+		_ = m.View(viewH, viewW)
+		cur := m.yOffset
+		if cur < prev {
+			t.Fatalf("iteration %d: ScrollDown moved viewport backward: %d -> %d",
+				i, prev, cur)
+		}
+		prev = cur
+	}
+	if prev != maxOffset {
+		t.Fatalf("ScrollDown chain did not reach bottom: end=%d maxOffset=%d", prev, maxOffset)
+	}
+	if got := m.SelectedIndex(); got != 1 {
+		t.Fatalf("selected drifted during scroll: got %d want 1", got)
+	}
+}
+
+func TestView_ShowsScrollHintForTallSelectedMessage(t *testing.T) {
+	lines := make([]string, 0, 40)
+	for i := range 40 {
+		lines = append(lines, fmt.Sprintf("line %02d with long content", i))
+	}
+	m := New([]MessageItem{
+		{
+			TS:        "1.0",
+			UserName:  "alice",
+			UserID:    "U1",
+			Text:      strings.Join(lines, "\n"),
+			Timestamp: "10:00 AM",
+		},
+		{
+			TS:        "2.0",
+			UserName:  "bob",
+			UserID:    "U2",
+			Text:      "tail",
+			Timestamp: "10:01 AM",
+		},
+	}, "general")
+	m.GoToTop()
+
+	out := m.View(16, 70)
+	if !strings.Contains(out, "PgDn/Ctrl+D/wheel") {
+		t.Fatalf("expected tall-message scroll affordance in output, got %q", out)
 	}
 }
 

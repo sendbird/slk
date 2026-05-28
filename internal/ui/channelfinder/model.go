@@ -43,9 +43,9 @@ type Item struct {
 	Type     string // channel, dm, group_dm, private, threads, activity
 	Presence string // for DMs: active, away
 	Joined   bool   // true if the user is already a member; false for browseable public channels
-	// LastVisited is the unix timestamp (seconds) of the user's most
-	// recent visit to this channel; 0 means never visited. Drives the
-	// recency-based sort used by filter(): empty-query order is by
+	// LastVisited is the unix timestamp (milliseconds) of the user's
+	// most recent visit to this channel; 0 means never visited. Drives
+	// the recency-based sort used by filter(): empty-query order is by
 	// LastVisited DESC, and on a query LastVisited breaks ties within
 	// a match tier.
 	LastVisited int64
@@ -55,6 +55,13 @@ type Item struct {
 	// opening a channel). These items are preserved across SetItems
 	// and SetBrowseable mutations so the finder always offers them.
 	Synthetic bool
+	// Members lists the OTHER-participant display names for DM and
+	// group_dm rows (1 entry for 1:1 DMs, N for MPDMs). Empty for
+	// regular channels. Carries the per-participant view the
+	// channel-finder doesn't use itself but global search needs for
+	// cmd+K-style multi-term ranking (each query term must match a
+	// different member). Order mirrors Slack's mpdm channel name order.
+	Members []string
 }
 
 // Model is the fuzzy channel finder overlay.

@@ -203,15 +203,27 @@ func TestBareChannelMentionUnresolvedFallsBack(t *testing.T) {
 	}
 }
 
-// TestUnlabeledNonHTTPLinkSurvives confirms that <url|text> patterns where the
-// URL is NOT http(s) don't get gobbled by linkWithLabelRe. (Slack uses
-// <!subteam^S123|@team> for groups, etc.)
-func TestNonHTTPBracketedSurvives(t *testing.T) {
-	// Should not panic, should not render as a link. We only assert it doesn't
-	// crash and the output is non-empty.
-	out := RenderSlackMarkdown("ping <!subteam^S123|@team> please", nil, nil)
-	if out == "" {
-		t.Error("expected non-empty output")
+// TestSubteamMentionRendersLabel confirms labeled subteam mentions render
+// as @tags rather than leaking the raw <!subteam^...> token.
+func TestSubteamMentionRendersLabel(t *testing.T) {
+	out := ansi.Strip(RenderSlackMarkdown("ping <!subteam^S123|@team> please", nil, nil))
+	if !strings.Contains(out, "@team") {
+		t.Fatalf("expected @team in output, got %q", out)
+	}
+	if strings.Contains(out, "<!subteam^") {
+		t.Fatalf("expected raw subteam token to be replaced, got %q", out)
+	}
+}
+
+// TestBareSubteamMentionFallsBackReadable confirms the bare wire form
+// still renders as an @tag-shaped placeholder rather than the raw token.
+func TestBareSubteamMentionFallsBackReadable(t *testing.T) {
+	out := ansi.Strip(RenderSlackMarkdown("ping <!subteam^S123> please", nil, nil))
+	if !strings.Contains(out, "@subteam") {
+		t.Fatalf("expected @subteam fallback in output, got %q", out)
+	}
+	if strings.Contains(out, "<!subteam^S123>") {
+		t.Fatalf("expected raw subteam token to be replaced, got %q", out)
 	}
 }
 

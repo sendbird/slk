@@ -25,8 +25,16 @@ func unreadDotStyle() lipgloss.Style {
 	return lipgloss.NewStyle().Foreground(styles.Primary).Bold(true)
 }
 
+func unreadBadgeStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(styles.Background).Background(styles.Primary).Bold(true)
+}
+
 func channelNameStyle() lipgloss.Style {
 	return lipgloss.NewStyle().Foreground(styles.Primary).Bold(true)
+}
+
+func actorNameStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Bold(true)
 }
 
 var thickLeftBorder = lipgloss.Border{Left: "▌"}
@@ -360,8 +368,8 @@ func (m *Model) renderCard(item cache.ActivityItem, width int, selected bool) []
 	}
 
 	header := m.renderHeader(item, contentWidth)
+	context := m.renderContext(item, contentWidth)
 	preview := m.renderPreview(item, contentWidth)
-	footer := m.renderFooter(item, contentWidth)
 
 	borderStyle := borderInvisStyle()
 	fill := borderFillStyle().Width(contentWidth)
@@ -371,35 +379,55 @@ func (m *Model) renderCard(item cache.ActivityItem, width int, selected bool) []
 	}
 
 	headerOut := borderStyle.Render(fill.Render(header))
-	previewOut := borderStyle.Render(fill.Render(preview))
-	footerOut := borderStyle.Render(fill.Foreground(styles.TextMuted).Render(footer))
-	return []string{headerOut, previewOut, footerOut}
+	contextOut := borderStyle.Render(fill.Render(context))
+	previewOut := borderStyle.Render(fill.Foreground(styles.TextMuted).Render(preview))
+	return []string{headerOut, contextOut, previewOut}
 }
 
 func (m *Model) renderHeader(item cache.ActivityItem, width int) string {
-	glyph := channelGlyph(item.ChannelType)
-	kind := kindLabel(item.Kind)
-	header := kind + "  " + mutedStyle().Render("·") + "  " + glyph + channelNameStyle().Render(item.ChannelName)
-	if item.Unread {
-		header += "  " + unreadDotStyle().Render("●")
+	actor := m.resolveUser(item.UserID)
+	if actor == "" {
+		if item.ChannelType == "app" && item.ChannelName != "" {
+			actor = item.ChannelName
+		} else {
+			actor = kindLabel(item.Kind)
+		}
 	}
-	return clipToWidth(header, width)
+	left := actorNameStyle().Render(actor)
+	right := mutedStyle().Render(formatActivityTime(item.TS))
+	if item.Unread {
+		right = right + "  " + unreadBadgeStyle().Render(" 1 ")
+	}
+	return joinLeftRight(left, right, width)
+}
+
+func (m *Model) renderContext(item cache.ActivityItem, width int) string {
+	label := contextLabel(item)
+	if label == "" {
+		return ""
+	}
+	return clipToWidth(mutedStyle().Render(label), width)
 }
 
 func (m *Model) renderPreview(item cache.ActivityItem, width int) string {
 	preview := messages.RenderSlackMarkdown(item.Text, m.userNames, m.channelNames)
 	preview = strings.ReplaceAll(preview, "\n", " ")
-	previewMax := width - 2
+	previewMax := width
 	if previewMax < 0 {
 		previewMax = 0
 	}
-	return clipToWidth("  "+truncate.StringWithTail(preview, uint(previewMax), "…"), width)
+	if strings.TrimSpace(preview) == "" {
+		preview = mutedStyle().Render("No message preview")
+	}
+	return clipToWidth(truncate.StringWithTail(preview, uint(previewMax), "…"), width)
 }
 
-func (m *Model) renderFooter(item cache.ActivityItem, width int) string {
-	actor := m.resolveUser(item.UserID)
-	footer := "  " + actor + " · " + formatRelTime(item.TS)
-	return clipToWidth(footer, width)
+func (m *Model) renderChannelRef(item cache.ActivityItem) string {
+	name := item.ChannelName
+	if name == "" {
+		name = item.ChannelID
+	}
+	return channelGlyph(item.ChannelType) + channelNameStyle().Render(name)
 }
 
 func channelGlyph(channelType string) string {
@@ -408,6 +436,8 @@ func channelGlyph(channelType string) string {
 		return lipgloss.NewStyle().Foreground(styles.Warning).Render("◆ ")
 	case "dm", "group_dm":
 		return lipgloss.NewStyle().Foreground(styles.TextMuted).Render("● ")
+	case "app":
+		return ""
 	default:
 		return "# "
 	}
@@ -417,13 +447,49 @@ func kindLabel(kind string) string {
 	switch kind {
 	case "mention":
 		return "Mention"
+	case "dm":
+		return "Direct message"
 	case "thread_reply":
-		return "Thread reply"
-	case "unread":
-		return "Unread"
+		return "Thread"
+	case "app":
+		return "App"
+	case "reminder":
+		return "Reminder"
+	case "invitation":
+		return "Invitation"
+	case "notification":
+		return "Notification"
 	default:
 		return "Activity"
 	}
+}
+
+// contextLabel mirrors Slack's second-line context: it omits the
+// channel reference for DMs/group DMs (the header already names the
+// counterpart) and otherwise renders "<kind> in #channel".
+func contextLabel(item cache.ActivityItem) string {
+	switch item.ChannelType {
+	case "dm":
+		return "Direct message"
+	case "group_dm":
+		return "Group message"
+	case "app":
+		if strings.Contains(strings.ToLower(item.Text), "user group") {
+			return "User group"
+		}
+		return "App"
+	}
+	if item.Kind == "notification" && strings.Contains(item.Text, "<!subteam^") {
+		return "User group"
+	}
+	name := item.ChannelName
+	if name == "" {
+		name = item.ChannelID
+	}
+	if name == "" {
+		return kindLabel(item.Kind)
+	}
+	return kindLabel(item.Kind) + " in " + channelGlyph(item.ChannelType) + name
 }
 
 func (m *Model) resolveUser(uid string) string {
@@ -440,6 +506,18 @@ func (m *Model) resolveUser(uid string) string {
 }
 
 func formatRelTime(ts string) string {
+	return formatActivityTime(ts)
+}
+
+// formatActivityTime mirrors Slack's Activity-list time format:
+//   - today: "h:MM AM/PM"
+//   - yesterday: "Yesterday"
+//   - within the last 6 days: weekday name (e.g. "Saturday")
+//   - older: "Mon DD"
+//   - older than a year: "Mon DD, YYYY"
+//
+// Returns "" if ts is empty or unparsable so callers can fall back.
+func formatActivityTime(ts string) string {
 	if ts == "" {
 		return ""
 	}
@@ -451,17 +529,51 @@ func formatRelTime(ts string) string {
 	if err != nil {
 		return ""
 	}
-	d := time.Since(time.Unix(sec, 0))
+	t := time.Unix(sec, 0)
+	now := time.Now()
+	today := startOfDay(now)
+	then := startOfDay(t)
+	days := int(today.Sub(then) / (24 * time.Hour))
 	switch {
-	case d < time.Minute:
-		return "now"
-	case d < time.Hour:
-		return strconv.Itoa(int(d/time.Minute)) + "m ago"
-	case d < 24*time.Hour:
-		return strconv.Itoa(int(d/time.Hour)) + "h ago"
+	case days <= 0:
+		return t.Format("3:04 PM")
+	case days == 1:
+		return "Yesterday"
+	case days < 7:
+		return t.Format("Monday")
+	case t.Year() == now.Year():
+		return t.Format("Jan 2")
 	default:
-		return strconv.Itoa(int(d/(24*time.Hour))) + "d ago"
+		return t.Format("Jan 2, 2006")
 	}
+}
+
+func startOfDay(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
+}
+
+func joinLeftRight(left, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if right == "" {
+		return clipToWidth(left, width)
+	}
+	rightWidth := lipgloss.Width(right)
+	if rightWidth >= width {
+		return clipToWidth(right, width)
+	}
+	leftWidth := width - rightWidth - 1
+	if leftWidth < 1 {
+		leftWidth = 1
+	}
+	left = clipToWidth(left, leftWidth)
+	gap := width - lipgloss.Width(left) - rightWidth
+	if gap < 1 {
+		gap = 1
+	}
+	return left + strings.Repeat(" ", gap) + right
 }
 
 func clipToWidth(s string, width int) string {
