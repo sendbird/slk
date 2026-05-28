@@ -9,15 +9,25 @@ import (
 
 var renderCellPixels = image.Pt(8, 16)
 
+// NormalizeCellPixels returns a sane terminal cell size. Some terminals /
+// multiplexers report bogus pixel metrics (for example, cells wider than they
+// are tall), which makes both inline images and fullscreen preview render
+// comically small. In those cases we fall back to the conservative default.
+func NormalizeCellPixels(px image.Point) image.Point {
+	if px.X <= 0 || px.Y <= 0 {
+		return image.Pt(8, 16)
+	}
+	ratio := float64(px.X) / float64(px.Y)
+	if ratio < 0.30 || ratio > 1.00 {
+		return image.Pt(8, 16)
+	}
+	return px
+}
+
 // SetRenderCellPixels records the actual terminal cell size used by renderers
 // that emit pixel-addressed protocols like kitty and sixel.
 func SetRenderCellPixels(px image.Point) {
-	if px.X > 0 {
-		renderCellPixels.X = px.X
-	}
-	if px.Y > 0 {
-		renderCellPixels.Y = px.Y
-	}
+	renderCellPixels = NormalizeCellPixels(px)
 }
 
 func currentRenderCellPixels() image.Point {
@@ -34,14 +44,16 @@ func currentRenderCellPixels() image.Point {
 func CellPixels(fd int) (pxW, pxH int) {
 	if w, ok := atoi(getenv("COLORTERM_CELL_WIDTH")); ok {
 		if h, ok := atoi(getenv("COLORTERM_CELL_HEIGHT")); ok {
-			debuglog.ImgRender("CellPixels: cell_w=%d cell_h=%d source=env_override", w, h)
-			return w, h
+			px := NormalizeCellPixels(image.Pt(w, h))
+			debuglog.ImgRender("CellPixels: cell_w=%d cell_h=%d source=env_override normalized=(%d,%d)", w, h, px.X, px.Y)
+			return px.X, px.Y
 		}
 	}
 	if fd >= 0 {
 		if w, h, ok := winsizePixels(fd); ok {
-			debuglog.ImgRender("CellPixels: cell_w=%d cell_h=%d source=ioctl fd=%d", w, h, fd)
-			return w, h
+			px := NormalizeCellPixels(image.Pt(w, h))
+			debuglog.ImgRender("CellPixels: cell_w=%d cell_h=%d source=ioctl fd=%d normalized=(%d,%d)", w, h, fd, px.X, px.Y)
+			return px.X, px.Y
 		}
 	}
 	debuglog.ImgRender("CellPixels: cell_w=8 cell_h=16 source=fallback (no env, no ioctl)")

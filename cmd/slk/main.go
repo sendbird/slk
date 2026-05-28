@@ -139,6 +139,10 @@ type WorkspaceContext struct {
 	// Used during channel construction to bucket app DMs into a separate
 	// "Apps" sidebar section.
 	BotUserIDs map[string]bool
+	// UsergroupNames maps usergroup id -> handle (e.g. "oncalls"). Populated
+	// from usergroups.list at workspace connect; consumed by the renderer
+	// to expand bare <!subteam^...> tokens into @handle.
+	UsergroupNames map[string]string
 	// SectionStore holds the user's Slack-native sidebar sections for
 	// this workspace. Nil when use_slack_sections is disabled, the
 	// REST bootstrap failed, or this workspace hasn't connected yet.
@@ -667,6 +671,7 @@ func run() error {
 
 	// Cell pixel metrics for sizing decisions.
 	pxW, pxH := imgpkg.CellPixels(int(os.Stdout.Fd()))
+	imgpkg.SetRenderCellPixels(image.Pt(pxW, pxH))
 	debuglog.ImgRender("cell pixels: %dx%d", pxW, pxH)
 
 	// Wire the inline-image pipeline into the messages pane. SendMsg
@@ -1324,12 +1329,34 @@ func run() error {
 			if wctx == nil {
 				return
 			}
+			// Optimistically advance the per-thread last_read in the
+			// local cache BEFORE the Slack API call so the next
+			// ListSubscribedThreads / ListActivityItems already sees
+			// the thread as read. Without this, a ThreadsListDirtyMsg
+			// firing between the local MarkSelectedRead (UI flip) and
+			// the thread_marked WS echo would recompute Unread=true
+			// from the stale last_read and the threads-row badge
+			// would visibly bounce back up. The WS echo from
+			// OnThreadMarked still runs and re-upserts the same value,
+			// which is harmless.
+			if err := db.UpsertThreadSubscription(wctx.TeamID, channelID, threadTS, ts, false); err != nil {
+				log.Printf("Warning: optimistic UpsertThreadSubscription(%s, %s): %v", channelID, threadTS, err)
+			}
 			client := wctx.Client
+			teamID := wctx.TeamID
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				if err := client.MarkThread(ctx, channelID, threadTS, ts); err != nil {
 					log.Printf("Warning: MarkThread(%s, %s): %v", channelID, threadTS, err)
+				}
+				// Force the activity feed to re-fetch so any thread-
+				// reply rows tied to this thread drop their Unread
+				// flag (or disappear when no longer active) without
+				// waiting for the next inbound NewMessageMsg.
+				if p != nil {
+					p.Send(ui.ActivityListDirtyMsg{TeamID: teamID})
+					p.Send(ui.ThreadsListDirtyMsg{TeamID: teamID})
 				}
 			}()
 		})
@@ -1370,6 +1397,38 @@ func run() error {
 			if err != nil {
 				log.Printf("Warning: ListActivityItems(%s): %v", teamID, err)
 				return ui.ActivityListLoadedMsg{TeamID: teamID, Items: nil}
+			}
+			if len(items) > 0 {
+				channelMeta := make(map[string]sidebar.ChannelItem, len(wctx.Channels))
+				for _, ch := range wctx.Channels {
+					channelMeta[ch.ID] = ch
+				}
+				for i := range items {
+					if ch, ok := channelMeta[items[i].ChannelID]; ok {
+						if items[i].ChannelName == "" {
+							items[i].ChannelName = ch.Name
+						}
+						if items[i].ChannelType == "" {
+							items[i].ChannelType = ch.Type
+						}
+					}
+				}
+			}
+			// Drop activity rows from muted channels to match Slack's
+			// Activity feed semantics. Mute state lives only in the
+			// in-memory MuteStore (the cache `channels` table has no
+			// is_muted column), so the SQL can't filter it; we strip
+			// here after the query. Direct @-mentions are kept even
+			// when the channel is muted — Slack still surfaces those.
+			if wctx.MuteStore != nil {
+				filtered := items[:0]
+				for _, it := range items {
+					if it.Kind != "mention" && wctx.MuteStore.IsMuted(it.ChannelID) {
+						continue
+					}
+					filtered = append(filtered, it)
+				}
+				items = filtered
 			}
 			return ui.ActivityListLoadedMsg{TeamID: teamID, Items: items}
 		})
@@ -1547,6 +1606,9 @@ func run() error {
 		if err != nil {
 			log.Printf("warning: loading sidebar collapse state for %s: %v", wctx.TeamID, err)
 		}
+		if p != nil {
+			p.Send(ui.WorkspaceUsergroupNamesUpdatedMsg{TeamID: wctx.TeamID, UsergroupNames: copyStringMap(wctx.UsergroupNames)})
+		}
 		return ui.WorkspaceSwitchedMsg{
 			TeamID:              wctx.TeamID,
 			TeamName:            wctx.TeamName,
@@ -1698,6 +1760,9 @@ func run() error {
 			collapsed, err := db.GetSidebarSectionCollapsed(wctx.TeamID)
 			if err != nil {
 				log.Printf("warning: loading sidebar collapse state for %s: %v", wctx.TeamID, err)
+			}
+			if p != nil {
+				p.Send(ui.WorkspaceUsergroupNamesUpdatedMsg{TeamID: wctx.TeamID, UsergroupNames: copyStringMap(wctx.UsergroupNames)})
 			}
 			p.Send(ui.WorkspaceReadyMsg{
 				TeamID:              wctx.TeamID,
@@ -1856,6 +1921,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		AvatarURLs:           &sync.Map{},
 		UserNamesByHandle:    make(map[string]string),
 		BotUserIDs:           make(map[string]bool),
+		UsergroupNames:       make(map[string]string),
 		CustomEmoji:          make(map[string]string),
 		SlashCommands:        defaultSlashPickerCommands(),
 		LastVisitedByChannel: make(map[string]int64),
@@ -1976,6 +2042,25 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 			}
 		}
 	}
+
+	// Fetch user-group (subteam) handles so the renderer can expand bare
+	// <!subteam^...> tokens back to @handle across every view. Best-effort:
+	// failure leaves UsergroupNames empty and the renderer falls back to
+	// the @subteam placeholder it already uses.
+	go func() {
+		groups, err := client.GetUserGroups(ctx)
+		if err != nil {
+			log.Printf("usergroup bootstrap for %s failed: %v", token.TeamName, err)
+			return
+		}
+		for id, name := range groups {
+			wctx.UsergroupNames[id] = name
+		}
+		log.Printf("usergroup bootstrap for %s: %d group(s) loaded", token.TeamName, len(groups))
+		if p != nil {
+			p.Send(ui.WorkspaceUsergroupNamesUpdatedMsg{TeamID: wctx.TeamID, UsergroupNames: copyStringMap(wctx.UsergroupNames)})
+		}
+	}()
 
 	// Initialize the mute store. Best-effort: failure is logged and the
 	// field stays nil; the sidebar then renders every channel as
@@ -3503,6 +3588,7 @@ func (h *rtmEventHandler) OnThreadMarked(channelID, threadTS, ts string, read bo
 		TS:        ts,
 		Read:      read,
 	})
+	h.program.Send(ui.ActivityListDirtyMsg{TeamID: h.workspaceID})
 }
 
 // OnThreadSubscriptionChanged persists a subscribe/unsubscribe event
@@ -3534,6 +3620,7 @@ func (h *rtmEventHandler) OnThreadSubscriptionChanged(channelID, threadTS, lastR
 	}
 	if h.program != nil {
 		h.program.Send(ui.ThreadsListDirtyMsg{TeamID: h.workspaceID})
+		h.program.Send(ui.ActivityListDirtyMsg{TeamID: h.workspaceID})
 	}
 }
 
@@ -3905,4 +3992,15 @@ func dumpSections() error {
 		fmt.Println()
 	}
 	return nil
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }

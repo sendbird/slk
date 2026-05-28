@@ -44,16 +44,34 @@ func buildChannelItem(ch slack.Channel, wctx *WorkspaceContext, cfg config.Confi
 	}
 
 	displayName := ch.Name
+	var members []string
 	if ch.IsIM {
 		if resolved, ok := wctx.UserNames[ch.User]; ok {
 			displayName = resolved
 		} else {
 			displayName = ch.User
 		}
+		if displayName != "" {
+			members = []string{displayName}
+		}
 	} else if ch.IsMpIM {
 		displayName = slackfmt.FormatMPDMName(ch.Name, func(h string) string {
 			return wctx.UserNamesByHandle[h]
 		})
+		// Per-member view that cmd+K-style ranking needs: resolve each
+		// handle in the mpdm name to its display name (falling back to
+		// the handle when the user roster hasn't hydrated yet).
+		handles := slackfmt.ParseMPDMHandles(ch.Name)
+		if len(handles) > 0 {
+			members = make([]string, 0, len(handles))
+			for _, h := range handles {
+				if name, ok := wctx.UserNamesByHandle[h]; ok && name != "" {
+					members = append(members, name)
+				} else {
+					members = append(members, h)
+				}
+			}
+		}
 	}
 
 	section := ""
@@ -93,6 +111,7 @@ func buildChannelItem(ch slack.Channel, wctx *WorkspaceContext, cfg config.Confi
 		Type:     chType,
 		Presence: item.Presence,
 		Joined:   true,
+		Members:  members,
 	}
 	return item, finderItem
 }

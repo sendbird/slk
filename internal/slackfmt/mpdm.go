@@ -66,6 +66,40 @@ func FormatMPDMName(name string, lookup func(handle string) string) string {
 	return strings.Join(displays, ", ")
 }
 
+// ParseMPDMHandles extracts the participant handles from a Slack MPDM
+// channel name (e.g. "mpdm-grant--myles--ray-1" → ["grant","myles","ray"]).
+// Returns nil for names that don't match the mpdm format. The caller can
+// resolve each handle to a display name via the same lookup map used by
+// FormatMPDMName. This is the per-member view that cmd+K-style ranking
+// needs so multi-term queries can match individual participants rather
+// than the concatenated display string.
+func ParseMPDMHandles(name string) []string {
+	const prefix = "mpdm-"
+	if !strings.HasPrefix(name, prefix) {
+		return nil
+	}
+	body := name[len(prefix):]
+	if body == "" {
+		return nil
+	}
+	if i := strings.LastIndexByte(body, '-'); i >= 0 && i < len(body)-1 {
+		if isAllDigits(body[i+1:]) {
+			body = body[:i]
+		}
+	}
+	parts := strings.Split(body, "--")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func isAllDigits(s string) bool {
 	if s == "" {
 		return false

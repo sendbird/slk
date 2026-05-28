@@ -280,6 +280,10 @@ func (m *mockSlackAPI) GetUsersContext(ctx context.Context, options ...slack.Get
 	return nil, nil
 }
 
+func (m *mockSlackAPI) GetUserGroupsContext(ctx context.Context, options ...slack.GetUserGroupsOption) ([]slack.UserGroup, error) {
+	return nil, nil
+}
+
 func (m *mockSlackAPI) GetEmoji() (map[string]string, error) {
 	if m.getEmojiFn != nil {
 		return m.getEmojiFn()

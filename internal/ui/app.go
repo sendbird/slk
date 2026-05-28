@@ -8,9 +8,11 @@ import (
 	"image/color"
 	"log"
 	"mime"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -58,6 +60,11 @@ const (
 	PanelSidebar
 	PanelMessages
 	PanelThread
+	// PanelActivityPreview is the right-side message preview shown next
+	// to the Activity list. It participates in keyboard focus cycling
+	// (←/→, h/l, Tab) and mouse focus so the user can scroll and enter
+	// the preview without falling back to the activity list first.
+	PanelActivityPreview
 )
 
 // navStack is a per-workspace browser-style back/forward history of
@@ -281,6 +288,13 @@ type (
 	WorkspaceUserNamesUpdatedMsg struct {
 		TeamID    string
 		UserNames map[string]string
+	}
+	// WorkspaceUsergroupNamesUpdatedMsg arrives after the background
+	// usergroups.list bootstrap so the renderer can resolve bare
+	// <!subteam^...> tokens by their handle across every view.
+	WorkspaceUsergroupNamesUpdatedMsg struct {
+		TeamID         string
+		UsergroupNames map[string]string
 	}
 	// UserExternalMsg flags a single user as external (Slack Connect /
 	// shared-channel guest). Emitted by the user-resolution path when a
@@ -968,10 +982,11 @@ type App struct {
 	suppressNextInsertText map[string]struct{}
 
 	// Cached layout widths for mouse hit-testing
-	layoutRailWidth  int
-	layoutSidebarEnd int // railWidth + sidebarWidth + sidebarBorder
-	layoutMsgEnd     int // layoutSidebarEnd + msgWidth + msgBorder
-	layoutThreadEnd  int // layoutMsgEnd + threadWidth + threadBorder
+	layoutRailWidth          int
+	layoutSidebarEnd         int // railWidth + sidebarWidth + sidebarBorder
+	layoutMsgEnd             int // layoutSidebarEnd + msgWidth + msgBorder
+	layoutThreadEnd          int // layoutMsgEnd + threadWidth + threadBorder
+	layoutActivityPreviewEnd int // layoutMsgEnd + activityPreviewWidth + activityPreviewBorder (only set in ViewActivity)
 	// Cached pane content heights, used for page-up/down distance calculations.
 	layoutMsgHeight     int
 	layoutSidebarHeight int
@@ -983,6 +998,14 @@ type App struct {
 	pendingWheelPanel  Panel
 	pendingWheelView   View
 	pendingWheelDelta  int
+	// wheelInputAccum holds raw wheel-event ticks before they are
+	// promoted into pendingWheelDelta. Trackpads and high-resolution
+	// mice emit 2+ events per physical notch, so accumulating 1 per
+	// event would force a minimum of 2 lines per visible scroll. The
+	// accumulator drops every other event in either direction, keeping
+	// the smallest perceptible scroll at exactly 1 line while leaving
+	// fast scrolls unchanged (they still saturate maxMouseWheelPerFrame).
+	wheelInputAccum    int
 	mouseWheelCooldown bool
 	mouseWheelGen      uint64
 
@@ -1059,6 +1082,7 @@ type App struct {
 	// to keep mark-as-read working without firing the full fetcher.
 	channelReadMarker  func(channelID, ts string) tea.Msg
 	channelCacheReader ChannelCacheReadFunc
+	readStateReader    func() map[string]cache.ReadState
 	// channelSyncedAtReader returns the unix timestamp (seconds) at which
 	// the channel's cache was last authoritatively replaced from the
 	// network, or 0 if never. Used by ChannelSelectedMsg's three-tier
@@ -1633,6 +1657,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if a.view == ViewActivity {
 				panel, _, py, ok := a.panelAt(msg.X, msg.Y)
 				if ok && panel == PanelMessages && py >= 0 {
+					a.focusedPanel = PanelMessages
 					a.activityView.ClickAt(py)
 					return a, a.loadActivityPreviewCmd()
 				}
@@ -1659,7 +1684,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 					if _, linkURL, hit := a.messagepane.HitTestLink(contentY, px); hit && linkURL != "" {
-						return a, openExternalURLCmd(linkURL)
+						return a, a.openLinkCmd(linkURL)
 					}
 					if hitMsgIdx, attIdx, fileID, hit := a.messagepane.HitTest(contentY, px); hit && fileID != "" {
 						msgs := a.messagepane.Messages()
@@ -1696,6 +1721,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.focusedPanel = PanelThread
 			panel, px, py, ok := a.panelAt(msg.X, msg.Y)
 			if ok && panel == PanelThread && py >= 0 {
+				// Header action: "Open in channel" click routes to a
+				// channel switch with pendingJumpTS pointing at the
+				// thread's parent message, so the user lands on the
+				// thread root inside the regular messages pane.
+				if a.threadPanel.HitTestOpenChannel(py, px) {
+					return a, a.openThreadInChannelCmd()
+				}
 				// Hit-test reactions first on the thread pane too.
 				// HitTestReaction's rows are pane-local (already
 				// inclusive of the thread chromeHeight), matching the
@@ -1707,11 +1739,73 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				if _, linkURL, hit := a.threadPanel.HitTestLink(py, px); hit && linkURL != "" {
-					return a, openExternalURLCmd(linkURL)
+					return a, a.openLinkCmd(linkURL)
+				}
+				if hitReplyIdx, attIdx, fileID, hit := a.threadPanel.HitTest(py, px); hit && fileID != "" {
+					replies := a.threadPanel.Replies()
+					if hitReplyIdx >= 0 && hitReplyIdx < len(replies) {
+						ch := a.threadPanel.ChannelID()
+						messageTS := replies[hitReplyIdx].TS
+						idx := attIdx
+						return a, func() tea.Msg {
+							return messages.OpenImagePreviewMsg{
+								Channel: ch,
+								TS:      messageTS,
+								AttIdx:  idx,
+							}
+						}
+					}
 				}
 				a.drag = dragState{panel: PanelThread, pressX: px, pressY: py, lastX: px, lastY: py}
 				a.threadPanel.BeginSelectionAt(py, px)
 				a.threadPanel.ClickAt(py)
+			}
+		} else if a.view == ViewActivity && x < a.layoutActivityPreviewEnd {
+			// Activity-view right-side preview pane. Mirrors the
+			// channel-pane click handling: hit-test reactions / links /
+			// images first, then fall through to selection + drag
+			// start. After ClickAt selects the message under the
+			// cursor, openSelectedActivityItem dispatches the channel
+			// switch (+ optional ThreadOpenedMsg) so the click acts as
+			// Enter without an extra keystroke.
+			panel, px, py, ok := a.panelAt(msg.X, msg.Y)
+			if ok && panel == PanelActivityPreview && py >= 0 {
+				a.focusedPanel = PanelActivityPreview
+				previewChannelID := ""
+				if item, ok := a.activityView.SelectedItem(); ok {
+					previewChannelID = item.ChannelID
+				}
+				contentY := py - a.activityPreview.ChromeHeight()
+				if contentY >= 0 {
+					if hitMsgIdx, emojiName, hit := a.activityPreview.HitTestReaction(contentY, px); hit && emojiName != "" {
+						msgs := a.activityPreview.Messages()
+						if hitMsgIdx >= 0 && hitMsgIdx < len(msgs) && previewChannelID != "" {
+							return a, a.toggleReactionOnMessageItem(previewChannelID, msgs[hitMsgIdx], emojiName)
+						}
+					}
+					if _, linkURL, hit := a.activityPreview.HitTestLink(contentY, px); hit && linkURL != "" {
+						return a, a.openLinkCmd(linkURL)
+					}
+					if hitMsgIdx, attIdx, fileID, hit := a.activityPreview.HitTest(contentY, px); hit && fileID != "" {
+						msgs := a.activityPreview.Messages()
+						if hitMsgIdx >= 0 && hitMsgIdx < len(msgs) && previewChannelID != "" {
+							ch := previewChannelID
+							messageTS := msgs[hitMsgIdx].TS
+							idx := attIdx
+							return a, func() tea.Msg {
+								return messages.OpenImagePreviewMsg{
+									Channel: ch,
+									TS:      messageTS,
+									AttIdx:  idx,
+								}
+							}
+						}
+					}
+				}
+				a.drag = dragState{panel: PanelActivityPreview, pressX: px, pressY: py, lastX: px, lastY: py}
+				a.activityPreview.BeginSelectionAt(py, px)
+				a.activityPreview.ClickAt(py)
+				return a, a.openSelectedActivityItem()
 			}
 		}
 
@@ -1722,7 +1816,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Button != tea.MouseLeft {
 			break
 		}
-		if a.drag.panel != PanelMessages && a.drag.panel != PanelThread {
+		if a.drag.panel != PanelMessages && a.drag.panel != PanelThread && a.drag.panel != PanelActivityPreview {
 			break
 		}
 		panel, px, py, _ := a.panelAt(msg.X, msg.Y)
@@ -1738,6 +1832,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.messagepane.ExtendSelectionAt(py, px)
 		case PanelThread:
 			a.threadPanel.ExtendSelectionAt(py, px)
+		case PanelActivityPreview:
+			a.activityPreview.ExtendSelectionAt(py, px)
 		}
 		// If the cursor is at the top/bottom edge of the originating pane,
 		// schedule an auto-scroll tick. The autoScrollActive gate ensures
@@ -1749,6 +1845,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			hint = a.messagepane.ScrollHintForDrag(py)
 		case PanelThread:
 			hint = a.threadPanel.ScrollHintForDrag(py)
+		case PanelActivityPreview:
+			hint = a.activityPreview.ScrollHintForDrag(py)
 		}
 		if hint != 0 && !a.drag.autoScrollActive {
 			a.drag.autoScrollActive = true
@@ -1759,7 +1857,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case autoScrollTickMsg:
 		// If the drag ended (release clears a.drag), self-terminate.
-		if a.drag.panel != PanelMessages && a.drag.panel != PanelThread {
+		if a.drag.panel != PanelMessages && a.drag.panel != PanelThread && a.drag.panel != PanelActivityPreview {
 			a.drag.autoScrollActive = false
 			break
 		}
@@ -1769,6 +1867,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			hint = a.messagepane.ScrollHintForDrag(a.drag.lastY)
 		case PanelThread:
 			hint = a.threadPanel.ScrollHintForDrag(a.drag.lastY)
+		case PanelActivityPreview:
+			hint = a.activityPreview.ScrollHintForDrag(a.drag.lastY)
 		}
 		if hint == 0 {
 			// Cursor left the edge -- stop ticking. Re-entering the edge
@@ -1791,6 +1891,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.threadPanel.ScrollDown(1)
 			}
 			a.threadPanel.ExtendSelectionAt(a.drag.lastY, a.drag.lastX)
+		case PanelActivityPreview:
+			if hint < 0 {
+				a.activityPreview.ScrollUp(1)
+			} else {
+				a.activityPreview.ScrollDown(1)
+			}
+			a.activityPreview.ExtendSelectionAt(a.drag.lastY, a.drag.lastX)
 		}
 		// Schedule the next tick. autoScrollActive remains true.
 		cmds = append(cmds, tea.Tick(50*time.Millisecond, func(time.Time) tea.Msg {
@@ -1835,7 +1942,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseReleaseMsg:
-		if a.drag.panel != PanelMessages && a.drag.panel != PanelThread {
+		if a.drag.panel != PanelMessages && a.drag.panel != PanelThread && a.drag.panel != PanelActivityPreview {
 			break
 		}
 		moved := a.drag.moved
@@ -1848,6 +1955,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.messagepane.ClearSelection()
 			case PanelThread:
 				a.threadPanel.ClearSelection()
+			case PanelActivityPreview:
+				a.activityPreview.ClearSelection()
 			}
 			break
 		}
@@ -1860,6 +1969,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			text, ok = a.messagepane.EndSelection()
 		case PanelThread:
 			text, ok = a.threadPanel.EndSelection()
+		case PanelActivityPreview:
+			text, ok = a.activityPreview.EndSelection()
 		}
 		if ok && text != "" {
 			n := len([]rune(text))
@@ -2929,6 +3040,22 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		a.SetUserNames(msg.UserNames)
+		return a, nil
+
+	case WorkspaceUsergroupNamesUpdatedMsg:
+		// Apply regardless of activeTeamID: the bootstrap goroutine
+		// in main.go races with workspace activation, so if we
+		// gated on the active team here, the first (and often only)
+		// usergroup fetch result would be dropped before the user's
+		// initial workspace is marked active — leaving the renderer
+		// stuck on its "@subteam" fallback for the whole session.
+		// SetUsergroupNames is now additive, so applying every
+		// workspace's map is harmless (Slack subteam IDs are
+		// workspace-unique).
+		messages.SetUsergroupNames(msg.UsergroupNames)
+		a.messagepane.InvalidateCache()
+		a.threadPanel.InvalidateCache()
+		a.activityPreview.InvalidateCache()
 		return a, nil
 
 	case UserExternalMsg:
@@ -5287,6 +5414,8 @@ func (a *App) handleDown() tea.Cmd {
 		a.messagepane.MoveDown()
 	case PanelThread:
 		a.threadPanel.MoveDown()
+	case PanelActivityPreview:
+		a.activityPreview.MoveDown()
 	}
 	return nil
 }
@@ -5327,6 +5456,8 @@ func (a *App) handleUp() tea.Cmd {
 		}
 	case PanelThread:
 		a.threadPanel.MoveUp()
+	case PanelActivityPreview:
+		a.activityPreview.MoveUp()
 	}
 	return nil
 }
@@ -5362,6 +5493,8 @@ func (a *App) handleGoToTop() tea.Cmd {
 		}
 	case PanelThread:
 		a.threadPanel.GoToTop()
+	case PanelActivityPreview:
+		a.activityPreview.GoToTop()
 	}
 	return nil
 }
@@ -5383,6 +5516,8 @@ func (a *App) handleGoToBottom() tea.Cmd {
 		a.messagepane.GoToBottom()
 	case PanelThread:
 		a.threadPanel.GoToBottom()
+	case PanelActivityPreview:
+		a.activityPreview.GoToBottom()
 	}
 	return nil
 }
@@ -5392,12 +5527,12 @@ func (a *App) handleGoToBottom() tea.Cmd {
 // terminals can emit wheel messages much faster than the TUI can render, and
 // rendering after every notch starves the event loop.
 func (a *App) absorbMouseWheel(msg tea.MouseWheelMsg) bool {
-	delta := 0
+	raw := 0
 	switch msg.Button {
 	case tea.MouseWheelUp:
-		delta = -1
+		raw = -1
 	case tea.MouseWheelDown:
-		delta = 1
+		raw = 1
 	default:
 		return false
 	}
@@ -5405,6 +5540,34 @@ func (a *App) absorbMouseWheel(msg tea.MouseWheelMsg) bool {
 	panel, ok := a.wheelTargetPanel(msg.X)
 	if !ok {
 		return false
+	}
+
+	// Trackpads emit 2+ events per physical notch, which used to force
+	// a minimum visible scroll of 2 lines. The first event of a burst
+	// (or any event that reverses direction) lands immediately so
+	// single notches feel responsive. Mid-burst events accumulate and
+	// only every second one promotes to a step, halving sensitivity
+	// without throwing away input.
+	freshBurst := !a.pendingWheelActive ||
+		a.pendingWheelPanel != panel ||
+		a.pendingWheelView != a.view ||
+		(a.pendingWheelDelta != 0 && (a.pendingWheelDelta < 0) != (raw < 0))
+	delta := 0
+	if freshBurst {
+		delta = raw
+		a.wheelInputAccum = 0
+	} else {
+		a.wheelInputAccum += raw
+		switch {
+		case a.wheelInputAccum >= 2:
+			delta = 1
+			a.wheelInputAccum -= 2
+		case a.wheelInputAccum <= -2:
+			delta = -1
+			a.wheelInputAccum += 2
+		default:
+			return false
+		}
 	}
 
 	a.focusedPanel = panel
@@ -5468,6 +5631,8 @@ func (a *App) wheelTargetPanel(x int) (Panel, bool) {
 		return PanelMessages, true
 	case a.threadVisible && x < a.layoutThreadEnd:
 		return PanelThread, true
+	case a.view == ViewActivity && x < a.layoutActivityPreviewEnd:
+		return PanelActivityPreview, true
 	default:
 		return PanelWorkspace, false
 	}
@@ -5522,31 +5687,23 @@ func (a *App) flushMouseWheel() tea.Cmd {
 				cmds = append(cmds, cmd)
 			}
 		default:
-			for i := 0; i < steps; i++ {
-				if up {
-					a.messagepane.MoveUp()
-				} else {
-					a.messagepane.MoveDown()
-				}
-			}
-			if up && a.messagepane.AtTop() && !a.fetchingOlder && a.olderMessagesFetcher != nil {
-				a.fetchingOlder = true
-				a.messagepane.SetLoading(true)
-				chID := a.activeChannelID
-				oldestTS := a.messagepane.OldestTS()
-				fetcher := a.olderMessagesFetcher
-				cmds = append(cmds, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
-					return SpinnerTickMsg{}
-				}))
-				cmds = append(cmds, func() tea.Msg { return fetcher(chID, oldestTS) })
+			if cmd := a.scrollMessagesPanel(delta); cmd != nil {
+				cmds = append(cmds, cmd)
 			}
 		}
 	case PanelThread:
+		if cmd := a.scrollThreadPanel(delta); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	case PanelActivityPreview:
+		// Wheel scrolls the preview message list locally. The preview
+		// is read-only — no fetcher, no follow-up cmds; the selection
+		// cursor on the activity list is unchanged.
 		for i := 0; i < steps; i++ {
 			if up {
-				a.threadPanel.MoveUp()
+				a.activityPreview.MoveUp()
 			} else {
-				a.threadPanel.MoveDown()
+				a.activityPreview.MoveDown()
 			}
 		}
 	}
@@ -5594,6 +5751,83 @@ func (a *App) halfPageSize() int {
 	return n
 }
 
+// scrollMessagesPanel routes scroll intent for the main channel history.
+// When the selected message is clipped in the direction of travel, scroll
+// within that message first; otherwise preserve the existing selection-based
+// navigation semantics.
+func (a *App) scrollMessagesPanel(delta int) tea.Cmd {
+	if delta == 0 {
+		return nil
+	}
+	steps := delta
+	if steps < 0 {
+		steps = -steps
+	}
+	if delta < 0 {
+		if a.messagepane.SelectedExtendsAboveViewport() {
+			a.messagepane.ScrollUp(steps)
+			return nil
+		}
+		for i := 0; i < steps; i++ {
+			a.messagepane.MoveUp()
+		}
+		if a.messagepane.AtTop() && !a.fetchingOlder && a.olderMessagesFetcher != nil {
+			a.fetchingOlder = true
+			a.messagepane.SetLoading(true)
+			chID := a.activeChannelID
+			oldestTS := a.messagepane.OldestTS()
+			fetcher := a.olderMessagesFetcher
+			return tea.Batch(
+				tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+					return SpinnerTickMsg{}
+				}),
+				func() tea.Msg { return fetcher(chID, oldestTS) },
+			)
+		}
+		return nil
+	}
+	if a.messagepane.SelectedExtendsBelowViewport() {
+		a.messagepane.ScrollDown(steps)
+		return nil
+	}
+	for i := 0; i < steps; i++ {
+		a.messagepane.MoveDown()
+	}
+	return nil
+}
+
+// scrollThreadPanel routes scroll intent for the thread detail pane.
+// When the selected reply is clipped in the direction of travel, scroll
+// within that reply first; otherwise preserve the existing selection-based
+// navigation semantics.
+func (a *App) scrollThreadPanel(delta int) tea.Cmd {
+	if delta == 0 {
+		return nil
+	}
+	steps := delta
+	if steps < 0 {
+		steps = -steps
+	}
+	if delta < 0 {
+		if a.threadPanel.SelectedExtendsAboveViewport() {
+			a.threadPanel.ScrollUp(steps)
+			return nil
+		}
+		for i := 0; i < steps; i++ {
+			a.threadPanel.MoveUp()
+		}
+		return nil
+	}
+	if a.threadPanel.SelectedExtendsBelowViewport() {
+		a.threadPanel.ScrollDown(steps)
+		return nil
+	}
+	for i := 0; i < steps; i++ {
+		a.threadPanel.MoveDown()
+	}
+	return nil
+}
+
 // panelAt classifies the (x, y) coordinate into the panel under the
 // cursor and returns pane-local content coordinates (after subtracting
 // layout offsets and the 1-row top border). ok=false means the cursor
@@ -5614,17 +5848,19 @@ func (a *App) panelAt(x, y int) (panel Panel, paneX, paneY int, ok bool) {
 		return PanelMessages, x - a.layoutSidebarEnd - 1, y - 1, true
 	case a.threadVisible && x < a.layoutThreadEnd:
 		return PanelThread, x - a.layoutMsgEnd - 1, y - 1, true
+	case a.view == ViewActivity && x < a.layoutActivityPreviewEnd:
+		// Activity preview region. Coords are pane-local so callers can
+		// hit-test rows; in practice the preview is read-only and clicks
+		// here just bump focus (handled in the click branch).
+		return PanelActivityPreview, x - a.layoutMsgEnd - 1, y - 1, true
 	}
 	return PanelWorkspace, 0, 0, false
 }
 
 // scrollFocusedPanel scrolls the focused panel by delta lines (negative = up).
-// Half-page scrolls (ctrl+u / ctrl+d) advance the SELECTION as well as the
-// viewport: previously they moved only the viewport, leaving `selected`
-// behind, so the next j/k snapped the viewport back to where the user
-// started -- effectively undoing the page jump. Moving by N selection
-// steps fixes that and also exercises sidebar's threads-row transition
-// logic naturally.
+// The channel message pane gives priority to revealing clipped rows of the
+// current selection so page keys can fully traverse tall messages before the
+// selection advances to a different message.
 // Returns a tea.Cmd when the resulting selection change has a side
 // effect to dispatch (currently: activity-view selection triggers a
 // preview reload). Callers should `return a.scrollFocusedPanel(...)`.
@@ -5670,24 +5906,18 @@ func (a *App) scrollFocusedPanel(delta int) tea.Cmd {
 			}
 			return a.loadActivityPreviewCmd()
 		} else {
-			if delta < 0 {
-				for i := 0; i < steps; i++ {
-					a.messagepane.MoveUp()
-				}
-			} else {
-				for i := 0; i < steps; i++ {
-					a.messagepane.MoveDown()
-				}
-			}
+			return a.scrollMessagesPanel(delta)
 		}
 	case PanelThread:
+		return a.scrollThreadPanel(delta)
+	case PanelActivityPreview:
 		if delta < 0 {
 			for i := 0; i < steps; i++ {
-				a.threadPanel.MoveUp()
+				a.activityPreview.MoveUp()
 			}
 		} else {
 			for i := 0; i < steps; i++ {
-				a.threadPanel.MoveDown()
+				a.activityPreview.MoveDown()
 			}
 		}
 	}
@@ -5759,35 +5989,8 @@ func (a *App) handleEnter() tea.Cmd {
 		a.focusedPanel = PanelThread
 		return cmd
 	}
-	if a.focusedPanel == PanelMessages && a.view == ViewActivity {
-		item, ok := a.activityView.SelectedItem()
-		if !ok {
-			return nil
-		}
-		if item.ChannelID == "" {
-			return nil
-		}
-		a.sidebar.SelectByID(item.ChannelID)
-		if item.Kind == "thread_reply" && item.ThreadTS != "" {
-			return tea.Sequence(
-				func() tea.Msg {
-					return ChannelSelectedMsg{ID: item.ChannelID, Name: item.ChannelName, Type: item.ChannelType}
-				},
-				func() tea.Msg {
-					parent := messages.MessageItem{
-						TS:       item.ThreadTS,
-						UserID:   item.UserID,
-						UserName: a.userNameFor(item.UserID),
-						Text:     item.Text,
-						ThreadTS: item.ThreadTS,
-					}
-					return ThreadOpenedMsg{ChannelID: item.ChannelID, ThreadTS: item.ThreadTS, ParentMsg: parent}
-				},
-			)
-		}
-		return func() tea.Msg {
-			return ChannelSelectedMsg{ID: item.ChannelID, Name: item.ChannelName, Type: item.ChannelType}
-		}
+	if a.view == ViewActivity && (a.focusedPanel == PanelMessages || a.focusedPanel == PanelActivityPreview) {
+		return a.openSelectedActivityItem()
 	}
 
 	if a.focusedPanel == PanelMessages {
@@ -5887,6 +6090,11 @@ func (a *App) clearSelections() {
 func (a *App) FocusNext() {
 	a.cancelEdit()
 	a.clearSelections()
+	// In Activity view the focus cycle has an extra stop: the right-
+	// side preview pane. Reachable via Tab/→/l from the activity list
+	// and Tab again continues to the sidebar. The preview is omitted
+	// from the cycle in any other view (it isn't rendered there).
+	activityPreviewAvailable := a.view == ViewActivity && a.layoutActivityPreviewEnd > a.layoutMsgEnd
 	if !a.sidebarVisible {
 		if a.threadVisible {
 			if a.focusedPanel == PanelMessages {
@@ -5894,6 +6102,14 @@ func (a *App) FocusNext() {
 			} else {
 				a.focusedPanel = PanelMessages
 			}
+			return
+		}
+		if activityPreviewAvailable {
+			if a.focusedPanel == PanelMessages {
+				a.focusedPanel = PanelActivityPreview
+			} else {
+				a.focusedPanel = PanelMessages
+			}
 		}
 		return
 	}
@@ -5903,10 +6119,14 @@ func (a *App) FocusNext() {
 	case PanelMessages:
 		if a.threadVisible {
 			a.focusedPanel = PanelThread
+		} else if activityPreviewAvailable {
+			a.focusedPanel = PanelActivityPreview
 		} else {
 			a.focusedPanel = PanelSidebar
 		}
 	case PanelThread:
+		a.focusedPanel = PanelSidebar
+	case PanelActivityPreview:
 		a.focusedPanel = PanelSidebar
 	}
 }
@@ -5914,12 +6134,21 @@ func (a *App) FocusNext() {
 func (a *App) FocusPrev() {
 	a.cancelEdit()
 	a.clearSelections()
+	activityPreviewAvailable := a.view == ViewActivity && a.layoutActivityPreviewEnd > a.layoutMsgEnd
 	if !a.sidebarVisible {
 		if a.threadVisible {
 			if a.focusedPanel == PanelThread {
 				a.focusedPanel = PanelMessages
 			} else {
 				a.focusedPanel = PanelThread
+			}
+			return
+		}
+		if activityPreviewAvailable {
+			if a.focusedPanel == PanelActivityPreview {
+				a.focusedPanel = PanelMessages
+			} else {
+				a.focusedPanel = PanelActivityPreview
 			}
 		}
 		return
@@ -5928,6 +6157,8 @@ func (a *App) FocusPrev() {
 	case PanelSidebar:
 		if a.threadVisible {
 			a.focusedPanel = PanelThread
+		} else if activityPreviewAvailable {
+			a.focusedPanel = PanelActivityPreview
 		} else {
 			a.focusedPanel = PanelMessages
 		}
@@ -5935,7 +6166,115 @@ func (a *App) FocusPrev() {
 		a.focusedPanel = PanelSidebar
 	case PanelThread:
 		a.focusedPanel = PanelMessages
+	case PanelActivityPreview:
+		a.focusedPanel = PanelMessages
 	}
+}
+
+type activityOpenTarget struct {
+	channel ChannelSelectedMsg
+	thread  *ThreadOpenedMsg
+	jumpTS  string
+}
+
+func (a *App) openSelectedActivityItem() tea.Cmd {
+	target, ok := a.selectedActivityOpenTarget()
+	if !ok {
+		return nil
+	}
+	a.sidebar.SelectByID(target.channel.ID)
+	a.pendingJumpChannelID = target.channel.ID
+	a.pendingJumpTS = target.jumpTS
+	if target.thread != nil {
+		thread := *target.thread
+		return tea.Sequence(
+			func() tea.Msg { return target.channel },
+			func() tea.Msg { return thread },
+		)
+	}
+	return func() tea.Msg { return target.channel }
+}
+
+func (a *App) selectedActivityOpenTarget() (activityOpenTarget, bool) {
+	item, ok := a.activityView.SelectedItem()
+	if !ok || item.ChannelID == "" {
+		return activityOpenTarget{}, false
+	}
+	target := activityOpenTarget{
+		channel: ChannelSelectedMsg{ID: item.ChannelID, Name: item.ChannelName, Type: item.ChannelType},
+		jumpTS:  item.TS,
+	}
+	if preview, ok := a.selectedActivityPreviewMessage(); ok {
+		target.jumpTS = preview.TS
+		if thread, ok := a.threadOpenTargetFromPreview(item, preview); ok {
+			target.thread = &thread
+			return target, true
+		}
+	}
+	if thread, ok := a.threadOpenTargetFromActivityItem(item); ok {
+		target.thread = &thread
+	}
+	return target, true
+}
+
+func (a *App) selectedActivityPreviewMessage() (messages.MessageItem, bool) {
+	if a.focusedPanel != PanelActivityPreview {
+		return messages.MessageItem{}, false
+	}
+	return a.activityPreview.SelectedMessage()
+}
+
+func (a *App) threadOpenTargetFromPreview(item cache.ActivityItem, msg messages.MessageItem) (ThreadOpenedMsg, bool) {
+	if !messageHasThread(msg) {
+		return ThreadOpenedMsg{}, false
+	}
+	threadTS := msg.TS
+	if msg.ThreadTS != "" && msg.ThreadTS != msg.TS {
+		threadTS = msg.ThreadTS
+	}
+	parent := msg
+	if threadTS != msg.TS {
+		if resolved, ok := findMessageByTS(a.activityPreview.Messages(), threadTS); ok {
+			parent = resolved
+		} else {
+			parent = messages.MessageItem{
+				TS:       threadTS,
+				ThreadTS: threadTS,
+				UserID:   item.UserID,
+				UserName: a.userNameFor(item.UserID),
+				Text:     item.Text,
+			}
+		}
+	} else if parent.ThreadTS == "" {
+		parent.ThreadTS = parent.TS
+	}
+	return ThreadOpenedMsg{ChannelID: item.ChannelID, ThreadTS: threadTS, ParentMsg: parent}, true
+}
+
+func (a *App) threadOpenTargetFromActivityItem(item cache.ActivityItem) (ThreadOpenedMsg, bool) {
+	if item.ThreadTS == "" || item.ThreadTS == item.TS {
+		return ThreadOpenedMsg{}, false
+	}
+	parent := messages.MessageItem{
+		TS:       item.ThreadTS,
+		ThreadTS: item.ThreadTS,
+		UserID:   item.UserID,
+		UserName: a.userNameFor(item.UserID),
+		Text:     item.Text,
+	}
+	if resolved, ok := findMessageByTS(a.activityPreview.Messages(), item.ThreadTS); ok {
+		parent = resolved
+	}
+	return ThreadOpenedMsg{ChannelID: item.ChannelID, ThreadTS: item.ThreadTS, ParentMsg: parent}, true
+}
+
+func findMessageByTS(msgs []messages.MessageItem, ts string) (messages.MessageItem, bool) {
+	for _, msg := range msgs {
+		if msg.TS == ts {
+			return msg, true
+		}
+	}
+	return messages.MessageItem{}, false
 }
 
 func (a *App) ToggleSidebar() {
@@ -6016,10 +6355,25 @@ func (a *App) openSelectedThreadCmd(debounce bool) tea.Cmd {
 	a.applyThreadUnreadBoundary(sum.ChannelID)
 	// Local mark-as-read for the threads list: opening a thread should
 	// clear its unread flag in the threads-view list and the sidebar
-	// badge. This is presentation-only — it does not call Slack's
-	// conversations.mark or advance the parent channel's last_read_ts.
+	// badge. We also fire the durable threadMarker right away (when
+	// wired) so the cache's per-thread last_read advances BEFORE any
+	// follow-up ThreadsListDirtyMsg refresh recomputes Unread from
+	// the stale boundary. Without this immediate persist, the unread
+	// count visibly bounced back up whenever a refresh ran between
+	// MarkSelectedRead and the eventual ThreadRepliesLoadedMsg-driven
+	// threadMarker call (which only fires after the network fetch
+	// returns).
 	if a.threadsView.MarkSelectedRead() {
 		a.sidebar.SetThreadsUnreadCount(a.threadsView.UnreadCount())
+	}
+	if a.threadMarker != nil && sum.ChannelID != "" && sum.ThreadTS != "" {
+		marker := a.threadMarker
+		latestTS := sum.LastReplyTS
+		if latestTS == "" {
+			latestTS = sum.ThreadTS
+		}
+		chID, threadTS := sum.ChannelID, sum.ThreadTS
+		go marker(chID, threadTS, latestTS)
 	}
 	if a.threadFetcher == nil {
 		return nil
@@ -6371,7 +6725,9 @@ func (a *App) SetChannelLastReadFetcher(fn func(channelID string) string) {
 // readers) will call at render time to fetch per-channel read state.
 // Must be set before the first render for unread dots to appear.
 func (a *App) SetReadStateReader(f func() map[string]cache.ReadState) {
+	a.readStateReader = f
 	a.sidebar.SetReadStateReader(f)
+	a.globalSearch.SetReadStateReader(f)
 }
 
 // SetWorkspaceUnreadReader installs the callback the workspace rail
@@ -6471,6 +6827,7 @@ func globalSearchItemsFromFinder(items []channelfinder.Item) []globalsearch.Item
 			Presence:    it.Presence,
 			Joined:      it.Joined,
 			LastVisited: it.LastVisited,
+			Members:     it.Members,
 		})
 	}
 	return out
@@ -6487,9 +6844,16 @@ func (a *App) SetAvatarFunc(fn messages.AvatarFunc) {
 // messages pane. Should be called once at startup, before the first
 // View(). Pass a zero-valued ImageContext to disable inline rendering.
 func (a *App) SetImageContext(ctx imgrender.ImageContext) {
-	a.messagepane.SetImageContext(ctx)
-	a.threadPanel.SetImageContext(ctx)
-	a.activityPreview.SetImageContext(ctx)
+	effective := ctx
+	if effective.MaxRows == 20 {
+		effective.MaxRows = 28
+	}
+	if effective.MaxCols == 60 {
+		effective.MaxCols = 96
+	}
+	a.messagepane.SetImageContext(effective)
+	a.threadPanel.SetImageContext(effective)
+	a.activityPreview.SetImageContext(effective)
 	a.imgCellPixels = ctx.CellPixels
 }
 
@@ -6748,6 +7112,139 @@ func openExternalURLCmd(rawURL string) tea.Cmd {
 		return nil
 	}
 	return openDefaultAppCmd(rawURL, "external browser")
+}
+
+// slackPermalinkRe captures the channel ID, the timestamp (with the
+// `p` prefix stripped and the implied dot re-inserted by the caller)
+// and the rest of the URL (query string) from a Slack archive
+// permalink. Examples:
+//
+//	https://sendbird.slack.com/archives/C0AMJQ2Q98S/p1779493681435679
+//	https://foo.slack.com/archives/C123/p1700000000000000?thread_ts=1.0&cid=C123
+//
+// The host must end in slack.com so generic links don't get
+// intercepted by accident.
+var slackPermalinkRe = regexp.MustCompile(`^https?://[^/]+\.slack\.com/archives/([A-Z0-9]+)/p(\d+)(?:\?([^#]*))?`)
+
+// SlackPermalinkTarget is the parsed coordinates of a Slack archive
+// permalink. ThreadTS is "" for a top-level channel link.
+type SlackPermalinkTarget struct {
+	ChannelID string
+	TS        string
+	ThreadTS  string
+}
+
+// parseSlackPermalink returns the channel + ts coordinates encoded in
+// a Slack archive URL, or ok=false when the URL doesn't match the
+// expected shape. The Slack `p1700000000000000` form encodes a
+// "<sec><usec>" concatenation with no dot — we re-insert the dot at
+// position -6 so the result lines up with cache TS values like
+// "1700000000.000000".
+func parseSlackPermalink(rawURL string) (SlackPermalinkTarget, bool) {
+	m := slackPermalinkRe.FindStringSubmatch(rawURL)
+	if m == nil {
+		return SlackPermalinkTarget{}, false
+	}
+	channelID := m[1]
+	pTs := m[2]
+	if len(pTs) < 7 {
+		return SlackPermalinkTarget{}, false
+	}
+	ts := pTs[:len(pTs)-6] + "." + pTs[len(pTs)-6:]
+	target := SlackPermalinkTarget{ChannelID: channelID, TS: ts}
+	if q := m[3]; q != "" {
+		if vals, err := url.ParseQuery(q); err == nil {
+			if t := vals.Get("thread_ts"); t != "" {
+				target.ThreadTS = t
+			}
+		}
+	}
+	return target, true
+}
+
+// openLinkCmd routes a clicked URL: Slack archive permalinks become an
+// in-app navigation (channel switch + message jump + optional thread
+// open), everything else hands off to the OS default browser.
+func (a *App) openLinkCmd(linkURL string) tea.Cmd {
+	if target, ok := parseSlackPermalink(linkURL); ok {
+		return a.openSlackPermalinkCmd(target)
+	}
+	return openExternalURLCmd(linkURL)
+}
+
+// openSlackPermalinkCmd dispatches the messages needed to jump to the
+// permalink's channel and (when applicable) thread. The actual channel
+// switch is routed through ChannelSelectedMsg so all existing cache /
+// fetch / pendingJump logic applies; ThreadOpenedMsg follows when the
+// permalink encodes a thread reply.
+// openThreadInChannelCmd dispatches the messages needed to jump from
+// the thread preview into the parent channel WHILE keeping the thread
+// pane open on the destination. Triggered by the chrome's "Open in
+// channel" link: the user wants the regular messages pane positioned
+// on the thread root, with the thread panel still showing replies.
+func (a *App) openThreadInChannelCmd() tea.Cmd {
+	channelID := a.threadPanel.ChannelID()
+	threadTS := a.threadPanel.ThreadTS()
+	if channelID == "" || threadTS == "" {
+		return nil
+	}
+	channelName, channelType := "", ""
+	if a.channelLookup != nil {
+		if name, ctype, ok := a.channelLookup(channelID); ok {
+			channelName, channelType = name, ctype
+		}
+	}
+	parent := a.threadPanel.ParentMsg()
+	if parent.TS == "" {
+		parent.TS = threadTS
+	}
+	if parent.ThreadTS == "" {
+		parent.ThreadTS = threadTS
+	}
+	a.pendingJumpChannelID = channelID
+	a.pendingJumpTS = threadTS
+	a.sidebar.SelectByID(channelID)
+	// Drop the dedup keys so ThreadOpenedMsg actually re-opens the
+	// thread (the original openSelectedThreadCmd dedupes on
+	// lastOpenedChannelID/ThreadTS, and we just navigated FROM this
+	// same thread, so the keys would match and short-circuit).
+	a.lastOpenedChannelID = ""
+	a.lastOpenedThreadTS = ""
+	chSel := ChannelSelectedMsg{ID: channelID, Name: channelName, Type: channelType}
+	thread := ThreadOpenedMsg{ChannelID: channelID, ThreadTS: threadTS, ParentMsg: parent}
+	return tea.Sequence(
+		func() tea.Msg { return chSel },
+		func() tea.Msg { return thread },
+	)
+}
+
+func (a *App) openSlackPermalinkCmd(target SlackPermalinkTarget) tea.Cmd {
+	a.pendingJumpChannelID = target.ChannelID
+	a.pendingJumpTS = target.TS
+	a.sidebar.SelectByID(target.ChannelID)
+	channelName, channelType := "", ""
+	if a.channelLookup != nil {
+		if name, ctype, ok := a.channelLookup(target.ChannelID); ok {
+			channelName, channelType = name, ctype
+		}
+	}
+	chSel := ChannelSelectedMsg{ID: target.ChannelID, Name: channelName, Type: channelType}
+	if target.ThreadTS != "" && target.ThreadTS != target.TS {
+		parent := messages.MessageItem{
+			TS:       target.ThreadTS,
+			ThreadTS: target.ThreadTS,
+		}
+		threadMsg := ThreadOpenedMsg{
+			ChannelID: target.ChannelID,
+			ThreadTS:  target.ThreadTS,
+			ParentMsg: parent,
+		}
+		return tea.Sequence(
+			func() tea.Msg { return chSel },
+			func() tea.Msg { return threadMsg },
+		)
+	}
+	return func() tea.Msg { return chSel }
 }
 
 func openDefaultAppCmd(target, label string) tea.Cmd {
@@ -7314,6 +7811,11 @@ func (a *App) View() tea.View {
 	} else {
 		a.layoutThreadEnd = a.layoutMsgEnd
 	}
+	if a.view == ViewActivity && activityPreviewWidth > 0 {
+		a.layoutActivityPreviewEnd = a.layoutMsgEnd + activityPreviewWidth + activityPreviewBorder
+	} else {
+		a.layoutActivityPreviewEnd = a.layoutMsgEnd
+	}
 
 	// Helper to force a panel to an exact width and height with a given
 	// background color. Uses an explicit width parameter instead of
@@ -7665,13 +8167,21 @@ func (a *App) View() tea.View {
 	// and uses different proportions (60% of the main-pane area, since
 	// it shows full channel messages rather than thread replies).
 	if a.view == ViewActivity && activityPreviewWidth > 0 {
-		// Never give the preview focus — it's read-only.
-		a.activityPreview.SetFocused(false)
+		// Mouse-focus-only highlight: when the user wheels or clicks on
+		// the preview region, focusedPanel flips to PanelActivityPreview
+		// and the border switches to the focused style. Any keyboard
+		// event in handleKey restores focus to PanelMessages, so this
+		// highlight is transient by design.
+		previewFocused := a.focusedPanel == PanelActivityPreview
+		a.activityPreview.SetFocused(previewFocused)
 		previewContentHeight := contentHeight - 2
 		if previewContentHeight < 3 {
 			previewContentHeight = 3
 		}
 		previewBorderStyle := styles.UnfocusedBorder.Width(activityPreviewWidth)
+		if previewFocused {
+			previewBorderStyle = styles.FocusedBorder.Width(activityPreviewWidth)
+		}
 		previewView := a.activityPreview.View(previewContentHeight, activityPreviewWidth-2)
 		previewView = messages.ReapplyBgAfterResets(previewView, messages.BgANSI())
 		previewOut := exactSize(

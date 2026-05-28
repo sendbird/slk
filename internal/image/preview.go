@@ -280,14 +280,9 @@ func (p *Preview) viewLoading(width, height int) string {
 // cellPixels describes the terminal cell size in pixels. When unknown,
 // callers can pass image.Point{} and the function falls back to 8×16.
 func fitInto(srcW, srcH, maxCols, maxRows int, cellPixels image.Point) image.Point {
+	cellPixels = NormalizeCellPixels(cellPixels)
 	cellW := cellPixels.X
 	cellH := cellPixels.Y
-	if cellW <= 0 {
-		cellW = 8
-	}
-	if cellH <= 0 {
-		cellH = 16
-	}
 	cellAspect := float64(cellH) / float64(cellW)
 	cellRatio := float64(srcW) / float64(srcH) * cellAspect
 

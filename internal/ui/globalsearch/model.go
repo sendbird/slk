@@ -19,6 +19,7 @@ import (
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/gammons/slk/internal/cache"
 	"github.com/gammons/slk/internal/text"
 	"github.com/gammons/slk/internal/ui/messages"
 	"github.com/gammons/slk/internal/ui/overlay"
@@ -92,6 +93,14 @@ type Item struct {
 	ChannelType string
 	MessageTS   string
 	Permalink   string
+
+	// Members lists the OTHER-participant display names for DM and
+	// group_dm rows (1 entry for 1:1 DMs, N for MPDMs; empty for
+	// channels). Used by the People-section ranker to do per-member
+	// multi-term matching the same way Slack's cmd+K does: each query
+	// term must match a different member, then results rank by
+	// smallest-member-count first.
+	Members []string
 }
 
 // Category returns the section this item belongs to.
@@ -146,6 +155,7 @@ type Model struct {
 	sectionOrder []string         // categories present, in CategoryOrder order
 	flat         []int            // selectable indexes in render order
 	selected     int              // index into flat
+	readState    func() map[string]cache.ReadState
 }
 
 // New returns an empty overlay (hidden).
@@ -223,6 +233,15 @@ func (m *Model) Configure(title, placeholder, scopeLabel string) {
 	m.placeholder = placeholder
 	m.scopeLabel = strings.TrimSpace(scopeLabel)
 	m.input.Placeholder = placeholder
+}
+
+// SetReadStateReader installs a callback the sorter can consult for
+// latest-message recency when ordering local channel/DM hits.
+func (m *Model) SetReadStateReader(f func() map[string]cache.ReadState) {
+	m.readState = f
+	if m.visible {
+		m.filter()
+	}
 }
 
 // SetItems replaces the non-synthetic items, preserving any previously
@@ -538,10 +557,11 @@ type candidate struct {
 //  1. Joined first (channel section only — other sections don't carry
 //     a meaningful Joined bit)
 //  2. Match tier: prefix > substring > subsequence
-//  3. LastVisited DESC (recency)
-//  4. Subsequence score DESC
-//  5. typeRank ASC (group_dm demoted)
-//  6. Name ASC (case-insensitive)
+//  3. Latest message TS DESC (when known)
+//  4. LastVisited DESC
+//  5. Subsequence score DESC
+//  6. typeRank ASC (group_dm demoted)
+//  7. Name ASC (case-insensitive)
 func (m *Model) filter() {
 	m.sectionItems = map[string][]int{}
 	m.sectionOrder = nil
@@ -604,6 +624,11 @@ func (m *Model) filter() {
 }
 
 func rank(item Item, q string) (match, bool) {
+	if item.Category() == CategoryPerson {
+		if m, ok := rankPerson(item, q); ok {
+			return m, true
+		}
+	}
 	if q == "" {
 		return match{}, true
 	}
@@ -618,6 +643,135 @@ func rank(item Item, q string) (match, bool) {
 		return match{tier: 2, score: score}, true
 	}
 	return match{}, false
+}
+
+// rankPerson scores a DM/MPDM/app row against the query the same way
+// Slack web's cmd+K does: split the query into terms, then match each
+// term against an individual participant's display name. All terms
+// must be satisfied by DIFFERENT participants (so "jay david" never
+// matches a single person whose name contains both substrings). The
+// caller's sort then puts fewer-participant rows first.
+//
+// Falls back to whole-name matching when no per-member roster is
+// available — covers single-term queries and stale items that haven't
+// been re-hydrated with members yet.
+func rankPerson(item Item, q string) (match, bool) {
+	if q == "" {
+		return match{}, true
+	}
+	name := text.Fold(item.Name)
+	queryTerms := searchTerms(q)
+
+	if len(queryTerms) <= 1 {
+		switch {
+		case strings.HasPrefix(name, q):
+			return match{tier: 0}, true
+		case strings.Contains(name, q):
+			return match{tier: 1}, true
+		}
+		if score, ok := subsequenceScore(name, q); ok {
+			return match{tier: 2, score: score}, true
+		}
+		return match{}, false
+	}
+
+	if penalty, ok := matchTermsAgainstMembers(queryTerms, item.Members); ok {
+		// Tier base 2 + per-term match-quality penalty (0 = exact, 1 =
+		// prefix, 2 = substring per term). Subtler than the previous
+		// member-count-derived tier so the sort key can sit on the
+		// real member count instead.
+		return match{tier: 2 + penalty, score: 100 - penalty*10}, true
+	}
+
+	// Fallback: whole-display-name search when the per-member roster
+	// is missing or didn't satisfy each term. Keeps single-name
+	// substring matches discoverable but ranked below per-member
+	// matches via the higher tier.
+	switch {
+	case strings.HasPrefix(name, q):
+		return match{tier: 6}, true
+	case strings.Contains(name, q):
+		return match{tier: 7}, true
+	}
+	return match{}, false
+}
+
+// matchTermsAgainstMembers checks that every query term matches a
+// distinct member name (Slack cmd+K's per-participant semantics).
+// Returns the cumulative exactness penalty across terms (0 best) and
+// ok=false if any term has no available member match.
+func matchTermsAgainstMembers(queryTerms, members []string) (int, bool) {
+	if len(members) == 0 || len(queryTerms) == 0 {
+		return 0, false
+	}
+	folded := make([]string, len(members))
+	for i, m := range members {
+		folded[i] = text.Fold(m)
+	}
+	used := make([]bool, len(folded))
+	totalPenalty := 0
+	for _, term := range queryTerms {
+		best := -1
+		bestScore := 99
+		for i, m := range folded {
+			if used[i] {
+				continue
+			}
+			score := termMatchScore(m, term)
+			if score >= 99 {
+				continue
+			}
+			if score < bestScore {
+				bestScore = score
+				best = i
+			}
+		}
+		if best < 0 {
+			return 0, false
+		}
+		used[best] = true
+		totalPenalty += bestScore
+	}
+	return totalPenalty, true
+}
+
+// termMatchScore returns 0 for exact equality, 1 for prefix-of-any-word,
+// 2 for substring, 99 for no match. Word boundaries are split on the
+// same separators searchTerms uses, so a member name like "David Ahn"
+// is treated as ["david","ahn"] and a query term of "david" hits as a
+// word-exact (0).
+func termMatchScore(memberName, term string) int {
+	if memberName == "" || term == "" {
+		return 99
+	}
+	if memberName == term {
+		return 0
+	}
+	if strings.HasPrefix(memberName, term) {
+		return 1
+	}
+	// Sub-word match: check each whitespace/sep-delimited token.
+	tokens := searchTerms(memberName)
+	for _, t := range tokens {
+		if t == term {
+			return 0
+		}
+	}
+	for _, t := range tokens {
+		if strings.HasPrefix(t, term) {
+			return 1
+		}
+	}
+	if strings.Contains(memberName, term) {
+		return 2
+	}
+	return 99
+}
+
+func searchTerms(s string) []string {
+	return strings.FieldsFunc(text.Fold(s), func(r rune) bool {
+		return isSeparator(r) || r == ','
+	})
 }
 
 func (m *Model) sortCandidates(cat string, slice []candidate) {
@@ -644,6 +798,10 @@ func (m *Model) sortCandidates(cat string, slice []candidate) {
 		})
 		return
 	}
+	var readState map[string]cache.ReadState
+	if m.readState != nil {
+		readState = m.readState()
+	}
 	sort.SliceStable(slice, func(i, j int) bool {
 		a, b := m.items[slice[i].idx], m.items[slice[j].idx]
 		if cat == CategoryChannel && a.Joined != b.Joined {
@@ -651,6 +809,19 @@ func (m *Model) sortCandidates(cat string, slice []candidate) {
 		}
 		if slice[i].tier != slice[j].tier {
 			return slice[i].tier < slice[j].tier
+		}
+		// People section: prefer fewer-participant conversations (1:1
+		// DM > 3-person mpdm > larger mpdm), mirroring Slack web's
+		// cmd+K ordering. We use len(Members) which is populated for
+		// DM/group_dm rows; zero-member rows (channels) compare equal.
+		if cat == CategoryPerson {
+			am, bm := len(a.Members), len(b.Members)
+			if am != bm && am > 0 && bm > 0 {
+				return am < bm
+			}
+		}
+		if cmp := compareLatestTS(readState, a.ID, b.ID); cmp != 0 {
+			return cmp > 0
 		}
 		if a.LastVisited != b.LastVisited {
 			return a.LastVisited > b.LastVisited
@@ -663,6 +834,28 @@ func (m *Model) sortCandidates(cat string, slice []candidate) {
 		}
 		return strings.ToLower(a.Name) < strings.ToLower(b.Name)
 	})
+}
+
+func compareLatestTS(readState map[string]cache.ReadState, aID, bID string) int {
+	if len(readState) == 0 {
+		return 0
+	}
+	aTS := readState[aID].LatestTS
+	bTS := readState[bID].LatestTS
+	switch {
+	case aTS == "" && bTS == "":
+		return 0
+	case aTS == "":
+		return -1
+	case bTS == "":
+		return 1
+	case aTS > bTS:
+		return 1
+	case aTS < bTS:
+		return -1
+	default:
+		return 0
+	}
 }
 
 func typeRank(it Item) int {

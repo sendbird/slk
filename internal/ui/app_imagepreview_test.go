@@ -12,6 +12,7 @@ import (
 	imgpkg "github.com/gammons/slk/internal/image"
 	"github.com/gammons/slk/internal/ui/imgrender"
 	"github.com/gammons/slk/internal/ui/messages"
+	threadui "github.com/gammons/slk/internal/ui/thread"
 )
 
 // makeTestPNGBytes returns a deterministic PNG of the given size for
@@ -176,6 +177,75 @@ func TestMouseClick_OnImageDispatchesOpenPreview(t *testing.T) {
 	_, cmd := app.Update(tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft})
 	if cmd == nil {
 		t.Fatal("expected non-nil cmd from click on image")
+	}
+	out := cmd()
+	op, ok := out.(messages.OpenImagePreviewMsg)
+	if !ok {
+		t.Fatalf("got %T, want messages.OpenImagePreviewMsg", out)
+	}
+	if op.Channel != channelID {
+		t.Errorf("Channel = %q, want %q", op.Channel, channelID)
+	}
+	if op.TS != ts {
+		t.Errorf("TS = %q, want %q", op.TS, ts)
+	}
+	if op.AttIdx != 0 {
+		t.Errorf("AttIdx = %d, want 0", op.AttIdx)
+	}
+}
+
+func TestMouseClick_OnThreadImageDispatchesOpenPreview(t *testing.T) {
+	channelID, ts, fileID, reply := imageBearingMessage(t)
+	parent := messages.MessageItem{
+		TS:        "1700000000.000000",
+		UserID:    "U0",
+		UserName:  "root",
+		Text:      "parent",
+		Timestamp: "10:29 AM",
+	}
+
+	cache, err := imgpkg.NewCache(t.TempDir(), 10)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	pngBytes := makeTestPNGBytes(720, 720)
+	if _, err := cache.Put(fileID+"-720", "png", pngBytes); err != nil {
+		t.Fatalf("cache.Put: %v", err)
+	}
+	fetcher := imgpkg.NewFetcher(cache, nil)
+
+	app := NewApp()
+	app.width = 140
+	app.height = 60
+	app.threadVisible = true
+	app.focusedPanel = PanelThread
+	app.threadPanel = threadui.New()
+	app.threadPanel.SetThread(parent, []messages.MessageItem{reply}, channelID, parent.TS)
+	app.threadPanel.SetImageContext(imgrender.ImageContext{
+		Protocol:   imgpkg.ProtoHalfBlock,
+		Fetcher:    fetcher,
+		CellPixels: stdimage.Pt(8, 16),
+		MaxRows:    20,
+		MaxCols:    60,
+	})
+
+	_ = app.View()
+	_ = app.View()
+
+	rects := app.threadPanel.LastHitsForTest()
+	if len(rects) == 0 {
+		t.Fatal("expected at least one thread image hit rect after View() with cached bytes")
+	}
+	h := rects[0]
+	rowMid := (h.RowStart + h.RowEnd) / 2
+	colMid := (h.ColStart + h.ColEnd) / 2
+
+	x := app.layoutMsgEnd + 1 + colMid
+	y := 1 + rowMid
+
+	_, cmd := app.Update(tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft})
+	if cmd == nil {
+		t.Fatal("expected non-nil cmd from click on thread image")
 	}
 	out := cmd()
 	op, ok := out.(messages.OpenImagePreviewMsg)

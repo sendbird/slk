@@ -103,6 +103,7 @@ type SixelEntry struct {
 // The largest thumb in the slice is used as the source aspect ratio
 // (matching the existing messages-pane behavior).
 func computeImageTarget(thumbs []ThumbSpec, ctx ImageContext, availWidth int) image.Point {
+	ctx.CellPixels = imgpkg.NormalizeCellPixels(ctx.CellPixels)
 	if len(thumbs) == 0 || ctx.CellPixels.X <= 0 || ctx.CellPixels.Y <= 0 {
 		debuglog.ImgRender("computeImageTarget: thumbs=%d cell_px=(%d,%d) → zero target",
 			len(thumbs), ctx.CellPixels.X, ctx.CellPixels.Y)

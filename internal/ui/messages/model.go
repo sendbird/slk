@@ -910,6 +910,34 @@ func (m *Model) AtTop() bool {
 	return m.selected == 0 && len(m.messages) > 0
 }
 
+// ViewportOffset reports the current top-line offset of the rendered message
+// viewport. Primarily used by the App layer to distinguish "scroll within the
+// currently-selected tall message" from "advance selection to another
+// message".
+func (m *Model) ViewportOffset() int { return m.yOffset }
+
+// TotalLinesForTest exposes the total rendered line count for tests that need
+// to bound a deterministic scroll loop. Not used by production code.
+func (m *Model) TotalLinesForTest() int { return m.totalLines }
+
+// SelectedExtendsBelowViewport reports whether the currently-selected message
+// still has unseen rows below the visible viewport on the most recent render.
+func (m *Model) SelectedExtendsBelowViewport() bool {
+	if m.lastViewHeight <= 0 {
+		return false
+	}
+	return m.selectedEndLine > m.yOffset+m.lastViewHeight
+}
+
+// SelectedExtendsAboveViewport reports whether the currently-selected message
+// still has unseen rows above the visible viewport on the most recent render.
+func (m *Model) SelectedExtendsAboveViewport() bool {
+	if m.lastViewHeight <= 0 {
+		return false
+	}
+	return m.selectedStartLine < m.yOffset
+}
+
 func (m *Model) PrependMessages(msgs []MessageItem) {
 	if len(msgs) == 0 {
 		return
@@ -1352,6 +1380,14 @@ func (m *Model) renderLoadingOlderHint(_ int) string {
 	hintStyle := lipgloss.NewStyle().Background(styles.Background).Foreground(styles.TextMuted)
 	frame := styles.SpinnerChars[m.spinnerFrame%len(styles.SpinnerChars)]
 	return hintStyle.Render("  " + string(frame) + " Loading older messages...")
+}
+
+func (m *Model) renderMoreBelowHint(msgAreaHeight int) string {
+	if m.selectedStartLine < m.yOffset+msgAreaHeight && m.selectedEndLine > m.yOffset+msgAreaHeight {
+		hintStyle := lipgloss.NewStyle().Background(styles.Background).Foreground(styles.TextMuted)
+		return hintStyle.Render("  -- more below · PgDn/Ctrl+D/wheel --")
+	}
+	return m.cacheMoreBelow
 }
 
 func (m *Model) messageTextLinkHits(msg MessageItem, width int, avatarStr string) []linkEntryHit {
@@ -2118,8 +2154,14 @@ func HTTPLinkSpansFromLines(lines []string) []LinkSpan {
 
 func linkEntryHitsFromLines(lines []string) []linkEntryHit {
 	var hits []linkEntryHit
+	// activeURL persists across line boundaries so that wrapped
+	// hyperlinks (the OSC 8 opener sits on the first line and the
+	// closer on the last) still produce hit rects for every wrapped
+	// continuation row. The previous per-line reset only registered
+	// hits on the first line, so clicking the second half of a long
+	// URL silently no-op'd.
+	activeURL := ""
 	for row, line := range lines {
-		activeURL := ""
 		col := 0
 		for i := 0; i < len(line); {
 			if strings.HasPrefix(line[i:], "\x1b]8;;") {
@@ -2868,7 +2910,7 @@ func (m *Model) View(height, width int) string {
 		overrodeFirst = true
 	}
 	if m.yOffset+msgAreaHeight < m.totalLines && len(visible) > 0 {
-		visible[len(visible)-1] = m.cacheMoreBelow
+		visible[len(visible)-1] = m.renderMoreBelowHint(msgAreaHeight)
 		overrodeLast = true
 	}
 

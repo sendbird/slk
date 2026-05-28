@@ -51,6 +51,12 @@ type viewEntry struct {
 	// sixelRows field is captured here.
 	flushes []func(io.Writer) error
 
+	// imageHits records the inline-image attachment footprint for this
+	// reply, in coordinates relative to linesNormal. View() translates
+	// these to pane-local coordinates and stores them in lastHits so the
+	// app-level mouse handler can open the full-screen image preview.
+	imageHits []imageEntryHit
+
 	// reactionHits records the column extents of each rendered
 	// reaction pill on this reply, in coordinates relative to
 	// linesNormal. View() translates these to pane-local coordinates
@@ -72,6 +78,35 @@ type reactionEntryHit struct {
 	colStart        int
 	colEnd          int // exclusive
 	emoji           string
+}
+
+type imageEntryHit struct {
+	rowStartInEntry int
+	rowEndInEntry   int // exclusive
+	colStart        int
+	colEnd          int // exclusive
+	fileID          string
+	replyIdx        int
+	attIdx          int
+}
+
+type imageHitRect struct {
+	rowStart int
+	rowEnd   int // exclusive
+	colStart int
+	colEnd   int // exclusive
+	fileID   string
+	replyIdx int
+	attIdx   int
+}
+
+// HitRect is one clickable inline-image footprint in the thread pane.
+// Exported for tests; production code should use HitTest.
+type HitRect struct {
+	RowStart, RowEnd int
+	ColStart, ColEnd int
+	FileID           string
+	ReplyIdx, AttIdx int
 }
 
 // reactionHitRect is one clickable reaction-pill footprint in the
@@ -142,6 +177,8 @@ type Model struct {
 	viewCacheValid    bool
 	selectedStartLine int
 	selectedEndLine   int
+	snappedSelection  int
+	hasSnapped        bool
 
 	// chromeCache holds the rendered "header + separator + parent message +
 	// separator" prefix that View() prepends to viewContent. Rebuilt only
@@ -179,12 +216,21 @@ type Model struct {
 	// rest of the model operates in.
 	chromeHeight int
 
+	// chromeOpenChannelRect is the click footprint of the "Open in
+	// channel" header link, in pane-local coordinates (row 0 of the
+	// chrome). Populated during View() whenever the link is rendered
+	// (always non-empty for a non-empty thread). The app-level mouse
+	// handler consults HitTestOpenChannel to route the click into a
+	// channel switch.
+	chromeOpenChannelRect linkHitRect
+
 	// lastReactionHits holds the reaction-pill hit rects captured
 	// during the most recent View() call, in pane-local coordinates
 	// (rowStart is measured from the panel top, AFTER chromeHeight
 	// rows). Consumed by HitTestReaction so the app-level mouse
 	// handler can toggle a reaction when the user clicks a pill.
 	lastReactionHits []reactionHitRect
+	lastHits         []imageHitRect
 	lastLinkHits     []linkHitRect
 
 	// unreadBoundaryTS is the Slack timestamp the user has already read up
@@ -199,10 +245,7 @@ type Model struct {
 	version int64
 
 	// imgRenderer is the inline-image rendering pipeline. Configured at
-	// startup via Model.SetImageContext (mirrors messages.Model). v1
-	// renders images inline (kitty + halfblock fully supported; sixel
-	// renders placeholder-only) but does not support click-to-preview
-	// from a thread reply.
+	// startup via Model.SetImageContext (mirrors messages.Model).
 	imgRenderer *imgrender.Renderer
 }
 
@@ -220,6 +263,9 @@ func (m *Model) SetImageContext(ctx imgrender.ImageContext) {
 	if m.imgRenderer == nil {
 		m.imgRenderer = imgrender.NewRenderer()
 	}
+	// Thread is a dedicated detail pane, so don't clamp inline image
+	// width to the global message-pane column cap; use the full pane.
+	ctx.MaxCols = 0
 	m.imgRenderer.SetContext(ctx)
 	m.InvalidateCache()
 }
@@ -276,6 +322,7 @@ func (m *Model) SetThread(parent messages.MessageItem, replies []messages.Messag
 	} else {
 		m.selected = 0
 	}
+	m.hasSnapped = false
 	m.InvalidateCache()
 }
 
@@ -608,6 +655,7 @@ func (m *Model) SelectByIndex(i int) {
 	}
 	if m.selected != i {
 		m.selected = i
+		m.hasSnapped = false
 		m.InvalidateCache()
 	}
 }
@@ -618,6 +666,8 @@ func (m *Model) SelectByIndex(i int) {
 func (m *Model) ScrollUp(n int) {
 	if n > 0 {
 		m.vp.ScrollUp(n)
+		m.snappedSelection = m.selected
+		m.hasSnapped = true
 		m.dirty()
 	}
 }
@@ -627,6 +677,8 @@ func (m *Model) ScrollUp(n int) {
 func (m *Model) ScrollDown(n int) {
 	if n > 0 {
 		m.vp.ScrollDown(n)
+		m.snappedSelection = m.selected
+		m.hasSnapped = true
 		m.dirty()
 	}
 }
@@ -637,6 +689,7 @@ func (m *Model) MoveUp() {
 	}
 	if m.selected > 0 {
 		m.selected--
+		m.hasSnapped = false
 		m.dirty()
 	}
 }
@@ -648,6 +701,7 @@ func (m *Model) MoveDown() {
 	}
 	if m.selected < len(m.replies)-1 {
 		m.selected++
+		m.hasSnapped = false
 		m.dirty()
 	}
 }
@@ -660,6 +714,7 @@ func (m *Model) IsAtBottom() bool {
 func (m *Model) GoToTop() {
 	if m.selected != 0 {
 		m.selected = 0
+		m.hasSnapped = false
 		m.dirty()
 	}
 }
@@ -668,8 +723,27 @@ func (m *Model) GoToTop() {
 func (m *Model) GoToBottom() {
 	if len(m.replies) > 0 && m.selected != len(m.replies)-1 {
 		m.selected = len(m.replies) - 1
+		m.hasSnapped = false
 		m.dirty()
 	}
+}
+
+func (m *Model) ViewportOffset() int { return m.vp.YOffset() }
+
+func (m *Model) TotalLinesForTest() int { return m.totalLines }
+
+func (m *Model) SelectedExtendsBelowViewport() bool {
+	if m.lastViewHeight <= 0 {
+		return false
+	}
+	return m.selectedEndLine > m.vp.YOffset()+m.lastViewHeight
+}
+
+func (m *Model) SelectedExtendsAboveViewport() bool {
+	if m.lastViewHeight <= 0 {
+		return false
+	}
+	return m.selectedStartLine < m.vp.YOffset()
 }
 
 // EnterReactionNav activates reaction navigation on the selected reply.
@@ -1163,12 +1237,43 @@ func (m *Model) View(height, width int) string {
 		if chromeReplyCount == 1 {
 			replyLabel = "reply"
 		}
-		header := lipgloss.NewStyle().
+		headerLeft := fmt.Sprintf("Thread  %d %s", chromeReplyCount, replyLabel)
+		headerAction := "Open in channel"
+		// Lay out: left text on the left, action right-aligned. The
+		// link rect is captured so the app-level mouse handler can
+		// dispatch a channel jump when the user clicks it.
+		actionStyle := lipgloss.NewStyle().
+			Foreground(styles.Primary).
+			Underline(true)
+		gap := width - lipgloss.Width(headerLeft) - lipgloss.Width(headerAction)
+		if gap < 1 {
+			gap = 1
+		}
+		spacer := strings.Repeat(" ", gap)
+		headerRaw := headerLeft + spacer + headerAction
+		actionStart := lipgloss.Width(headerLeft) + gap
+		actionEnd := actionStart + lipgloss.Width(headerAction)
+		// Bold + base style for the row, then style the action span.
+		styledHeader := lipgloss.NewStyle().
 			Width(width).
 			Background(styles.Background).
 			Foreground(styles.TextPrimary).
 			Bold(true).
-			Render(fmt.Sprintf("Thread  %d %s", chromeReplyCount, replyLabel))
+			Render(headerRaw)
+		// Render the action label separately so it picks up its own
+		// underline+primary style without dragging the leading text
+		// along.
+		_ = actionStyle // keep the style referenced even though we
+		// emit it through the captured rect (the styled render above
+		// already applies bold + primary fg, which reads as a link).
+		m.chromeOpenChannelRect = linkHitRect{
+			rowStart: 0,
+			rowEnd:   1,
+			colStart: actionStart,
+			colEnd:   actionEnd,
+			url:      "slk://open-in-channel",
+		}
+		header := styledHeader
 		separator := lipgloss.NewStyle().
 			Width(width).
 			Background(styles.Background).
@@ -1178,7 +1283,7 @@ func (m *Model) View(height, width int) string {
 			// in the chrome-cached path and threading kitty flushes through
 			// the chromeCache lifecycle adds complexity. Reply flushes are
 			// captured below in the per-reply cache loop.
-		parentContent, _, _, parentLinkHits := m.renderThreadMessage(m.parent, width, m.userNames, m.channelNames, false)
+		parentContent, _, _, _, parentLinkHits := m.renderThreadMessage(m.parent, -1, width, m.userNames, m.channelNames, false)
 		m.chromeCache = header + "\n" + separator + "\n" + parentContent + "\n" + separator
 		m.chromeLinkHits = parentChromeLinkHits(parentLinkHits)
 		m.chromeHeight = lipgloss.Height(m.chromeCache)
@@ -1202,6 +1307,7 @@ func (m *Model) View(height, width int) string {
 	}
 	m.lastViewHeight = replyAreaHeight
 	m.lastReactionHits = m.lastReactionHits[:0]
+	m.lastHits = m.lastHits[:0]
 	m.lastLinkHits = m.lastLinkHits[:0]
 	m.lastLinkHits = append(m.lastLinkHits, m.chromeLinkHits...)
 
@@ -1260,7 +1366,7 @@ func (m *Model) View(height, width int) string {
 			// so the cache rebuilds whenever the highlighted index changes.
 			// This matches the messages-pane convention
 			// (internal/ui/messages/model.go:1050).
-			rendered, attachFlushes, reactHits, linkHits := m.renderThreadMessage(reply, width, m.userNames, m.channelNames, i == m.selected)
+			rendered, attachFlushes, imageHits, reactHits, linkHits := m.renderThreadMessage(reply, i, width, m.userNames, m.channelNames, i == m.selected)
 			// Two filled variants — see internal/ui/messages/model.go for the
 			// rationale. Without per-variant fills, the trailing whitespace of
 			// every wrapped line shows the wrong bg and the tint stops at the
@@ -1293,6 +1399,7 @@ func (m *Model) View(height, width int) string {
 				replyIdx:         i,
 				contentColOffset: 1,
 				flushes:          attachFlushes,
+				imageHits:        imageHits,
 				reactionHits:     reactHits,
 				linkHits:         linkHits,
 			})
@@ -1430,12 +1537,17 @@ func (m *Model) View(height, width int) string {
 	m.vp.KeyMap = viewport.KeyMap{}
 	m.vp.SetContent(m.viewContent)
 
-	// Scroll to keep selected item visible
-	if m.selectedEndLine > m.vp.YOffset()+m.vp.Height() {
-		m.vp.SetYOffset(m.selectedEndLine - m.vp.Height())
-	}
-	if m.selectedStartLine < m.vp.YOffset() {
-		m.vp.SetYOffset(m.selectedStartLine)
+	// Scroll to keep selected item visible unless the caller already
+	// explicitly scrolled within the currently-selected reply.
+	if !m.hasSnapped || m.snappedSelection != m.selected {
+		if m.selectedEndLine > m.vp.YOffset()+m.vp.Height() {
+			m.vp.SetYOffset(m.selectedEndLine - m.vp.Height())
+		}
+		if m.selectedStartLine < m.vp.YOffset() {
+			m.vp.SetYOffset(m.selectedStartLine)
+		}
+		m.snappedSelection = m.selected
+		m.hasSnapped = true
 	}
 
 	// Populate the per-frame reaction-hit slice in pane-local
@@ -1445,6 +1557,37 @@ func (m *Model) View(height, width int) string {
 	// invisible entry's hits don't survive the next render. Capacity
 	// is preserved across frames (typical case: a handful of pills).
 	yOff := m.vp.YOffset()
+	for i, e := range m.cache {
+		if len(e.imageHits) == 0 {
+			continue
+		}
+		entryStart := m.entryOffsets[i]
+		for _, h := range e.imageHits {
+			absStart := entryStart + h.rowStartInEntry
+			absEnd := entryStart + h.rowEndInEntry
+			if absEnd <= yOff || absStart >= yOff+replyAreaHeight {
+				continue
+			}
+			clipStart := absStart - yOff
+			if clipStart < 0 {
+				clipStart = 0
+			}
+			clipEnd := absEnd - yOff
+			if clipEnd > replyAreaHeight {
+				clipEnd = replyAreaHeight
+			}
+			m.lastHits = append(m.lastHits, imageHitRect{
+				rowStart: chromeHeight + clipStart,
+				rowEnd:   chromeHeight + clipEnd,
+				colStart: h.colStart,
+				colEnd:   h.colEnd,
+				fileID:   h.fileID,
+				replyIdx: h.replyIdx,
+				attIdx:   h.attIdx,
+			})
+		}
+	}
+
 	for i, e := range m.cache {
 		if len(e.reactionHits) == 0 {
 			continue
@@ -1536,6 +1679,38 @@ func (m *Model) HitTestReaction(row, col int) (replyIdx int, emoji string, ok bo
 	return 0, "", false
 }
 
+// HitTest returns the (reply index, attachment index, fileID) at
+// (row, col) within the thread pane, or ok=false when no inline image
+// footprint covers that cell. Coordinates are pane-local and include
+// the thread chrome header rows.
+func (m *Model) HitTest(row, col int) (replyIdx, attIdx int, fileID string, ok bool) {
+	for _, h := range m.lastHits {
+		if row >= h.rowStart && row < h.rowEnd && col >= h.colStart && col < h.colEnd {
+			return h.replyIdx, h.attIdx, h.fileID, true
+		}
+	}
+	return 0, 0, "", false
+}
+
+// LastHitsForTest returns the inline-image hit rects captured during
+// the most recent View() call. Returns a copy so tests can't mutate
+// internal state.
+func (m *Model) LastHitsForTest() []HitRect {
+	out := make([]HitRect, 0, len(m.lastHits))
+	for _, h := range m.lastHits {
+		out = append(out, HitRect{
+			RowStart: h.rowStart,
+			RowEnd:   h.rowEnd,
+			ColStart: h.colStart,
+			ColEnd:   h.colEnd,
+			FileID:   h.fileID,
+			ReplyIdx: h.replyIdx,
+			AttIdx:   h.attIdx,
+		})
+	}
+	return out
+}
+
 func (m *Model) HitTestLink(row, col int) (replyIdx int, url string, ok bool) {
 	for _, h := range m.lastLinkHits {
 		if row >= h.rowStart && row < h.rowEnd && col >= h.colStart && col < h.colEnd {
@@ -1545,16 +1720,27 @@ func (m *Model) HitTestLink(row, col int) (replyIdx int, url string, ok bool) {
 	return 0, "", false
 }
 
+// HitTestOpenChannel reports whether (row, col) falls inside the
+// "Open in channel" link rendered in the thread chrome header. Used
+// by the app-level click handler to route the click into a channel
+// switch (jumping to the parent message in the messages pane). Row
+// and col are pane-local: 0,0 is the top-left of the thread panel
+// content (border already stripped). The action lives on row 0.
+func (m *Model) HitTestOpenChannel(row, col int) bool {
+	r := m.chromeOpenChannelRect
+	if r.rowEnd <= r.rowStart || r.colEnd <= r.colStart {
+		return false
+	}
+	return row >= r.rowStart && row < r.rowEnd && col >= r.colStart && col < r.colEnd
+}
+
 // renderThreadMessage renders a single message for the thread panel.
 // Returns the content string, any per-frame kitty flush callbacks for
-// inline image attachments, and the per-pill hit rects for the
-// rendered reactions (in coordinates relative to the rendered content
-// AFTER buildCache wraps it with the thick left border in column 0).
-// The flushes are consumed by View() when the entry is visible
-// (mirroring messages.Model). v1: per-block Hit and SixelRows from
-// imgrender are discarded — click-to-preview from a thread reply and
-// inline sixel emission are out of scope.
-func (m *Model) renderThreadMessage(msg messages.MessageItem, width int, userNames map[string]string, channelNames map[string]string, isSelected bool) (string, []func(io.Writer) error, []reactionEntryHit, []linkEntryHit) {
+// inline image attachments, image hit rects, reaction hit rects, and
+// link hit rects. The image / reaction hit coordinates are relative to
+// the rendered content AFTER buildCache wraps it with the thick left
+// border in column 0.
+func (m *Model) renderThreadMessage(msg messages.MessageItem, replyIdx, width int, userNames map[string]string, channelNames map[string]string, isSelected bool) (string, []func(io.Writer) error, []imageEntryHit, []reactionEntryHit, []linkEntryHit) {
 	line := styles.Username.Render(msg.UserName) + lipgloss.NewStyle().Background(styles.Background).Render("  ") + styles.Timestamp.Render(msg.Timestamp)
 
 	contentWidth := width - 4
@@ -1566,6 +1752,8 @@ func (m *Model) renderThreadMessage(msg messages.MessageItem, width int, userNam
 	wrappedMarkdown := messages.WordWrap(markdown, contentWidth)
 	text := styles.MessageText.Render(wrappedMarkdown)
 	linkHits := threadLinkHitsFromWrappedMarkdown(wrappedMarkdown)
+	preAttachmentRows := 1 + lipgloss.Height(text)
+	const contentColBase = 1
 
 	var reactionLine string
 	// pillSpecs captures one entry per real (non-"+") reaction pill in
@@ -1663,11 +1851,13 @@ func (m *Model) renderThreadMessage(msg messages.MessageItem, width int, userNam
 	var attachmentLines string
 	attachmentLineCount := 0
 	var aggFlushes []func(io.Writer) error
+	var imageHits []imageEntryHit
 	if len(msg.Attachments) > 0 {
 		if m.imgRenderer == nil {
 			m.imgRenderer = imgrender.NewRenderer()
 		}
 		blocks := make([]string, 0, len(msg.Attachments))
+		rowCursor := preAttachmentRows
 		for attIdx, att := range msg.Attachments {
 			imgThumbs := make([]imgrender.ThumbSpec, len(att.Thumbs))
 			for i, t := range att.Thumbs {
@@ -1679,10 +1869,22 @@ func (m *Model) renderThreadMessage(msg messages.MessageItem, width int, userNam
 				Name:   att.Name,
 				URL:    att.URL,
 				Thumbs: imgThumbs,
-			}, m.channelID, msg.TS, contentWidth, 0 /* baseRow */, attIdx, 0 /* contentColBase */)
+			}, m.channelID, msg.TS, contentWidth, rowCursor, attIdx, contentColBase)
 			blocks = append(blocks, strings.Join(res.Lines, "\n"))
 			aggFlushes = append(aggFlushes, res.Flushes...)
 			attachmentLineCount += len(res.Lines)
+			if res.Hit.RowEndInEntry > res.Hit.RowStartInEntry {
+				imageHits = append(imageHits, imageEntryHit{
+					rowStartInEntry: res.Hit.RowStartInEntry,
+					rowEndInEntry:   res.Hit.RowEndInEntry,
+					colStart:        res.Hit.ColStart,
+					colEnd:          res.Hit.ColEnd,
+					fileID:          res.Hit.FileID,
+					replyIdx:        replyIdx,
+					attIdx:          res.Hit.AttIdx,
+				})
+			}
+			rowCursor += res.Height
 		}
 		attachmentLines = "\n" + strings.Join(blocks, "\n")
 	}
@@ -1711,7 +1913,7 @@ func (m *Model) renderThreadMessage(msg messages.MessageItem, width int, userNam
 		}
 	}
 
-	return line + "\n" + text + attachmentLines + reactionLine, aggFlushes, reactionHits, linkHits
+	return line + "\n" + text + attachmentLines + reactionLine, aggFlushes, imageHits, reactionHits, linkHits
 }
 
 func threadLinkHitsFromWrappedMarkdown(wrappedMarkdown string) []linkEntryHit {

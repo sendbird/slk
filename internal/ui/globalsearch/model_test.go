@@ -6,6 +6,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 
+	"github.com/gammons/slk/internal/cache"
 	"github.com/gammons/slk/internal/config"
 	"github.com/gammons/slk/internal/ui/messages"
 	"github.com/gammons/slk/internal/ui/styles"
@@ -326,6 +327,123 @@ func TestAppTypeRoutesToPeopleSection(t *testing.T) {
 	got := sectionNames(m, CategoryPerson)
 	if len(got) != 2 {
 		t.Fatalf("People section must include app DMs: got %v", got)
+	}
+}
+
+func TestPeopleMultiTermQueryPrefersExactNamesOverLooseMPDMMatches(t *testing.T) {
+	m := newWithItems(t, []Item{
+		{ID: "D1", Name: "David Jay", Type: "dm", Joined: true, LastVisited: 10,
+			Members: []string{"David Jay"}},
+		{ID: "G1", Name: "David, jay", Type: "group_dm", Joined: true, LastVisited: 9,
+			Members: []string{"David", "jay"}},
+		{ID: "G2", Name: "Mickey, Jin, David, Jayden Lee, Young", Type: "group_dm", Joined: true, LastVisited: 100,
+			Members: []string{"Mickey", "Jin", "David", "Jayden Lee", "Young"}},
+		{ID: "G3", Name: "Charles, David, jay, Jin, June Kim", Type: "group_dm", Joined: true, LastVisited: 8,
+			Members: []string{"Charles", "David", "jay", "Jin", "June Kim"}},
+	})
+	for _, r := range "jay david" {
+		m.HandleKey(string(r))
+	}
+
+	got := sectionNames(m, CategoryPerson)
+	if len(got) < 2 {
+		t.Fatalf("expected at least 2 people results, got %v", got)
+	}
+	// Smaller-participant exact match must win even when a larger
+	// MPDM has a newer LastVisited.
+	if got[0] != "David, jay" {
+		t.Fatalf("smallest-member exact-match mpdm should rank first, got %v", got)
+	}
+}
+
+func TestPeopleMultiTermQueryRequiresEachTerm(t *testing.T) {
+	m := newWithItems(t, []Item{
+		{ID: "G1", Name: "David, Jay", Type: "group_dm", Joined: true,
+			Members: []string{"David", "Jay"}},
+		{ID: "G2", Name: "David, Young", Type: "group_dm", Joined: true,
+			Members: []string{"David", "Young"}},
+	})
+	for _, r := range "jay david" {
+		m.HandleKey(string(r))
+	}
+
+	got := sectionNames(m, CategoryPerson)
+	if len(got) != 1 || got[0] != "David, Jay" {
+		t.Fatalf("multi-term people query must keep only rows covering all terms, got %v", got)
+	}
+}
+
+func TestPeopleMultiTermQueryRejectsSingleMemberMatchingBothTerms(t *testing.T) {
+	// "Jayden" alone must NOT satisfy both "jay" and "david" — every
+	// term must map to a DIFFERENT participant, matching Slack web's
+	// cmd+K semantics.
+	m := newWithItems(t, []Item{
+		{ID: "G1", Name: "Jayden, Bob", Type: "group_dm", Joined: true,
+			Members: []string{"Jayden", "Bob"}},
+		{ID: "G2", Name: "Jay, David", Type: "group_dm", Joined: true,
+			Members: []string{"Jay", "David"}},
+	})
+	for _, r := range "jay david" {
+		m.HandleKey(string(r))
+	}
+
+	got := sectionNames(m, CategoryPerson)
+	if len(got) != 1 || got[0] != "Jay, David" {
+		t.Fatalf("each query term must map to a distinct participant, got %v", got)
+	}
+}
+
+func TestPeopleMemberCountBeatsRecency(t *testing.T) {
+	// 2-person mpdm must outrank the 5-person mpdm even though the
+	// latter has a newer LatestTS. Mirrors Slack web cmd+K: 2 → 5.
+	m := newWithItems(t, []Item{
+		{ID: "G2", Name: "David, Eva, Ian, Jay, Yongjun", Type: "group_dm", Joined: true, LastVisited: 1000,
+			Members: []string{"David", "Eva", "Ian", "Jay", "Yongjun"}},
+		{ID: "G1", Name: "David, Jay", Type: "group_dm", Joined: true, LastVisited: 1,
+			Members: []string{"David", "Jay"}},
+	})
+	m.SetReadStateReader(func() map[string]cache.ReadState {
+		return map[string]cache.ReadState{
+			"G1": {LatestTS: "1779000000.000001"},
+			"G2": {LatestTS: "1779000099.000001"},
+		}
+	})
+	for _, r := range "jay david" {
+		m.HandleKey(string(r))
+	}
+
+	got := sectionNames(m, CategoryPerson)
+	if len(got) < 2 {
+		t.Fatalf("expected at least 2 people results, got %v", got)
+	}
+	if got[0] != "David, Jay" {
+		t.Fatalf("smaller mpdm must outrank larger newer one, got %v", got)
+	}
+}
+
+func TestPeopleRecencyBreaksMemberCountTies(t *testing.T) {
+	m := newWithItems(t, []Item{
+		{ID: "G1", Name: "David, Jay", Type: "group_dm", Joined: true, LastVisited: 100,
+			Members: []string{"David", "Jay"}},
+		{ID: "G2", Name: "Jay, David", Type: "group_dm", Joined: true, LastVisited: 1,
+			Members: []string{"Jay", "David"}},
+	})
+	m.SetReadStateReader(func() map[string]cache.ReadState {
+		return map[string]cache.ReadState{
+			"G1": {LatestTS: "1779000000.000001"},
+			"G2": {LatestTS: "1779000001.000001"},
+		}
+	})
+	for _, r := range "jay david" {
+		m.HandleKey(string(r))
+	}
+
+	got := sectionNames(m, CategoryPerson)
+	if len(got) < 2 {
+		t.Fatalf("expected at least 2 people results, got %v", got)
+	}
+	if got[0] != "Jay, David" {
+		t.Fatalf("newer mpdm should rank first when member counts tie, got %v", got)
 	}
 }
 

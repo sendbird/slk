@@ -55,6 +55,13 @@ type Item struct {
 	// opening a channel). These items are preserved across SetItems
 	// and SetBrowseable mutations so the finder always offers them.
 	Synthetic bool
+	// Members lists the OTHER-participant display names for DM and
+	// group_dm rows (1 entry for 1:1 DMs, N for MPDMs). Empty for
+	// regular channels. Carries the per-participant view the
+	// channel-finder doesn't use itself but global search needs for
+	// cmd+K-style multi-term ranking (each query term must match a
+	// different member). Order mirrors Slack's mpdm channel name order.
+	Members []string
 }
 
 // Model is the fuzzy channel finder overlay.

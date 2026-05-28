@@ -1056,6 +1056,57 @@ func TestApp_HandleEnterOnActivityRowActivatesView(t *testing.T) {
 	}
 }
 
+func TestApp_SelectedActivityOpenTargetUsesPreviewThreadSelection(t *testing.T) {
+	app := NewApp()
+	app.view = ViewActivity
+	app.focusedPanel = PanelActivityPreview
+	app.activityView.SetItems([]cache.ActivityItem{{
+		Kind:        "thread_reply",
+		ChannelID:   "C1",
+		ChannelName: "general",
+		ChannelType: "channel",
+		TS:          "2.0",
+		ThreadTS:    "1.0",
+		UserID:      "U2",
+		Text:        "reply body",
+	}})
+	app.activityPreview.SetMessages([]messages.MessageItem{{
+		TS:         "1.0",
+		ThreadTS:   "1.0",
+		UserID:     "U1",
+		UserName:   "Root",
+		Text:       "parent body",
+		ReplyCount: 2,
+	}, {
+		TS:       "2.0",
+		ThreadTS: "1.0",
+		UserID:   "U2",
+		UserName: "Jane",
+		Text:     "reply body",
+	}})
+	app.activityPreview.SelectByIndex(1)
+
+	target, ok := app.selectedActivityOpenTarget()
+	if !ok {
+		t.Fatal("expected selected activity target")
+	}
+	if target.jumpTS != "2.0" {
+		t.Fatalf("jumpTS = %q, want 2.0", target.jumpTS)
+	}
+	if target.thread == nil {
+		t.Fatal("expected thread target from preview selection")
+	}
+	if target.thread.ThreadTS != "1.0" {
+		t.Fatalf("thread ts = %q, want 1.0", target.thread.ThreadTS)
+	}
+	if target.thread.ParentMsg.TS != "1.0" {
+		t.Fatalf("parent ts = %q, want 1.0", target.thread.ParentMsg.TS)
+	}
+	if target.thread.ParentMsg.Text != "parent body" {
+		t.Fatalf("parent text = %q, want parent body", target.thread.ParentMsg.Text)
+	}
+}
+
 func TestAppViewRequestsKeyboardEnhancementsForIME(t *testing.T) {
 	app := NewApp()
 	app.width = 100
@@ -1947,6 +1998,37 @@ func TestApp_HalfPageScrollAdvancesSelection(t *testing.T) {
 	downIdx := app.messagepane.SelectedIndex()
 	if downIdx <= upIdx {
 		t.Errorf("ctrl+d should increase selection; before=%d after=%d", upIdx, downIdx)
+	}
+}
+
+func TestApp_HalfPageScrollRevealsTallSelectedMessageBeforeAdvancing(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.focusedPanel = PanelMessages
+	app.width = 140
+	app.height = 24
+	app.layoutMsgHeight = 20
+
+	lines := make([]string, 0, 40)
+	for i := range 40 {
+		lines = append(lines, fmt.Sprintf("line %02d", i))
+	}
+	app.messagepane.SetMessages([]messages.MessageItem{
+		{TS: "1.0", UserName: "alice", UserID: "U1", Text: strings.Join(lines, "\n"), Timestamp: "10:00 AM"},
+		{TS: "2.0", UserName: "bob", UserID: "U2", Text: "tail", Timestamp: "10:01 AM"},
+	})
+	app.messagepane.GoToTop()
+	_ = app.View()
+
+	startIdx := app.messagepane.SelectedIndex()
+	startOffset := app.messagepane.ViewportOffset()
+	app.scrollFocusedPanel(app.halfPageSize())
+
+	if got := app.messagepane.SelectedIndex(); got != startIdx {
+		t.Fatalf("ctrl+d on tall selected message changed selection: got %d want %d", got, startIdx)
+	}
+	if got := app.messagepane.ViewportOffset(); got <= startOffset {
+		t.Fatalf("ctrl+d should scroll within tall selected message: offset %d -> %d", startOffset, got)
 	}
 }
 
@@ -5591,6 +5673,170 @@ func TestApp_MouseWheelBurstIsCoalesced(t *testing.T) {
 	}
 	if a.pendingWheelActive {
 		t.Fatal("oversized wheel burst should be capped and drained in one flush")
+	}
+}
+
+func TestApp_MouseWheelRevealsTallSelectedMessageBeforeAdvancing(t *testing.T) {
+	a := NewApp()
+	a.width = 140
+	a.height = 24
+	a.activeChannelID = "C1"
+	a.focusedPanel = PanelMessages
+
+	lines := make([]string, 0, 40)
+	for i := range 40 {
+		lines = append(lines, fmt.Sprintf("line %02d", i))
+	}
+	a.messagepane.SetMessages([]messages.MessageItem{
+		{TS: "1.0", UserName: "alice", UserID: "U1", Text: strings.Join(lines, "\n"), Timestamp: "10:00 AM"},
+		{TS: "2.0", UserName: "bob", UserID: "U2", Text: "tail", Timestamp: "10:01 AM"},
+	})
+	a.messagepane.GoToTop()
+	_ = a.View()
+
+	x := a.layoutSidebarEnd + 5
+	startIdx := a.messagepane.SelectedIndex()
+	startOffset := a.messagepane.ViewportOffset()
+	_, cmd := a.Update(tea.MouseWheelMsg{X: x, Y: 5, Button: tea.MouseWheelDown})
+	if cmd == nil {
+		t.Fatal("wheel event should schedule a coalesced flush")
+	}
+	_, _ = a.Update(mouseWheelFlushMsg{})
+
+	if got := a.messagepane.SelectedIndex(); got != startIdx {
+		t.Fatalf("wheel on tall selected message changed selection: got %d want %d", got, startIdx)
+	}
+	if got := a.messagepane.ViewportOffset(); got <= startOffset {
+		t.Fatalf("wheel should scroll within tall selected message: offset %d -> %d", startOffset, got)
+	}
+}
+
+// TestApp_ScrollMessagesPanelReachesBottomOfTallLastMessage routes
+// the user-reported wheel/PgDn scroll path through App and asserts
+// the viewport reaches the bottom of a long last message. App layout
+// is bypassed by driving messagepane directly so the test is robust
+// to terminal-height differences.
+func TestApp_ScrollMessagesPanelReachesBottomOfTallLastMessage(t *testing.T) {
+	a := NewApp()
+	a.activeChannelID = "C1"
+	a.focusedPanel = PanelMessages
+	a.view = ViewChannels
+
+	lines := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		lines = append(lines, fmt.Sprintf("line %03d body content", i))
+	}
+	a.messagepane.SetMessages([]messages.MessageItem{
+		{TS: "1.0", UserName: "head", UserID: "U0", Text: "first", Timestamp: "10:00 AM"},
+		{TS: "2.0", UserName: "alice", UserID: "U1", Text: strings.Join(lines, "\n"), Timestamp: "10:01 AM"},
+	})
+
+	const viewH = 20
+	const viewW = 120
+	_ = a.messagepane.View(viewH, viewW)
+	total := a.messagepane.TotalLinesForTest()
+	if total <= 50 {
+		t.Fatalf("test precondition: not enough total lines (%d)", total)
+	}
+	a.messagepane.ScrollUp(total + 10)
+	_ = a.messagepane.View(viewH, viewW)
+	if got := a.messagepane.ViewportOffset(); got != 0 {
+		t.Fatalf("ScrollUp past total should clamp to 0; got %d", got)
+	}
+
+	prev := 0
+	plateau := 0
+	for i := 0; i < total*2; i++ {
+		a.scrollMessagesPanel(1)
+		_ = a.messagepane.View(viewH, viewW)
+		cur := a.messagepane.ViewportOffset()
+		if cur < prev {
+			t.Fatalf("iteration %d: scrollMessagesPanel moved offset backward: %d -> %d", i, prev, cur)
+		}
+		if cur == prev {
+			plateau++
+			if plateau > 4 {
+				break
+			}
+		} else {
+			plateau = 0
+		}
+		prev = cur
+	}
+	if prev == 0 {
+		t.Fatalf("scrollMessagesPanel chain never advanced viewport from 0")
+	}
+	if got := a.messagepane.SelectedIndex(); got != 1 {
+		t.Fatalf("scrollMessagesPanel changed selection: got %d want 1", got)
+	}
+	// One more scroll must be a no-op (we're at the bottom).
+	beforeStuck := prev
+	a.scrollMessagesPanel(1)
+	_ = a.messagepane.View(viewH, viewW)
+	if got := a.messagepane.ViewportOffset(); got != beforeStuck {
+		t.Fatalf("expected viewport pinned at bottom; advanced from %d to %d", beforeStuck, got)
+	}
+}
+
+func TestApp_ScrollThreadPanelReachesBottomOfTallLastReply(t *testing.T) {
+	a := NewApp()
+	a.focusedPanel = PanelThread
+	a.threadVisible = true
+
+	lines := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		lines = append(lines, fmt.Sprintf("line %03d body content", i))
+	}
+	parent := messages.MessageItem{TS: "P1", UserName: "root", UserID: "U0", Text: "parent", Timestamp: "10:00 AM"}
+	replies := []messages.MessageItem{
+		{TS: "R1", UserName: "head", UserID: "U1", Text: "first", Timestamp: "10:01 AM"},
+		{TS: "R2", UserName: "alice", UserID: "U2", Text: strings.Join(lines, "\n"), Timestamp: "10:02 AM"},
+	}
+	a.threadPanel.SetThread(parent, replies, "C1", "P1")
+
+	const viewH = 20
+	const viewW = 120
+	_ = a.threadPanel.View(viewH, viewW)
+	total := a.threadPanel.TotalLinesForTest()
+	if total <= 50 {
+		t.Fatalf("test precondition: not enough total lines (%d)", total)
+	}
+	a.threadPanel.ScrollUp(total + 10)
+	_ = a.threadPanel.View(viewH, viewW)
+	if got := a.threadPanel.ViewportOffset(); got != 0 {
+		t.Fatalf("ScrollUp past total should clamp to 0; got %d", got)
+	}
+
+	prev := 0
+	plateau := 0
+	for i := 0; i < total*2; i++ {
+		a.scrollThreadPanel(1)
+		_ = a.threadPanel.View(viewH, viewW)
+		cur := a.threadPanel.ViewportOffset()
+		if cur < prev {
+			t.Fatalf("iteration %d: scrollThreadPanel moved offset backward: %d -> %d", i, prev, cur)
+		}
+		if cur == prev {
+			plateau++
+			if plateau > 4 {
+				break
+			}
+		} else {
+			plateau = 0
+		}
+		prev = cur
+	}
+	if prev == 0 {
+		t.Fatalf("scrollThreadPanel chain never advanced viewport from 0")
+	}
+	if sel := a.threadPanel.SelectedReply(); sel == nil || sel.TS != "R2" {
+		t.Fatalf("scrollThreadPanel changed selection: got %+v want R2", sel)
+	}
+	beforeStuck := prev
+	a.scrollThreadPanel(1)
+	_ = a.threadPanel.View(viewH, viewW)
+	if got := a.threadPanel.ViewportOffset(); got != beforeStuck {
+		t.Fatalf("expected viewport pinned at bottom; advanced from %d to %d", beforeStuck, got)
 	}
 }
 

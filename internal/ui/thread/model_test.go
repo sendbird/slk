@@ -1,6 +1,7 @@
 package thread
 
 import (
+	"fmt"
 	stdimage "image"
 	"strings"
 	"testing"
@@ -124,6 +125,55 @@ func TestNavigation(t *testing.T) {
 	m.MoveDown() // should not go past end
 	if m.selected != 2 {
 		t.Errorf("expected selected=2, got %d", m.selected)
+	}
+}
+
+func TestModel_ScrollDownReachesBottomOfTallLastReply(t *testing.T) {
+	lines := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		lines = append(lines, fmt.Sprintf("line %03d body content", i))
+	}
+	m := New()
+	m.SetThread(
+		messages.MessageItem{TS: "P1", UserName: "root", Text: "parent", Timestamp: "10:00 AM"},
+		[]messages.MessageItem{
+			{TS: "R1", UserName: "head", UserID: "U0", Text: "first", Timestamp: "10:01 AM"},
+			{TS: "R2", UserName: "alice", UserID: "U1", Text: strings.Join(lines, "\n"), Timestamp: "10:02 AM"},
+		},
+		"C1",
+		"P1",
+	)
+
+	const viewH = 20
+	const viewW = 120
+	_ = m.View(viewH, viewW)
+	maxOffset := m.TotalLinesForTest() - m.lastViewHeight
+	if maxOffset <= 50 {
+		t.Fatalf("test precondition: totalLines too small; totalLines=%d lastViewHeight=%d",
+			m.TotalLinesForTest(), m.lastViewHeight)
+	}
+
+	m.ScrollUp(maxOffset + 10)
+	_ = m.View(viewH, viewW)
+	if got := m.ViewportOffset(); got != 0 {
+		t.Fatalf("ScrollUp past maxOffset should clamp to 0; got %d", got)
+	}
+
+	prev := m.ViewportOffset()
+	for i := 0; i < maxOffset+5; i++ {
+		m.ScrollDown(1)
+		_ = m.View(viewH, viewW)
+		cur := m.ViewportOffset()
+		if cur < prev {
+			t.Fatalf("iteration %d: ScrollDown moved viewport backward: %d -> %d", i, prev, cur)
+		}
+		prev = cur
+	}
+	if prev != maxOffset {
+		t.Fatalf("ScrollDown chain did not reach bottom: end=%d maxOffset=%d", prev, maxOffset)
+	}
+	if got := m.selected; got != 1 {
+		t.Fatalf("selected drifted during scroll: got %d want 1", got)
 	}
 }
 
