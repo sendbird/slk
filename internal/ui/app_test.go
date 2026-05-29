@@ -90,6 +90,54 @@ func TestHandleNormalMode_ColonEntersCommandMode(t *testing.T) {
 	}
 }
 
+func TestHandleNormalMode_CmdKOpensGlobalSearch(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  tea.KeyPressMsg
+	}{
+		{
+			name: "keystroke only",
+			msg:  tea.KeyPressMsg{Code: 'k', Mod: tea.ModSuper},
+		},
+		{
+			name: "enhanced event with text",
+			msg:  tea.KeyPressMsg{Code: 'k', Text: "k", Mod: tea.ModSuper},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app := NewApp()
+
+			app.handleNormalMode(tc.msg)
+
+			if app.mode != ModeSearch {
+				t.Fatalf("expected ModeSearch, got %v (string=%q keystroke=%q keys=%v)",
+					app.mode, tc.msg.String(), tc.msg.Key().Keystroke(), app.keys.SearchMode.Keys())
+			}
+			if !app.globalSearch.IsVisible() {
+				t.Fatal("expected global search overlay to be visible")
+			}
+		})
+	}
+}
+
+func TestHandleNormalMode_BareKDoesNotOpenSearch(t *testing.T) {
+	// Regression: plain 'k' is vim-style "up", not search. The Cmd+K
+	// matcher must require the super modifier and not catch bare 'k'.
+	app := NewApp()
+	app.SetMode(ModeNormal)
+
+	app.handleNormalMode(tea.KeyPressMsg{Code: 'k', Text: "k"})
+
+	if app.mode == ModeSearch {
+		t.Fatal("bare k should not open global search")
+	}
+	if app.globalSearch.IsVisible() {
+		t.Fatal("bare k should not show the search overlay")
+	}
+}
+
 func TestHandleNormalMode_GGJumpsToTop(t *testing.T) {
 	app := NewApp()
 	app.focusedPanel = PanelMessages
@@ -5977,7 +6025,7 @@ func TestHelpOverlayIncludesSearchShortcuts(t *testing.T) {
 	entries := app.help.VisibleEntries()
 	var hasGlobalSearch, hasChannelSearch bool
 	for _, entry := range entries {
-		if entry.Key == "/" && entry.Desc == "global search" {
+		if entry.Key == "//cmd+k" && entry.Desc == "global search" {
 			hasGlobalSearch = true
 		}
 		if entry.Key == "ctrl+f" && entry.Desc == "search in channel" {
@@ -6010,6 +6058,42 @@ func TestApp_NewConvoPicker_OpensOnN(t *testing.T) {
 	}
 	if !app.newConvoPicker.IsVisible() {
 		t.Fatalf("picker overlay should be visible after 'n'")
+	}
+}
+
+// TestApp_NewConvoPicker_OpensOnCmdN verifies the Cmd+N alias mirrors
+// the bare-`n` behavior — same as Cmd+K for global search.
+func TestApp_NewConvoPicker_OpensOnCmdN(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  tea.KeyPressMsg
+	}{
+		{
+			name: "keystroke only",
+			msg:  tea.KeyPressMsg{Code: 'n', Mod: tea.ModSuper},
+		},
+		{
+			name: "enhanced event with text",
+			msg:  tea.KeyPressMsg{Code: 'n', Text: "n", Mod: tea.ModSuper},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app := NewApp()
+			app.activeTeamID = "T1"
+			app.SetMode(ModeNormal)
+
+			app.handleNormalMode(tc.msg)
+
+			if app.mode != ModeNewConvoPicker {
+				t.Fatalf("expected ModeNewConvoPicker, got %v (string=%q keystroke=%q keys=%v)",
+					app.mode, tc.msg.String(), tc.msg.Key().Keystroke(), app.keys.NewConversation.Keys())
+			}
+			if !app.newConvoPicker.IsVisible() {
+				t.Fatal("expected newConvoPicker overlay to be visible")
+			}
+		})
 	}
 }
 
