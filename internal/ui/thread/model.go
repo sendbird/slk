@@ -1889,6 +1889,19 @@ func (m *Model) renderThreadMessage(msg messages.MessageItem, replyIdx, width in
 		attachmentLines = "\n" + strings.Join(blocks, "\n")
 	}
 
+	// Legacy attachments (quoted/forwarded message bodies, bot
+	// attachments). Rendered as wrapped text so the quoted original shows
+	// in the thread panel, matching the message pane. Image emission is
+	// out of scope here.
+	var legacyLines string
+	legacyLineCount := 0
+	if len(msg.LegacyAttachments) > 0 {
+		if rendered := messages.RenderLegacyAttachmentsText(msg.LegacyAttachments, userNames, channelNames, contentWidth); rendered != "" {
+			legacyLines = "\n" + rendered
+			legacyLineCount = lipgloss.Height(rendered)
+		}
+	}
+
 	// Translate per-pill specs into reactionEntryHit rects. Row layout
 	// of the reply content (pre-border, pre-tint):
 	//   row 0: username + timestamp line
@@ -1900,7 +1913,7 @@ func (m *Model) renderThreadMessage(msg messages.MessageItem, replyIdx, width in
 	var reactionHits []reactionEntryHit
 	if len(pillSpecs) > 0 && reactionLineCount > 0 {
 		const contentColBase = 1 // thick left border occupies col 0 of linesNormal
-		reactionRowBase := 1 + lipgloss.Height(text) + attachmentLineCount
+		reactionRowBase := 1 + lipgloss.Height(text) + attachmentLineCount + legacyLineCount
 		for _, ps := range pillSpecs {
 			row := reactionRowBase + ps.lineIdx
 			reactionHits = append(reactionHits, reactionEntryHit{
@@ -1913,7 +1926,7 @@ func (m *Model) renderThreadMessage(msg messages.MessageItem, replyIdx, width in
 		}
 	}
 
-	return line + "\n" + text + attachmentLines + reactionLine, aggFlushes, imageHits, reactionHits, linkHits
+	return line + "\n" + text + legacyLines + attachmentLines + reactionLine, aggFlushes, imageHits, reactionHits, linkHits
 }
 
 func threadLinkHitsFromWrappedMarkdown(wrappedMarkdown string) []linkEntryHit {

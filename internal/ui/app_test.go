@@ -22,6 +22,7 @@ import (
 	"github.com/gammons/slk/internal/ui/compose"
 	"github.com/gammons/slk/internal/ui/globalsearch"
 	"github.com/gammons/slk/internal/ui/messages"
+	"github.com/gammons/slk/internal/ui/messages/blockkit"
 	"github.com/gammons/slk/internal/ui/newconvopicker"
 	"github.com/gammons/slk/internal/ui/sidebar"
 	"github.com/gammons/slk/internal/ui/slashpicker"
@@ -6343,5 +6344,310 @@ func TestApp_NewConvoPicker_OpensFromActivityView(t *testing.T) {
 				t.Fatalf("picker overlay should be visible from %v", tc.view)
 			}
 		})
+	}
+}
+
+// --- Quote/forward jump-to-original (P key) tests ---
+
+func TestPKeyFromMessagePaneJumpsToOriginal(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C06DXGR74AY"
+	app.focusedPanel = PanelMessages
+	app.SetChannels([]sidebar.ChannelItem{
+		{ID: "C06DXGR74AY", Name: "team-core-platform", Type: "channel"},
+		{ID: "CAJ5UJ8PR", Name: "winning", Type: "channel"},
+	})
+	app.messagepane.SetMessages([]messages.MessageItem{
+		{
+			TS:       "1780025488.126509",
+			UserName: "Doogie Min",
+			LegacyAttachments: []blockkit.LegacyAttachment{{
+				Text:      "Congrats to a quick AI WIN with CultureFly!!",
+				SourceURL: "https://sendbird.slack.com/archives/CAJ5UJ8PR/p1779978601179149?thread_ts=1779978601.179149&cid=CAJ5UJ8PR",
+			}},
+		},
+	})
+	if !app.messagepane.SelectByTS("1780025488.126509") {
+		t.Fatal("failed to select the forwarded message")
+	}
+
+	cmd := app.handleNormalMode(tea.KeyPressMsg{Code: 'P', Text: "P"})
+	if cmd == nil {
+		t.Fatal("P keypress produced no command (jump did not fire)")
+	}
+	msg := cmd()
+	selected, ok := msg.(ChannelSelectedMsg)
+	if !ok {
+		t.Fatalf("expected ChannelSelectedMsg from P, got %T", msg)
+	}
+	if selected.ID != "CAJ5UJ8PR" {
+		t.Fatalf("P jumped to channel %q, want CAJ5UJ8PR", selected.ID)
+	}
+	if app.pendingJumpChannelID != "CAJ5UJ8PR" || app.pendingJumpTS != "1779978601.179149" {
+		t.Fatalf("pending jump = (%q, %q); want (CAJ5UJ8PR, 1779978601.179149)",
+			app.pendingJumpChannelID, app.pendingJumpTS)
+	}
+}
+
+func TestJumpToThreadRootPrefersAttachmentSourcePermalink(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.SetChannels([]sidebar.ChannelItem{
+		{ID: "C1", Name: "general", Type: "channel"},
+		{ID: "CAJ5UJ8PR", Name: "sales", Type: "channel"},
+	})
+	app.threadVisible = true
+	app.focusedPanel = PanelThread
+	app.threadPanel.SetThread(messages.MessageItem{
+		TS:       "100.0",
+		UserName: "alice",
+		Text:     "thread root",
+		ThreadTS: "100.0",
+	}, []messages.MessageItem{{
+		TS:       "101.0",
+		UserName: "bob",
+		Text:     "reply",
+		LegacyAttachments: []blockkit.LegacyAttachment{{
+			Text:      "quoted body",
+			SourceURL: "https://sendbird.slack.com/archives/CAJ5UJ8PR/p1779978601179149",
+		}},
+	}}, "C1", "100.0")
+	app.threadPanel.SelectByIndex(0)
+
+	cmd := app.jumpToThreadRoot()
+	if cmd == nil {
+		t.Fatal("expected jump command")
+	}
+	msg := cmd()
+	selected, ok := msg.(ChannelSelectedMsg)
+	if !ok {
+		t.Fatalf("expected ChannelSelectedMsg, got %T", msg)
+	}
+	if selected.ID != "CAJ5UJ8PR" {
+		t.Fatalf("expected attachment source channel jump, got %+v", selected)
+	}
+	if app.pendingJumpTS != "1779978601.179149" {
+		t.Fatalf("expected permalink-derived ts, got %q", app.pendingJumpTS)
+	}
+}
+
+func TestJumpFromMessagePanePrefersAttachmentSourcePermalink(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C06DXGR74AY"
+	app.focusedPanel = PanelMessages
+	app.SetChannels([]sidebar.ChannelItem{
+		{ID: "C06DXGR74AY", Name: "team-core-platform", Type: "channel"},
+		{ID: "CAJ5UJ8PR", Name: "winning", Type: "channel"},
+	})
+	app.messagepane.SetMessages([]messages.MessageItem{
+		{
+			TS:       "1780025488.126509",
+			UserName: "Doogie Min",
+			Text:     "",
+			LegacyAttachments: []blockkit.LegacyAttachment{{
+				Text:      "Congrats to a quick AI WIN with CultureFly!!",
+				SourceURL: "https://sendbird.slack.com/archives/CAJ5UJ8PR/p1779978601179149?thread_ts=1779978601.179149&cid=CAJ5UJ8PR",
+			}},
+		},
+	})
+	if !app.messagepane.SelectByTS("1780025488.126509") {
+		t.Fatal("failed to select source message")
+	}
+
+	cmd := app.jumpToThreadRoot()
+	if cmd == nil {
+		t.Fatal("expected jump command from message pane")
+	}
+	msg := cmd()
+	selected, ok := msg.(ChannelSelectedMsg)
+	if !ok {
+		t.Fatalf("expected ChannelSelectedMsg, got %T", msg)
+	}
+	if selected.ID != "CAJ5UJ8PR" {
+		t.Fatalf("expected jump to source channel CAJ5UJ8PR, got %+v", selected)
+	}
+	if app.pendingJumpChannelID != "CAJ5UJ8PR" || app.pendingJumpTS != "1779978601.179149" {
+		t.Fatalf("unexpected pending jump: channel=%q ts=%q", app.pendingJumpChannelID, app.pendingJumpTS)
+	}
+}
+
+func TestJumpFromMessagePaneNoQuoteNoOp(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.focusedPanel = PanelMessages
+	app.SetChannels([]sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}})
+	app.messagepane.SetMessages([]messages.MessageItem{
+		{TS: "100.0", UserName: "alice", Text: "just a normal message"},
+	})
+	if !app.messagepane.SelectByTS("100.0") {
+		t.Fatal("failed to select message")
+	}
+	if cmd := app.jumpToThreadRoot(); cmd != nil {
+		t.Fatal("expected no jump for a message pane message without a quoted attachment")
+	}
+}
+
+func TestJumpToThreadRootFallsBackToRemoteQuoteSearch(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.SetChannels([]sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}})
+	app.messagepane.SetMessages([]messages.MessageItem{{TS: "100.0", UserName: "alice", Text: "thread root"}})
+	app.SetQuoteJumpSearcher(func(channelID, query string) (string, error) {
+		if channelID != "C1" {
+			t.Fatalf("channelID = %q, want C1", channelID)
+		}
+		if !strings.Contains(query, "quoted source body") {
+			t.Fatalf("query = %q, want quoted source body", query)
+		}
+		return "90.0", nil
+	})
+	app.threadVisible = true
+	app.focusedPanel = PanelThread
+	app.threadPanel.SetThread(messages.MessageItem{
+		TS:       "100.0",
+		UserName: "alice",
+		Text:     "thread root",
+		ThreadTS: "100.0",
+	}, []messages.MessageItem{{
+		TS:                "101.0",
+		UserName:          "bob",
+		Text:              "reply",
+		LegacyAttachments: []blockkit.LegacyAttachment{{Text: "[time] user: > quoted source body"}},
+	}}, "C1", "100.0")
+	app.threadPanel.SelectByIndex(0)
+
+	cmd := app.jumpToThreadRoot()
+	if cmd == nil {
+		t.Fatal("expected jump command")
+	}
+	_ = cmd()
+	if app.pendingJumpTS != "90.0" {
+		t.Fatalf("expected remote fallback jump ts 90.0, got %q", app.pendingJumpTS)
+	}
+}
+
+func TestJumpToThreadRootUsesThreadChannelFromThreadsView(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C-OLD"
+	app.SetChannels([]sidebar.ChannelItem{
+		{ID: "C-OLD", Name: "old", Type: "channel"},
+		{ID: "C1", Name: "general", Type: "channel"},
+	})
+	app.threadVisible = true
+	app.focusedPanel = PanelThread
+	app.threadPanel.SetThread(messages.MessageItem{
+		TS:       "100.0",
+		UserName: "alice",
+		Text:     "thread root",
+		ThreadTS: "100.0",
+	}, []messages.MessageItem{{TS: "101.0", UserName: "bob", Text: "reply"}}, "C1", "100.0")
+
+	cmd := app.jumpToThreadRoot()
+	if cmd == nil {
+		t.Fatal("expected jump command")
+	}
+	msg := cmd()
+	selected, ok := msg.(ChannelSelectedMsg)
+	if !ok {
+		t.Fatalf("expected ChannelSelectedMsg, got %T", msg)
+	}
+	if selected.ID != "C1" || selected.Name != "general" || selected.Type != "channel" {
+		t.Fatalf("unexpected jump target: %+v", selected)
+	}
+}
+
+func TestJumpToThreadRootPrefersQuotedMessageFromLegacyAttachmentFallback(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.SetChannels([]sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}})
+	app.messagepane.SetMessages([]messages.MessageItem{
+		{TS: "90.0", UserName: "sam", Text: "quoted source body"},
+		{TS: "100.0", UserName: "alice", Text: "thread root"},
+	})
+	app.threadVisible = true
+	app.focusedPanel = PanelThread
+	app.threadPanel.SetThread(messages.MessageItem{
+		TS:       "100.0",
+		UserName: "alice",
+		Text:     "thread root",
+		ThreadTS: "100.0",
+	}, []messages.MessageItem{{
+		TS:       "101.0",
+		UserName: "bob",
+		Text:     "reply",
+		LegacyAttachments: []blockkit.LegacyAttachment{{
+			Text: "[time] user: > quoted source body",
+		}},
+	}}, "C1", "100.0")
+
+	app.threadPanel.SelectByIndex(0)
+	cmd := app.jumpToThreadRoot()
+	if cmd == nil {
+		t.Fatal("expected jump command")
+	}
+	_ = cmd()
+	if app.pendingJumpTS != "90.0" {
+		t.Fatalf("expected quoted-message jump ts 90.0, got %q", app.pendingJumpTS)
+	}
+}
+
+func TestJumpToThreadRootPrefersQuotedMessage(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.SetChannels([]sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}})
+	app.messagepane.SetMessages([]messages.MessageItem{
+		{TS: "90.0", UserName: "sam", Text: "hello world\nquoted source body"},
+		{TS: "100.0", UserName: "alice", Text: "thread root"},
+	})
+	app.threadVisible = true
+	app.focusedPanel = PanelThread
+	app.threadPanel.SetThread(messages.MessageItem{
+		TS:       "100.0",
+		UserName: "alice",
+		Text:     "thread root",
+		ThreadTS: "100.0",
+	}, []messages.MessageItem{{TS: "101.0", UserName: "bob", Text: "> quoted source body\nreply"}}, "C1", "100.0")
+
+	app.threadPanel.SelectByIndex(0)
+	cmd := app.jumpToThreadRoot()
+	if cmd == nil {
+		t.Fatal("expected jump command")
+	}
+	_ = cmd()
+	if app.pendingJumpTS != "90.0" {
+		t.Fatalf("expected quoted-message jump ts 90.0, got %q", app.pendingJumpTS)
+	}
+}
+
+func TestJumpToThreadRootQueuesChannelJump(t *testing.T) {
+	app := NewApp()
+	app.activeChannelID = "C1"
+	app.SetChannels([]sidebar.ChannelItem{{ID: "C1", Name: "general", Type: "channel"}})
+	app.threadVisible = true
+	app.focusedPanel = PanelThread
+	app.threadPanel.SetThread(messages.MessageItem{
+		TS:       "100.0",
+		UserName: "alice",
+		Text:     "root",
+		ThreadTS: "100.0",
+	}, []messages.MessageItem{{TS: "101.0", UserName: "bob", Text: "reply"}}, "C1", "100.0")
+
+	cmd := app.jumpToThreadRoot()
+	if cmd == nil {
+		t.Fatal("expected jump command")
+	}
+	msg := cmd()
+	selected, ok := msg.(ChannelSelectedMsg)
+	if !ok {
+		t.Fatalf("expected ChannelSelectedMsg, got %T", msg)
+	}
+	if selected.ID != "C1" || selected.Name != "general" || selected.Type != "channel" {
+		t.Fatalf("unexpected jump target: %+v", selected)
+	}
+	if app.pendingJumpChannelID != "C1" || app.pendingJumpTS != "100.0" {
+		t.Fatalf("unexpected pending jump state: %q %q", app.pendingJumpChannelID, app.pendingJumpTS)
+	}
+	if app.threadVisible {
+		t.Fatal("thread should close before jumping")
 	}
 }

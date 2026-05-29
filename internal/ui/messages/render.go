@@ -39,6 +39,7 @@ var (
 	// Slack user/channel mentions: <@U1234> <#C1234|channel-name>
 	userMentionRe    = regexp.MustCompile(`<@([A-Z0-9]+)>`)
 	subteamMentionRe = regexp.MustCompile(`<!subteam\^([A-Z0-9]+)(?:\|([^>]+))?>`)
+	specialMentionRe = regexp.MustCompile(`<!(channel|here|everyone)>`)
 	// channelMentionRe matches both wire forms Slack accepts:
 	//   <#CHANNELID>          — bare ID (sometimes emitted by other clients,
 	//                           and what we used to emit ourselves)
@@ -633,6 +634,15 @@ func renderInlineFormatting(text string, userNames map[string]string, channelNam
 			label = "subteam"
 		}
 		return mentionStyle().Render("@" + label)
+	})
+
+	// Special mentions: <!channel> / <!here> / <!everyone> ->
+	// @channel / @here / @everyone. These carry no ID and never take a
+	// label, so a straight token->@word substitution matches what the
+	// Slack web/mobile clients display.
+	text = specialMentionRe.ReplaceAllStringFunc(text, func(match string) string {
+		groups := specialMentionRe.FindStringSubmatch(match)
+		return mentionStyle().Render("@" + groups[1])
 	})
 
 	// Emoji shortcodes: :red_circle: -> 🔴

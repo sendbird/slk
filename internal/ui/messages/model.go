@@ -1661,6 +1661,27 @@ func (m *Model) blockkitContext(msg MessageItem, userNames, channelNames map[str
 	}
 }
 
+// RenderLegacyAttachmentsText renders a message's legacy attachments
+// (quoted/forwarded message bodies, bot attachments) to plain wrapped
+// text suitable for panels — like the thread panel — that don't run the
+// full inline-image blockkit pipeline. Returns "" when there are none.
+// Image/sixel emission is intentionally omitted; the quoted text body is
+// what callers need here.
+func RenderLegacyAttachmentsText(atts []blockkit.LegacyAttachment, userNames, channelNames map[string]string, width int) string {
+	if len(atts) == 0 {
+		return ""
+	}
+	ctx := blockkit.Context{
+		UserNames: userNames,
+		RenderText: func(s string, un map[string]string) string {
+			return RenderSlackMarkdown(s, un, channelNames)
+		},
+		WrapText: WordWrap,
+	}
+	res := blockkit.RenderLegacy(atts, ctx, width)
+	return strings.Join(res.Lines, "\n")
+}
+
 // renderMessagePlain renders a message without selection highlight.
 //
 // Returns the message content (multi-line string), per-frame flushes

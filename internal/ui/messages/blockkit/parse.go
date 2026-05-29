@@ -181,6 +181,10 @@ func parseAttachment(a slack.Attachment) LegacyAttachment {
 		ThumbURL:   a.ThumbURL,
 		Footer:     a.Footer,
 		FooterIcon: a.FooterIcon,
+		SourceURL:  a.FromURL,
+	}
+	if la.Pretext == "" && la.Title == "" && la.Text == "" && len(a.Fields) == 0 && a.Fallback != "" {
+		la.Text = a.Fallback
 	}
 	for _, f := range a.Fields {
 		la.Fields = append(la.Fields, LegacyField{

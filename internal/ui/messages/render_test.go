@@ -453,3 +453,13 @@ func TestEscapedAngleBracketsNotMistakenForMention(t *testing.T) {
 		t.Errorf("expected literal %q, got %q", "<@U123>", plain)
 	}
 }
+
+// TestSpecialMentionRendersHumanReadable confirms <!channel>/<!here>/
+// <!everyone> render as @channel/@here/@everyone rather than leaking the
+// raw token.
+func TestSpecialMentionRendersHumanReadable(t *testing.T) {
+	out := ansi.Strip(RenderSlackMarkdown("ping <!channel> <!here> <!everyone>", nil, nil))
+	if out != "ping @channel @here @everyone" {
+		t.Fatalf("got %q", out)
+	}
+}
