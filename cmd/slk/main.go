@@ -1081,6 +1081,25 @@ func run() error {
 			}
 		})
 
+		app.SetQuoteJumpSearcher(func(channelID, query string) (string, error) {
+			wctx := router.Active()
+			if wctx == nil {
+				return "", fmt.Errorf("no active workspace")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			hits, err := wctx.Client.SearchMessages(ctx, query, 10)
+			if err != nil {
+				return "", err
+			}
+			for _, hit := range hits {
+				if hit.ChannelID == channelID {
+					return hit.TS, nil
+				}
+			}
+			return "", nil
+		})
+
 		app.SetRemoteSearcher(func(ctx context.Context, query string, gen uint64) tea.Msg {
 			teamID := ui.SearchTeamIDFromContext(ctx)
 			wctx := router.ByID(teamID)

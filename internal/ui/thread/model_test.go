@@ -11,6 +11,7 @@ import (
 	imgpkg "github.com/gammons/slk/internal/image"
 	"github.com/gammons/slk/internal/ui/imgrender"
 	"github.com/gammons/slk/internal/ui/messages"
+	"github.com/gammons/slk/internal/ui/messages/blockkit"
 	"github.com/gammons/slk/internal/ui/styles"
 )
 
@@ -200,6 +201,29 @@ func TestViewRendersContent(t *testing.T) {
 	}
 	if !strings.Contains(view, "bob") {
 		t.Error("expected view to contain reply username 'bob'")
+	}
+}
+
+// TestViewRendersLegacyAttachmentQuotedBody confirms a reply carrying a
+// legacy attachment (a quoted/forwarded message) shows its quoted body in
+// the thread panel, not just the reply text.
+func TestViewRendersLegacyAttachmentQuotedBody(t *testing.T) {
+	m := New()
+	parent := messages.MessageItem{TS: "P1", UserName: "alice", Text: "parent message", Timestamp: "10:30 AM"}
+	replies := []messages.MessageItem{{
+		TS:        "R1",
+		UserName:  "bob",
+		Text:      "see the original",
+		Timestamp: "10:31 AM",
+		LegacyAttachments: []blockkit.LegacyAttachment{{
+			Text: "QUOTED_BODY_MARKER content from the original message",
+		}},
+	}}
+	m.SetThread(parent, replies, "C123", "P1")
+
+	view := ansi.Strip(m.View(30, 60))
+	if !strings.Contains(view, "QUOTED_BODY_MARKER") {
+		t.Errorf("expected thread view to render the legacy attachment quoted body; got:\n%s", view)
 	}
 }
 

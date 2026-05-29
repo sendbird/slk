@@ -172,6 +172,7 @@ type LegacyAttachment struct {
 	Footer     string
 	FooterIcon string // tiny inline image rendered before Footer
 	TS         int64  // unix seconds; 0 means absent
+	SourceURL  string // original Slack permalink when this attachment references another message
 }
 
 // LegacyField is one entry in a LegacyAttachment's Fields slice.

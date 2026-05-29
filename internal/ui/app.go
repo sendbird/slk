@@ -652,6 +652,10 @@ type ChannelSearchScope struct {
 // query syntax (`in:#name`, `with:<@U…>`, …).
 type ChannelSearchFunc func(ctx context.Context, scope ChannelSearchScope, query string, gen uint64) tea.Msg
 
+// QuoteJumpSearchFunc searches for a message TS in a specific channel that
+// best matches a quoted snippet extracted from a forwarded/quoted message.
+type QuoteJumpSearchFunc func(channelID, query string) (string, error)
+
 // ChannelCacheReadFunc is called synchronously when the user selects a
 // channel; it returns cached messages from local storage. Returning a
 // non-empty slice causes the messagepane to render immediately without
@@ -1049,7 +1053,8 @@ type App struct {
 	pendingInitialRestoreChannelID string
 
 	// Callbacks
-	channelFetcher ChannelFetchFunc
+	channelFetcher    ChannelFetchFunc
+	quoteJumpSearcher QuoteJumpSearchFunc
 	// remoteSearcher fires search.messages + search.files when the
 	// global search overlay's query changes. Wired by main.go.
 	remoteSearcher SearchFunc
@@ -4175,6 +4180,9 @@ func (a *App) handleNormalMode(msg tea.KeyMsg) tea.Cmd {
 			a.threadPanel.EnterReactionNav()
 		}
 
+	case a.matchesKey(msg, a.keys.JumpToThreadRoot):
+		return a.jumpToThreadRoot()
+
 	case a.matchesKey(msg, a.keys.CopyPermalink):
 		return a.copyPermalinkOfSelected()
 
@@ -4672,6 +4680,220 @@ func (a *App) channelMetaByID(channelID string) (name, channelType string, ok bo
 		}
 	}
 	return "", "", false
+}
+
+// parseSlackPermalinkTarget extracts the channel ID and message TS from a
+// Slack permalink such as
+// https://x.slack.com/archives/C123/p1700000000123456?thread_ts=...&cid=C123.
+// Returns empty strings when the URL doesn't carry both.
+func parseSlackPermalinkTarget(raw string) (channelID, ts string) {
+	if raw == "" {
+		return "", ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", ""
+	}
+	parts := strings.Split(u.Path, "/")
+	for i := 0; i < len(parts)-1; i++ {
+		if parts[i] == "archives" {
+			channelID = parts[i+1]
+			break
+		}
+	}
+	if v := u.Query().Get("cid"); v != "" {
+		channelID = v
+	}
+	if v := u.Query().Get("thread_ts"); v != "" {
+		ts = v
+	}
+	if ts == "" {
+		for _, part := range parts {
+			if strings.HasPrefix(part, "p") && len(part) > 11 {
+				digits := part[1:]
+				ts = digits[:10] + "." + digits[10:]
+				break
+			}
+		}
+	}
+	return channelID, ts
+}
+
+// directJumpTargetFromLegacyAttachments returns the channel/TS a
+// quoted/forwarded message points at via a legacy attachment's
+// `from_url` source permalink, or empty strings if none do.
+func directJumpTargetFromLegacyAttachments(msg messages.MessageItem) (channelID, ts string) {
+	for _, att := range msg.LegacyAttachments {
+		if ch, t := parseSlackPermalinkTarget(att.SourceURL); ch != "" && t != "" {
+			return ch, t
+		}
+	}
+	return "", ""
+}
+
+// searchableMessageSource joins a message's text body with its legacy
+// attachment pretext/title/text so quoted-snippet matching can search
+// the whole rendered surface, not just the bare body.
+func searchableMessageSource(msg messages.MessageItem) string {
+	parts := []string{}
+	if text := strings.TrimSpace(messages.MessageTextSource(msg)); text != "" {
+		parts = append(parts, text)
+	}
+	for _, att := range msg.LegacyAttachments {
+		if pre := strings.TrimSpace(att.Pretext); pre != "" {
+			parts = append(parts, pre)
+		}
+		if title := strings.TrimSpace(att.Title); title != "" {
+			parts = append(parts, title)
+		}
+		if text := strings.TrimSpace(att.Text); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// quotedSnippetFromText extracts the quoted ("> " / "&gt; ") lines from a
+// message body so the jump action can locate the original message by
+// content when no source permalink is available.
+func quotedSnippetFromText(text string) string {
+	var lines []string
+	capturing := false
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if idx := strings.Index(trimmed, "> "); idx >= 0 {
+			trimmed = strings.TrimSpace(trimmed[idx+2:])
+			if trimmed != "" {
+				lines = append(lines, trimmed)
+				capturing = true
+			}
+			continue
+		}
+		if idx := strings.Index(trimmed, "&gt; "); idx >= 0 {
+			trimmed = strings.TrimSpace(trimmed[idx+5:])
+			if trimmed != "" {
+				lines = append(lines, trimmed)
+				capturing = true
+			}
+			continue
+		}
+		if capturing {
+			break
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// findMessageTSByQuotedSnippet returns the TS of the first loaded message
+// whose searchable source contains the quoted snippet, or "" if none do.
+func findMessageTSByQuotedSnippet(items []messages.MessageItem, snippet string) string {
+	snippet = strings.TrimSpace(snippet)
+	if snippet == "" {
+		return ""
+	}
+	for _, msg := range items {
+		if source := strings.TrimSpace(searchableMessageSource(msg)); source != "" && strings.Contains(source, snippet) {
+			return msg.TS
+		}
+	}
+	return ""
+}
+
+// jumpToThreadRoot is the P-key action. It resolves the message the
+// user is pointing at — the selected reply in the thread panel, or the
+// selected message in the main pane — and jumps to the most specific
+// target available:
+//
+//  1. the original message a quoted/forwarded attachment references
+//     (its `from_url` source permalink), which can live in ANOTHER
+//     channel;
+//  2. failing that, a channel message whose text contains the quoted
+//     snippet (local cache, then remote search);
+//  3. failing that, for thread-panel context, the thread's root message.
+//
+// Works from both the message pane and the thread panel so the user
+// can press P wherever the quoted message is visible.
+func (a *App) jumpToThreadRoot() tea.Cmd {
+	selected, srcChannelID, ok := a.selectedJumpSource()
+	if !ok {
+		a.statusbar.SetToast("Jump: no message selected")
+		return nil
+	}
+
+	jumpChannelID, jumpTS := "", ""
+
+	// 1. Exact source permalink from a quoted/forwarded attachment.
+	if ch, ts := directJumpTargetFromLegacyAttachments(selected); ch != "" && ts != "" {
+		jumpChannelID, jumpTS = ch, ts
+	}
+
+	// 2. Quoted snippet match within the source channel.
+	if jumpTS == "" {
+		if snippet := quotedSnippetFromText(searchableMessageSource(selected)); snippet != "" && srcChannelID != "" {
+			if hit := findMessageTSByQuotedSnippet(a.messagepane.Messages(), snippet); hit != "" {
+				jumpChannelID, jumpTS = srcChannelID, hit
+			} else if a.quoteJumpSearcher != nil {
+				if ts, err := a.quoteJumpSearcher(srcChannelID, snippet); err == nil && ts != "" {
+					jumpChannelID, jumpTS = srcChannelID, ts
+				}
+			}
+		}
+	}
+
+	// 3. Thread-panel fallback: jump to the thread root message.
+	if jumpTS == "" && a.focusedPanel == PanelThread && a.threadVisible {
+		if parent := a.threadPanel.ParentMsg(); parent.TS != "" {
+			jumpChannelID = a.threadPanel.ChannelID()
+			jumpTS = parent.TS
+		}
+	}
+
+	if jumpChannelID == "" || jumpTS == "" {
+		a.statusbar.SetToast("Jump: no linked/original message found")
+		return nil
+	}
+
+	// Resolve channel name/type. The target may be a channel the user
+	// isn't in (a forwarded message's source channel), so fall back to
+	// reasonable defaults when the sidebar has no metadata for it —
+	// mirroring the global-search remote-message jump.
+	name, channelType, known := a.channelMetaByID(jumpChannelID)
+	if !known {
+		name = jumpChannelID
+		channelType = "channel"
+	}
+
+	a.pendingJumpChannelID = jumpChannelID
+	a.pendingJumpTS = jumpTS
+	a.statusbar.SetToast("Jumping to original message…")
+	if a.threadVisible {
+		a.CloseThread()
+	}
+	a.sidebar.SelectByID(jumpChannelID)
+	return func() tea.Msg {
+		return ChannelSelectedMsg{ID: jumpChannelID, Name: name, Type: channelType}
+	}
+}
+
+// selectedJumpSource returns the message the P-key action should act on
+// plus the channel it currently lives in. Prefers the thread panel's
+// selected reply when it has focus, falling back to the thread parent,
+// otherwise the main message pane.
+func (a *App) selectedJumpSource() (messages.MessageItem, string, bool) {
+	if a.focusedPanel == PanelThread && a.threadVisible {
+		if selected := a.threadPanel.SelectedReply(); selected != nil {
+			return *selected, a.threadPanel.ChannelID(), true
+		}
+		// Thread open but no reply selected: fall back to the parent.
+		if parent := a.threadPanel.ParentMsg(); parent.TS != "" {
+			return parent, a.threadPanel.ChannelID(), true
+		}
+		return messages.MessageItem{}, "", false
+	}
+	if msg, ok := a.messagepane.SelectedMessage(); ok {
+		return msg, a.activeChannelID, true
+	}
+	return messages.MessageItem{}, "", false
 }
 
 func channelSearchScopeLabel(scope ChannelSearchScope) string {
@@ -6614,6 +6836,12 @@ func (a *App) SetChannels(items []sidebar.ChannelItem) {
 // SetChannelFetcher sets the callback used to load messages when a channel is selected.
 func (a *App) SetChannelFetcher(fn ChannelFetchFunc) {
 	a.channelFetcher = fn
+}
+
+// SetQuoteJumpSearcher installs the remote quoted-snippet searcher used
+// by the P jump action when the original message isn't in local cache.
+func (a *App) SetQuoteJumpSearcher(fn QuoteJumpSearchFunc) {
+	a.quoteJumpSearcher = fn
 }
 
 // SetChannelReadMarker installs the mark-as-read callback. Wired in
