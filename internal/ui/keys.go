@@ -117,6 +117,26 @@ func normalizeShortcutKeyMsg(msg tea.KeyMsg) tea.KeyMsg {
 	return shortcutKeyMsg{KeyMsg: msg, keyString: keyString}
 }
 
+// overlayNavKeys are the only keys the j/k-navigating overlays (file picker,
+// theme switcher, presence menu) may take from a jamo.
+//
+// Those overlays also hold an ASCII-only filter that accepts any printable
+// character, so a blanket normalization would turn `ㅂ` into a literal `q`
+// typed into the query. Restricting the rewrite to the navigation letters keeps
+// j/k/h working under a Korean input source without inventing query text: a
+// jamo that maps to anything else is dropped by the filter, which is what
+// happened before this mapping existed.
+var overlayNavKeys = map[string]bool{"j": true, "k": true, "h": true}
+
+// normalizeOverlayNavKeyMsg is normalizeShortcutKeyMsg limited to those keys.
+func normalizeOverlayNavKeyMsg(msg tea.KeyMsg) tea.KeyMsg {
+	keyString, ok := koreanShortcutKeyString(msg)
+	if !ok || !overlayNavKeys[keyString] {
+		return msg
+	}
+	return shortcutKeyMsg{KeyMsg: msg, keyString: keyString}
+}
+
 func koreanShortcutKeyString(msg tea.KeyMsg) (string, bool) {
 	k := msg.Key()
 	r, ok := koreanShortcutRune(k.Text)

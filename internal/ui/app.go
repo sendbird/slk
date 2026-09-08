@@ -5132,6 +5132,10 @@ func (a *App) handleWorkspaceFinderMode(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (a *App) handleFilePickerMode(msg tea.KeyMsg) tea.Cmd {
+	// Only the navigation letters are taken from a jamo here: this overlay's
+	// filter accepts any printable character, so rewriting every jamo would
+	// type a literal into the query. See normalizeOverlayNavKeyMsg.
+	msg = normalizeOverlayNavKeyMsg(msg)
 	keyStr := msg.String()
 	switch msg.Key().Code {
 	case tea.KeyEnter:
@@ -5163,6 +5167,10 @@ func (a *App) handleFilePickerMode(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (a *App) handleThemeSwitcherMode(msg tea.KeyMsg) tea.Cmd {
+	// Only the navigation letters are taken from a jamo here: this overlay's
+	// filter accepts any printable character, so rewriting every jamo would
+	// type a literal into the query. See normalizeOverlayNavKeyMsg.
+	msg = normalizeOverlayNavKeyMsg(msg)
 	keyStr := msg.String()
 	switch msg.Key().Code {
 	case tea.KeyEnter:
@@ -5230,6 +5238,10 @@ func (a *App) handleHelpMode(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (a *App) handlePresenceMenuMode(msg tea.KeyMsg) tea.Cmd {
+	// Only the navigation letters are taken from a jamo here: this overlay's
+	// filter accepts any printable character, so rewriting every jamo would
+	// type a literal into the query. See normalizeOverlayNavKeyMsg.
+	msg = normalizeOverlayNavKeyMsg(msg)
 	keyStr := msg.String()
 	switch msg.Key().Code {
 	case tea.KeyEnter:
